@@ -43,7 +43,8 @@ changed_first_party() {
 ensure_pushed() { # 构建机从 origin 取码，未推送的提交构建不到
   local repo
   for repo in "$@"; do
-    git -C "$SRC_ROOT/$repo" fetch -q origin
+    git -C "$SRC_ROOT/$repo" fetch -q origin \
+      || warn "$repo fetch origin 失败，用本地已有的 origin/main 引用判断"
     git -C "$SRC_ROOT/$repo" merge-base --is-ancestor HEAD origin/main \
       || die "$repo 本地 HEAD 尚未推送到 origin/main，先 push 再发布"
   done

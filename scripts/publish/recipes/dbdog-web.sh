@@ -11,9 +11,9 @@ WORK="$BUILD_WORK/$MODULE"; PKG="$WORK/pkg/$MODULE-$VERSION"
 rm -rf "$WORK/pkg" "$WORK/src"; mkdir -p "$PKG" "$WORK/out"
 
 log "检出 $SHA"
-git -C "$REPO_ROOT/dbdog-web" fetch -q origin
+git -C "$REPO_ROOT/dbdog-web" fetch -q origin 2>/dev/null || log "构建机对源仓无 fetch 凭据，用现有本地对象"
 git clone -q --shared "$REPO_ROOT/dbdog-web" "$WORK/src"
-git -C "$WORK/src" checkout -q "$SHA"
+git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 $SHA（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
 log "注入 standalone 输出"

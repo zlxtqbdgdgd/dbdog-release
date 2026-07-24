@@ -10,9 +10,9 @@ WORK="$BUILD_WORK/$MODULE"; PKG="$WORK/pkg/$MODULE-$VERSION"
 rm -rf "$WORK/pkg" "$WORK/src"; mkdir -p "$PKG/bin" "$WORK/out"
 
 log "检出 $SHA"
-git -C "$REPO_ROOT/dbdog-server" fetch -q origin
+git -C "$REPO_ROOT/dbdog-server" fetch -q origin 2>/dev/null || log "构建机对源仓无 fetch 凭据，用现有本地对象"
 git clone -q --shared "$REPO_ROOT/dbdog-server" "$WORK/src"
-git -C "$WORK/src" checkout -q "$SHA"
+git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 $SHA（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
 log "Go 构建（CGO_CFLAGS=-DHAVE_STRCHRNUL，见源仓 Makefile 注释）"
