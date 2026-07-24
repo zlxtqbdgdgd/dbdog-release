@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# dbdogctl —— 内网无 root 进程管理：nohup + pidfile，不依赖 systemd。
+# 用法：dbdogctl start|stop|restart|status [服务名|all]
+# 服务：postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# 启动顺序即依赖顺序；stop 时倒序。
+SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
+
+pid_of() { local f="$RUN_DIR/$1.pid"; [ -f "$f" ] && cat "$f" 2>/dev/null || true; }
+is_running() { local pid; pid="$(pid_of "$1")"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+
+# 通用应用服务：source 对应 env 文件后 nohup 拉起。
+start_app() { # start_app <服务名> <工作目录> <命令...>
+  local svc="$1" cwd="$2"; shift 2
+  local envf="$ETC_DIR/$svc.env"
+  [ -f "$envf" ] || warn "$svc: 缺少 $envf（将无配置启动）"
+  (
+    set -a; [ -f "$envf" ] && source "$envf"; set +a
+    cd "$cwd" || exit 1
+    nohup "$@" >>"$LOGS_DIR/$svc.log" 2>&1 &
+    echo $! >"$RUN_DIR/$svc.pid"
+  )
+}
+
+start_one() {
+  local svc="$1"
+  if is_running "$svc"; then log "$svc 已在运行 (pid $(pid_of "$svc"))"; return 0; fi
+  case "$svc" in
+    postgresql)
+      "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" \
+        -l "$LOGS_DIR/postgresql.log" -w start ;;
+    clickhouse)
+      "$MODULES_DIR/clickhouse/current/bin/clickhouse" server \
+        --config-file="$ETC_DIR/clickhouse/config.xml" \
+        --pid-file="$RUN_DIR/clickhouse.pid" --daemon ;;
+    dbdog-server)
+      start_app dbdog-server "$MODULES_DIR/dbdog-server/current" \
+        "$MODULES_DIR/dbdog-server/current/bin/dbdog-server" ;;
+    ddsql-server)
+      start_app ddsql-server "$MODULES_DIR/dbdog-server/current" \
+        "$MODULES_DIR/dbdog-server/current/bin/ddsql-server" ;;
+    dbdog-web)
+      start_app dbdog-web "$MODULES_DIR/dbdog-web/current" \
+        "$MODULES_DIR/node/current/bin/node" server.js ;;
+    dbdog-mcp)
+      start_app dbdog-mcp "$MODULES_DIR/dbdog-mcp/current" \
+        "$MODULES_DIR/node/current/bin/node" index.js ;;
+    *) die "未知服务: $svc" ;;
+  esac
+  log "$svc 已启动"
+}
+
+stop_one() {
+  local svc="$1"
+  case "$svc" in
+    postgresql)
+      if [ -d "$DATA_DIR/pg" ]; then
+        "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" -m fast -w stop || true
+      fi ;;
+    *)
+      if is_running "$svc"; then
+        kill "$(pid_of "$svc")" 2>/dev/null || true
+        for _ in $(seq 1 20); do is_running "$svc" || break; sleep 0.5; done
+        is_running "$svc" && { warn "$svc 未响应 TERM，发送 KILL"; kill -9 "$(pid_of "$svc")" || true; }
+      fi
+      rm -f "$RUN_DIR/$svc.pid" ;;
+  esac
+  log "$svc 已停止"
+}
+
+status_one() {
+  local svc="$1" v m
+  case "$svc" in
+    ddsql-server) m="dbdog-server" ;;
+    *) m="$svc" ;;
+  esac
+  v="$(installed_version "$m")"
+  if is_running "$svc"; then
+    printf '%-14s %-8s pid=%-8s v%s\n' "$svc" "运行中" "$(pid_of "$svc")" "$v"
+  else
+    printf '%-14s %-8s %-12s v%s\n' "$svc" "已停止" "-" "$v"
+  fi
+}
+
+expand() { # all → 全部服务
+  if [ "${1:-all}" = "all" ]; then printf '%s\n' "${SERVICES[@]}"; else printf '%s\n' "$@"; fi
+}
+
+reverse() { awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}'; }
+
+cmd="${1:-status}"; shift || true
+ensure_layout
+case "$cmd" in
+  start)   expand "$@" | while read -r s; do start_one "$s"; done ;;
+  stop)    expand "$@" | reverse | while read -r s; do stop_one "$s"; done ;;
+  restart) expand "$@" | reverse | while read -r s; do stop_one "$s"; done
+           expand "$@" | while read -r s; do start_one "$s"; done ;;
+  status)  expand "$@" | while read -r s; do status_one "$s"; done ;;
+  *) die "用法: dbdogctl start|stop|restart|status [服务|all]" ;;
+esac

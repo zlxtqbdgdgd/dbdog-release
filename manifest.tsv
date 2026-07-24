@@ -1,0 +1,18 @@
+# dbdog-release 权威模块清单（机器可读；README 版本表是它的镜像）。
+# 由 scripts/publish/publish.sh 维护，勿手改（手改需同步 README 与桶内文件）。
+# 列（TAB 分隔）：
+#   module  kind(first-party|third-party)  target(stack|dbhost)  service(yes|no)
+#   version  artifact  sha256  source_sha
+# version/artifact/sha256 为 "-" 表示尚未发布过。
+# 说明：
+#   - dbdog-server 模块内含 dbdog-server 与 ddsql-server 两个二进制及 migrations/。
+#   - dbdog-agent 的 source_sha 形如 agent:<sha7>,core:<sha7>（含 agent-core，二者任一变更即视为变更）。
+#   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 包。
+dbdog-server	first-party	stack	yes	-	-	-	-
+dbdog-web	first-party	stack	yes	-	-	-	-
+dbdog-mcp	first-party	stack	yes	-	-	-	-
+dbdog-agent	first-party	dbhost	no	-	-	-	-
+postgresql	third-party	stack	yes	-	-	-	-
+clickhouse	third-party	stack	yes	-	-	-	-
+node	third-party	stack	no	-	-	-	-
+goose	third-party	stack	no	-	-	-	-

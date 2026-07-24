@@ -1,0 +1,20 @@
+# 发布配置（复制为 publish.conf 填写；publish.conf 已 gitignore）
+# 构建机 ssh 目标（必填）。构建机 = 与内网鲲鹏 EulerOS 产物兼容的公网测试机。
+BUILD_HOST="z1@CHANGE-ME"
+
+# 各源仓在本机的父目录（默认取 dbdog-release 的上一级，通常无需改）
+#SRC_ROOT="$HOME/Code/github.com/zlxtqbdgdgd"
+
+# 构建机上的目录
+REPO_ROOT="/home/z1/dbdog/repo"          # 各源仓在构建机上的 clone 父目录
+BUILD_WORK="/home/z1/dbdog-release-build" # 发布构建工作目录（自动创建）
+
+# 构建机上工具链 PATH 前缀（go / cargo / node 所在 bin 目录，冒号分隔）
+TOOL_PATH="/home/z1/dbdog/dev/go/bin:/home/z1/.cargo/bin"
+
+# dbdog-agent 版本基线（上游 milestone；发布号形如 7.81.1-dbdog.N）
+AGENT_BASE_VERSION="7.81.1"
+
+# 三方件定位（留空则构建机上 command -v 自动探测）
+#PG_PREFIX="/usr/local/pgsql"   # PostgreSQL 安装前缀（bin/lib/share 的父目录）
+#CH_BIN="/usr/local/bin/clickhouse"
