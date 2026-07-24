@@ -15,7 +15,7 @@ is_running() { local pid; pid="$(pid_of "$1")"; [ -n "$pid" ] && kill -0 "$pid" 
 start_app() { # start_app <服务名> <工作目录> <命令...>
   local svc="$1" cwd="$2"; shift 2
   local envf="$ETC_DIR/$svc.env"
-  [ -f "$envf" ] || warn "$svc: 缺少 $envf（将无配置启动）"
+  [ -f "$envf" ] || warn "$svc: 缺少 ${envf}（将无配置启动）"
   (
     set -a; [ -f "$envf" ] && source "$envf"; set +a
     cd "$cwd" || exit 1

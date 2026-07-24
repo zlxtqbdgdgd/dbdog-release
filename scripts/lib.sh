@@ -47,16 +47,23 @@ installed_version() { # 已装版本；未装输出 "-"
 }
 
 # ---- 下载与校验 ----
+sha256_verify() { # sha256_verify <文件> <期望值>（mac 无 sha256sum，用 shasum 兜底）
+  local got
+  if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$1" | awk '{print $1}')"
+  else got="$(shasum -a 256 "$1" | awk '{print $1}')"; fi
+  [ "$got" = "$2" ]
+}
+
 download_artifact() { # download_artifact <artifact> <sha256> → stdout 本地路径
   local artifact="$1" sha="$2" dest="$CACHE_DIR/$1"
   mkdir -p "$CACHE_DIR"
-  if [ -f "$dest" ] && printf '%s  %s\n' "$sha" "$dest" | sha256sum -c --quiet - 2>/dev/null; then
+  if [ -f "$dest" ] && sha256_verify "$dest" "$sha"; then
     log "缓存命中: $artifact" >&2
   else
     log "下载: $BUCKET_URL/$artifact" >&2
-    curl -fL --retry 3 -o "$dest.part" "$BUCKET_URL/$artifact" || die "下载失败: $artifact（内网需放行 objects.githubusercontent.com）"
+    curl -fL --retry 3 -o "$dest.part" "$BUCKET_URL/$artifact" || die "下载失败: ${artifact}（内网需放行 objects.githubusercontent.com）"
     mv "$dest.part" "$dest"
-    printf '%s  %s\n' "$sha" "$dest" | sha256sum -c --quiet - || die "sha256 校验失败: $artifact"
+    sha256_verify "$dest" "$sha" || die "sha256 校验失败: $artifact"
   fi
   printf '%s\n' "$dest"
 }
@@ -79,5 +86,5 @@ run_hook() { # run_hook <模块新版本目录> <pre-switch|post-switch>
   [ -f "$script" ] || return 0
   log "执行钩子: $(basename "$dir")/hooks/$2.sh"
   DBDOG_HOME="$DBDOG_HOME" ETC_DIR="$ETC_DIR" MODULES_DIR="$MODULES_DIR" \
-    bash "$script" || die "钩子失败: $script（修复后可手动重跑）"
+    bash "$script" || die "钩子失败: ${script}（修复后可手动重跑）"
 }

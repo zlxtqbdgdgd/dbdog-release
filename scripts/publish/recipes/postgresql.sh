@@ -17,14 +17,14 @@ fi
 VER="$("$PGC" --version | awk '{print $2}')"
 PREFIX="$(dirname "$("$PGC" --bindir)")"
 case "$PREFIX" in
-  /|/usr|/usr/local) die "PG 前缀是系统目录（$PREFIX），不能整体打包；请源码安装到独立前缀后用 PG_PREFIX 指定" ;;
+  /|/usr|/usr/local) die "PG 前缀是系统目录（${PREFIX}），不能整体打包；请源码安装到独立前缀后用 PG_PREFIX 指定" ;;
 esac
 
 WORK="$BUILD_WORK/$MODULE"; PKG="$WORK/pkg/postgresql-$VER"
 rm -rf "$WORK/pkg"; mkdir -p "$WORK/pkg" "$WORK/out"
 log "打包 $PREFIX (PostgreSQL $VER)"
 cp -a "$PREFIX" "$PKG"
-[ -x "$PKG/bin/initdb" ] || die "打包结果缺 bin/initdb（前缀推断有误: $PREFIX）"
+[ -x "$PKG/bin/initdb" ] || die "打包结果缺 bin/initdb（前缀推断有误: ${PREFIX}）"
 
 ART="postgresql-$VER-$ARCH.tar.gz"
 tar -czf "$WORK/out/$ART" -C "$WORK/pkg" "postgresql-$VER"

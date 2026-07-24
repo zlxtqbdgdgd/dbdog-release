@@ -19,7 +19,7 @@ while IFS=$'\t' read -r m kind target service version artifact sha256 source_sha
   if [ "$version" = "-" ]; then
     st="未发布"
   elif [ "$inst" = "-" ]; then
-    st="未安装（install.sh 或 upgrade.sh $m）"
+    st="未安装（install.sh 或 upgrade.sh ${m}）"
   elif [ "$inst" = "$version" ]; then
     st="最新"
   else

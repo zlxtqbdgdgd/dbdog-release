@@ -13,14 +13,14 @@ NODE_BIN="$(readlink -f "$NODE_BIN")"
 VER="$("$NODE_BIN" -v)"; VER="${VER#v}"
 PREFIX="$(cd "$(dirname "$NODE_BIN")/.." && pwd)"
 case "$PREFIX" in
-  /|/usr|/usr/local) die "node 前缀是系统目录（$PREFIX），不能整体打包；请改用独立目录安装的 node（如 nvm/n 或解压的官方 tar 目录）" ;;
+  /|/usr|/usr/local) die "node 前缀是系统目录（${PREFIX}），不能整体打包；请改用独立目录安装的 node（如 nvm/n 或解压的官方 tar 目录）" ;;
 esac
 
 WORK="$BUILD_WORK/$MODULE"; PKG="$WORK/pkg/node-$VER"
 rm -rf "$WORK/pkg"; mkdir -p "$WORK/pkg" "$WORK/out"
 log "打包 $PREFIX (node v$VER)"
 cp -a "$PREFIX" "$PKG"
-[ -x "$PKG/bin/node" ] || die "打包结果缺 bin/node（前缀推断有误: $PREFIX）"
+[ -x "$PKG/bin/node" ] || die "打包结果缺 bin/node（前缀推断有误: ${PREFIX}）"
 
 ART="node-$VER-$ARCH.tar.gz"
 tar -czf "$WORK/out/$ART" -C "$WORK/pkg" "node-$VER"

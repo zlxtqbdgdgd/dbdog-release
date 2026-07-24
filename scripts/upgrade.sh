@@ -17,10 +17,10 @@ upgrade_one() {
   target="$(manifest_get "$m" 3)"
 
   [ "$version" != "-" ] || { warn "$m 尚未发布，跳过"; return 0; }
-  [ "$target" = "stack" ] || { warn "$m 不装在本机（target=$target），跳过；DB 主机用 agent-install.sh"; return 0; }
+  [ "$target" = "stack" ] || { warn "$m 不装在本机（target=${target}），跳过；DB 主机用 agent-install.sh"; return 0; }
 
   local inst; inst="$(installed_version "$m")"
-  if [ "$inst" = "$version" ]; then log "$m 已是 $version，跳过"; return 0; fi
+  if [ "$inst" = "$version" ]; then log "$m 已是 ${version}，跳过"; return 0; fi
 
   local pkg; pkg="$(download_artifact "$artifact" "$sha256")"
 

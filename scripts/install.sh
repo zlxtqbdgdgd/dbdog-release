@@ -56,7 +56,7 @@ EOF
     <quotas><default/></quotas>
 </clickhouse>
 EOF
-  log "已生成 $cfg（默认仅本机访问、default 用户空密码）"
+  log "已生成 ${cfg}（默认仅本机访问、default 用户空密码）"
 }
 
 init_databases() {

@@ -13,7 +13,7 @@ rm -rf "$WORK/pkg" "$WORK/src"; mkdir -p "$PKG" "$WORK/out"
 log "检出 $SHA"
 git -C "$REPO_ROOT/dbdog-web" fetch -q origin 2>/dev/null || log "构建机对源仓无 fetch 凭据，用现有本地对象"
 git clone -q --shared "$REPO_ROOT/dbdog-web" "$WORK/src"
-git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 $SHA（先在构建机上刷新该仓）"
+git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
 log "注入 standalone 输出"
@@ -70,7 +70,7 @@ cat >"$PKG/hooks/pre-switch.sh" <<'EOF'
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENVF="$ETC_DIR/dbdog-web.env"
-[ -f "$ENVF" ] || { echo "[hook] 无 $ENVF，跳过 drizzle 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
+[ -f "$ENVF" ] || { echo "[hook] 无 ${ENVF}，跳过 drizzle 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
 set -a; source "$ENVF"; set +a
 cd "$HERE" && "$MODULES_DIR/node/current/bin/node" hooks/migrate.mjs
 EOF

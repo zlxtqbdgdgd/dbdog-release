@@ -35,7 +35,7 @@ live_sha() { # 当前源码指纹（与 manifest.source_sha 同格式）
 changed_first_party() {
   while IFS=$'\t' read -r m kind _t _s _v _a _h recorded; do
     [ "$kind" = "first-party" ] || continue
-    [ -d "$SRC_ROOT/$m/.git" ] || { warn "源仓不存在: $SRC_ROOT/$m，跳过 $m"; continue; }
+    [ -d "$SRC_ROOT/$m/.git" ] || { warn "源仓不存在: $SRC_ROOT/${m}，跳过 $m"; continue; }
     [ "$(live_sha "$m")" != "$recorded" ] && echo "$m"
   done < <(manifest_rows)
 }
@@ -173,7 +173,7 @@ cmd_publish() {
     [ ${#mods[@]} -gt 0 ] || { log "没有变更的一方模块（三方件需点名发布）"; exit 0; }
   fi
 
-  echo "发布计划（bump=$bump）:"
+  echo "发布计划（bump=${bump}）:"
   local plan_vers=()
   for m in "${mods[@]}"; do
     local kind cur nv

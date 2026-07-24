@@ -12,7 +12,7 @@ rm -rf "$WORK/pkg" "$WORK/src"; mkdir -p "$PKG/bin" "$WORK/out"
 log "检出 $SHA"
 git -C "$REPO_ROOT/dbdog-server" fetch -q origin 2>/dev/null || log "构建机对源仓无 fetch 凭据，用现有本地对象"
 git clone -q --shared "$REPO_ROOT/dbdog-server" "$WORK/src"
-git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 $SHA（先在构建机上刷新该仓）"
+git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
 log "Go 构建（CGO_CFLAGS=-DHAVE_STRCHRNUL，见源仓 Makefile 注释）"
@@ -40,7 +40,7 @@ cat >"$PKG/hooks/pre-switch.sh" <<'EOF'
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENVF="$ETC_DIR/dbdog-server.env"
-[ -f "$ENVF" ] || { echo "[hook] 无 $ENVF，跳过 goose 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
+[ -f "$ENVF" ] || { echo "[hook] 无 ${ENVF}，跳过 goose 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
 set -a; source "$ENVF"; set +a
 [ -n "${PG_DSN:-}" ] || { echo "[hook] PG_DSN 未设置，跳过 goose 迁移"; exit 0; }
 "$MODULES_DIR/goose/current/bin/goose" -dir "$HERE/migrations" postgres "$PG_DSN" up

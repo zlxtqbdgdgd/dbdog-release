@@ -13,7 +13,7 @@ rm -rf "$WORK/pkg" "$WORK/src"; mkdir -p "$PKG" "$WORK/out"
 log "检出 $SHA"
 git -C "$REPO_ROOT/dbdog-mcp" fetch -q origin 2>/dev/null || log "构建机对源仓无 fetch 凭据，用现有本地对象"
 git clone -q --shared "$REPO_ROOT/dbdog-mcp" "$WORK/src"
-git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 $SHA（先在构建机上刷新该仓，如跑一次部署脚本的 fetch）"
+git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在构建机上刷新该仓，如跑一次部署脚本的 fetch）"
 cd "$WORK/src"
 
 log "npm ci + gen-skills + esbuild bundle"
@@ -22,7 +22,7 @@ node scripts/gen-skills.mjs >&2
 # banner 里补 createRequire：bundle 进来的 CJS 依赖在 ESM 输出下需要 require 可用
 npx --yes esbuild src/index.ts --bundle --minify --platform=node --format=esm \
   --target=node20 --log-level=warning \
-  --banner:js "import{createRequire}from'node:module';const require=createRequire(import.meta.url);" \
+  "--banner:js=import{createRequire}from'node:module';const require=createRequire(import.meta.url);" \
   --outfile="$PKG/index.js" >&2
 
 mkdir -p "$PKG/etc"
