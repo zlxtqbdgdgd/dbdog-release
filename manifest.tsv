@@ -10,7 +10,7 @@
 #   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 包。
 dbdog-server	first-party	stack	yes	-	-	-	-
 dbdog-web	first-party	stack	yes	-	-	-	-
-dbdog-mcp	first-party	stack	yes	-	-	-	-
+dbdog-mcp	first-party	stack	yes	0.1.0	dbdog-mcp-0.1.0-noarch.tar.gz	b9e2d179d60f78bb66657c8eb9839065b0faadbad966912b2afc8239e46a209b	c84bc18
 dbdog-agent	first-party	dbhost	no	-	-	-	-
 postgresql	third-party	stack	yes	-	-	-	-
 clickhouse	third-party	stack	yes	-	-	-	-
