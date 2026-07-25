@@ -8,11 +8,11 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-07-24 21:24（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-07-24 21:31（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 |
 | --- | --- | --- | --- | --- |
-| dbdog-server | first-party | 全家桶机 | - | - |
+| dbdog-server | first-party | 全家桶机 | 0.1.0 | dbdog-server-0.1.0-aarch64.tar.gz |
 | dbdog-web | first-party | 全家桶机 | - | - |
 | dbdog-mcp | first-party | 全家桶机 | 0.1.0 | dbdog-mcp-0.1.0-noarch.tar.gz |
 | dbdog-agent | first-party | DB 主机 | - | - |
@@ -65,10 +65,11 @@ server 启动时自动推进）→ 切 `current` 软链 → 起服务。
 该主机同样 clone 本仓，然后：
 
 ```bash
-./scripts/agent-install.sh        # 下载校验 rpm，打印 sudo 安装命令（需 DBA 执行）
+./scripts/agent-install.sh        # 下载校验运行时 tarball，打印切换步骤（需 DBA 执行）
 ```
 
-这是全流程唯一需要 root 的环节（rpm 安装本身是特权操作）。
+agent 产物是 omnibus 运行时 tarball（非 rpm，自制 rpm 与官方包冲突被 fork 明确禁止），
+用 cutover 脚本原子切换到 /opt/dbdog-agent。切换涉及 systemd，是全流程唯一需要 root 的环节。
 
 ## 服务管理（无 root，纯脚本）
 
@@ -109,12 +110,14 @@ cd scripts/publish && cp publish.conf.example publish.conf  # 首次：填 BUILD
 ./scripts/publish/publish.sh prune --keep 3      # 清理桶内旧产物（试运行，--yes 执行）
 ```
 
-构建在与内网鲲鹏 EulerOS 产物兼容的公网测试机上进行（ssh 驱动），产物只出 aarch64。
-三方件（postgresql/clickhouse/node/goose）在构建机环境变化后点名发布一次即可。
+构建在专职 arm 编译机上进行（麒麟 V10 / 鲲鹏 aarch64，与内网同构，ssh 驱动），
+产物只出 aarch64（纯 JS 模块为 noarch）。三方件（postgresql/clickhouse/node/goose）
+在编译机环境变化后点名发布一次即可。
 
 ## 待验证清单（内网 ready 后逐项打钩）
 
 - [ ] 内网可下载 `objects.githubusercontent.com`（产物桶资产直链）
-- [ ] agent 的 omnibus aarch64 构建在构建机跑通一次（`scripts/publish/recipes/dbdog-agent.sh` 转正）
+- [ ] agent 的 omnibus aarch64 运行时构建：需临时将编译机扩容到 ≥8c/16GB/50G 盘跑一次
+      （当前 2GB 机不可行），随后 `scripts/publish/recipes/dbdog-agent.sh` 转正（结论已写在该文件头）
 - [ ] dbdog-server 的 `migrations/clickhouse*/` 是否有 blueprint 覆盖不到、需手动执行的 CH DDL
 - [ ] 各 `.env` 模板在内网首装时逐个校准（配方里标了 [首跑校准]）

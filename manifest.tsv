@@ -7,8 +7,10 @@
 # 说明：
 #   - dbdog-server 模块内含 dbdog-server 与 ddsql-server 两个二进制及 migrations/。
 #   - dbdog-agent 的 source_sha 形如 agent:<sha7>,core:<sha7>（含 agent-core，二者任一变更即视为变更）。
-#   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 包。
-dbdog-server	first-party	stack	yes	-	-	-	-
+#   - dbdog-agent 产物是 omnibus 运行时 tarball（非 rpm；自制 rpm 被 fork 明确禁止），
+#     DB 主机用 cutover 脚本切换部署，见 scripts/agent-install.sh。
+#   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 运行时。
+dbdog-server	first-party	stack	yes	0.1.0	dbdog-server-0.1.0-aarch64.tar.gz	4a55900f15b1a54dee9d37b4b6e6cc7d8c6200f05b9846804600b3ff3b52a35f	9fb8294
 dbdog-web	first-party	stack	yes	-	-	-	-
 dbdog-mcp	first-party	stack	yes	0.1.0	dbdog-mcp-0.1.0-noarch.tar.gz	b9e2d179d60f78bb66657c8eb9839065b0faadbad966912b2afc8239e46a209b	c84bc18
 dbdog-agent	first-party	dbhost	no	-	-	-	-
