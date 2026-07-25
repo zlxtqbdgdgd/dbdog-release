@@ -21,6 +21,7 @@ sed -i 's|const nextConfig: NextConfig = {|const nextConfig: NextConfig = {\n  o
 grep -q '"standalone"' next.config.ts || die "next.config.ts 注入失败（源文件结构变了，更新本配方的 sed）"
 
 log "npm ci + next build"
+export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"   # 小内存编译机防 OOM
 npm ci --no-audit --no-fund >&2
 npm run build >&2
 
@@ -28,7 +29,6 @@ cp -a .next/standalone/. "$PKG/"
 mkdir -p "$PKG/.next"
 cp -a .next/static "$PKG/.next/static"
 [ -d public ] && cp -a public "$PKG/public"
-find "$PKG" -name '*.map' -delete
 [ -f "$PKG/server.js" ] || die "standalone 输出缺 server.js"
 
 # drizzle 迁移物料；standalone 的 node_modules 是按引用裁剪的，migrator 子路径
@@ -39,6 +39,8 @@ for p in drizzle-orm postgres; do
   [ -d "node_modules/$p" ] || die "缺 node_modules/$p"
   rm -rf "$PKG/node_modules/$p"; cp -a "node_modules/$p" "$PKG/node_modules/$p"
 done
+# 删 map 必须放在 node_modules 补齐之后（否则三方包又把 map 带回来）
+find "$PKG" -name '*.map' -delete
 
 mkdir -p "$PKG/etc"
 if [ -f deploy/.env.example ]; then cp deploy/.env.example "$PKG/etc/dbdog-web.env.example"
