@@ -12,7 +12,7 @@ dbdog-server	first-party	stack	yes	-	-	-	-
 dbdog-web	first-party	stack	yes	-	-	-	-
 dbdog-mcp	first-party	stack	yes	0.1.0	dbdog-mcp-0.1.0-noarch.tar.gz	b9e2d179d60f78bb66657c8eb9839065b0faadbad966912b2afc8239e46a209b	c84bc18
 dbdog-agent	first-party	dbhost	no	-	-	-	-
-postgresql	third-party	stack	yes	-	-	-	-
+postgresql	third-party	stack	yes	16.14	postgresql-16.14-aarch64.tar.gz	035e9a2d0cd286a4ab8cafa48bedb661efbb6604b94dca2585255ba5e297c7a9	-
 clickhouse	third-party	stack	yes	24.8.5.115	clickhouse-24.8.5.115-aarch64.tar.gz	bb9a76fd1b07457564b941613af4cddf36c7ac697c932f48d4c36149bcb5de4f	-
 node	third-party	stack	no	20.18.1	node-20.18.1-aarch64.tar.gz	fdcb9715f091fe19d58f6e98f0acc27962977e0e28344f2f31189931cb0986c3	-
 goose	third-party	stack	no	-	-	-	-
