@@ -11,7 +11,7 @@
 #     DB 主机用 cutover 脚本切换部署，见 scripts/agent-install.sh。
 #   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 运行时。
 dbdog-server	first-party	stack	yes	0.1.0	dbdog-server-0.1.0-aarch64.tar.gz	4a55900f15b1a54dee9d37b4b6e6cc7d8c6200f05b9846804600b3ff3b52a35f	9fb8294
-dbdog-web	first-party	stack	yes	0.1.0	dbdog-web-0.1.0-aarch64.tar.gz	8dc67a3f401d62e26275797188ff3e33d7e86c8bfb786ebb91f1312857125c7a	5052411
+dbdog-web	first-party	stack	yes	0.1.1	dbdog-web-0.1.1-aarch64.tar.gz	452e4269191aaf5809f0bd260dda18a0db8615ef5732bfc00bb248d1daeb2f6d	5052411
 dbdog-mcp	first-party	stack	yes	0.1.0	dbdog-mcp-0.1.0-noarch.tar.gz	b9e2d179d60f78bb66657c8eb9839065b0faadbad966912b2afc8239e46a209b	c84bc18
 dbdog-agent	first-party	dbhost	no	-	-	-	-
 postgresql	third-party	stack	yes	16.14	postgresql-16.14-aarch64.tar.gz	035e9a2d0cd286a4ab8cafa48bedb661efbb6604b94dca2585255ba5e297c7a9	-
