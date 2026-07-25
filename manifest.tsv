@@ -14,5 +14,5 @@ dbdog-mcp	first-party	stack	yes	0.1.0	dbdog-mcp-0.1.0-noarch.tar.gz	b9e2d179d60f
 dbdog-agent	first-party	dbhost	no	-	-	-	-
 postgresql	third-party	stack	yes	-	-	-	-
 clickhouse	third-party	stack	yes	-	-	-	-
-node	third-party	stack	no	-	-	-	-
+node	third-party	stack	no	20.18.1	node-20.18.1-aarch64.tar.gz	fdcb9715f091fe19d58f6e98f0acc27962977e0e28344f2f31189931cb0986c3	-
 goose	third-party	stack	no	-	-	-	-
