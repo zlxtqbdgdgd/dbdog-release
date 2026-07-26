@@ -123,8 +123,8 @@ a9a043a7975a7b4b1f43de46cdcaca292adc51799aa281cb9b47a276134871b7  patchelf-0.18.
 01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf  external tools/patchelf/0.18.0-aarch64-kylin10-v2/bin/patchelf
 237f20579fbb1e9155183211d07cc5b6bbf45908d912021b21a87a17d7c9f79d  finalize-agent-runtime-v1.sh
 b9f660d25db9c349f0affceb48c0274b23630e5c15174dd223b46bbe76ab8704  run-finalize-agent-runtime-v1.sh
-4700cd0c6a1cf4ba01323db50ed11415b4889d03114d2e88cb0d2d49fcda7d8f  seal-agent-build-dependencies-v1.sh
-62c747f25e343cbdb4beffea257e02ab4c6f4cecd5626da895558eeb161eddce  ../recipes/dbdog-agent.sh
+ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3  seal-agent-build-dependencies-v1.sh
+b05db3ecafa89588248757a64acdf868664142b62318b66553b9db896e177a37  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical overlays

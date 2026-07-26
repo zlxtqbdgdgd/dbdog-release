@@ -75,7 +75,7 @@ readonly SEAL_DIR="$CACHE_ROOT/seals/${MANIFEST_REL##*/}/omnibus-cache-v2"
 # These hashes are frozen from the exact audited v10 controls.  The explicit
 # gate below keeps future edits fail-closed if a maintainer resets one to the
 # all-zero placeholder while preparing a new control generation.
-readonly TRACKED_SEAL_CONTROL_SHA256=4700cd0c6a1cf4ba01323db50ed11415b4889d03114d2e88cb0d2d49fcda7d8f
+readonly TRACKED_SEAL_CONTROL_SHA256=ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3
 readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
 readonly FINALIZER_SHA256=237f20579fbb1e9155183211d07cc5b6bbf45908d912021b21a87a17d7c9f79d
 readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"

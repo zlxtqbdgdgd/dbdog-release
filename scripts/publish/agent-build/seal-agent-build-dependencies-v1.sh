@@ -613,6 +613,14 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 
+# The cache hierarchy is intentionally setgid for shared build inputs.  GNU
+# chmod preserves a directory's setgid bit unless it is cleared explicitly,
+# so normalize this root before creating any immutable seal descendants.
+chmod g-s -- "$stage"
+chmod 0700 "$stage"
+test "$(stat -c '%u:%g:%a' -- "$stage")" = 0:0:700 ||
+  fail "dependency-seal staging root must be root:root mode 0700"
+
 install -d -o root -g root -m 0755 \
   "$stage/objects/sha256" \
   "$stage/git-bundles" \
@@ -1534,7 +1542,10 @@ git_safe "$core_mirror" bundle list-heads \
 # invoked with bash.
 chown -R root:root "$stage"
 find "$stage" -type f -exec chmod 0444 {} +
+find "$stage" -type d -exec chmod g-s {} +
 find "$stage" -type d -exec chmod 0555 {} +
+test -z "$(find "$stage" -type d ! -perm 0555 -print -quit)" ||
+  fail "published dependency-seal directories must all be exact mode 0555"
 chmod 0555 "$stage/snapshots/cache-root/$control_overlay_rel/run-agent-omnibus.sh"
 chmod 0555 "$stage/snapshots/cache-root/$patchelf_rel"
 
