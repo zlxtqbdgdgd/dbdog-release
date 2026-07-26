@@ -1,0 +1,27 @@
+diff --git a/omnibus/lib/ostools.rb b/omnibus/lib/ostools.rb
+--- a/omnibus/lib/ostools.rb
++++ b/omnibus/lib/ostools.rb
+@@ -2,6 +2,9 @@
+ # OS-detection helper functions
+ # ------------------------------------
+ def linux_target?()
++    if not Omnibus::Config.host_distribution().nil?
++      return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? Omnibus::Config.host_distribution()
++    end
+     return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? ohai['platform_family']
+ end
+ 
+diff --git a/tasks/libs/common/omnibus.py b/tasks/libs/common/omnibus.py
+--- a/tasks/libs/common/omnibus.py
++++ b/tasks/libs/common/omnibus.py
+@@ -24,6 +24,10 @@ ENV_PASSHTROUGH = {
+     'BUNDLE_FROZEN': 'Forbids Bundler from changing the committed lockfile',
+     'BUNDLE_USER_CACHE': 'Persistent Bundler metadata and compact-index cache',
+     'BUNDLE_USER_CONFIG': 'Pinned Bundler mirror configuration',
++    'GIT_AUTHOR_EMAIL': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_AUTHOR_NAME': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_COMMITTER_EMAIL': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_COMMITTER_NAME': 'Deterministic identity for Omnibus incremental-cache commits',
+     'CI': "dda and `bazel` rely on this to be able to tell whether they're running on CI and adapt behavior",
+     'DD_CC': 'Points at c compiler',
+     'DD_CXX': 'Points at c++ compiler',

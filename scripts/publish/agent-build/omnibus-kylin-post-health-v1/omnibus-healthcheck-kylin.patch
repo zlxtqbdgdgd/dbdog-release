@@ -1,0 +1,11 @@
+diff --git a/lib/omnibus/health_check.rb b/lib/omnibus/health_check.rb
+--- a/lib/omnibus/health_check.rb
++++ b/lib/omnibus/health_check.rb
+@@ -262,6 +262,6 @@ module Omnibus
+                       log.warn(log_key) { "Skipping dependency health checks on Windows." }
+                       {}
+-                    when "ubuntu", "centos", "opensuseleap", "amazon"
++                    when "ubuntu", "centos", "opensuseleap", "amazon", "kylin"
+                       health_check_ldd
+                     else
+                       log.error(log_key) { "Unknown platform \"#{Ohai['platform']}\", cannot perform healthcheck" }

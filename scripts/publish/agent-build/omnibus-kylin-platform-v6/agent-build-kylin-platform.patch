@@ -1,0 +1,81 @@
+diff --git a/omnibus/lib/ostools.rb b/omnibus/lib/ostools.rb
+--- a/omnibus/lib/ostools.rb
++++ b/omnibus/lib/ostools.rb
+@@ -2,6 +2,9 @@
+ # OS-detection helper functions
+ # ------------------------------------
+ def linux_target?()
++    if not Omnibus::Config.host_distribution().nil?
++      return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? Omnibus::Config.host_distribution()
++    end
+     return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? ohai['platform_family']
+ end
+ 
+diff --git a/omnibus/config/software/datadog-agent.rb b/omnibus/config/software/datadog-agent.rb
+--- a/omnibus/config/software/datadog-agent.rb
++++ b/omnibus/config/software/datadog-agent.rb
+@@ -58,6 +58,18 @@ build do
+   build_workers = ENV.fetch('OMNIBUS_WORKERS_OVERRIDE', '1')
+   env['GOMAXPROCS'] = build_workers
+   env['GOFLAGS'] = "-p=#{build_workers}"
++  go_tmpdir = ENV.fetch('GOTMPDIR')
++  tmpdir = ENV.fetch('TMPDIR')
++  unless go_tmpdir == tmpdir
++    raise "GOTMPDIR and TMPDIR must select the same pinned Go temporary directory"
++  end
++  unless Pathname.new(go_tmpdir).absolute? && Dir.exist?(go_tmpdir)
++    raise "pinned Go temporary directory must be an existing absolute directory"
++  end
++  # Mixlib command environments are explicit. Forward both variables so the
++  # nested dda/invoke process, the Go driver, and cgo helpers share this path.
++  env['GOTMPDIR'] = go_tmpdir
++  env['TMPDIR'] = tmpdir
+   unless windows_target?
+     env['LDFLAGS'] = "-Wl,-rpath,#{install_dir}/embedded/lib -L#{install_dir}/embedded/lib"
+     env['CGO_CFLAGS'] = "-I. -I#{install_dir}/embedded/include"
+diff --git a/tasks/libs/common/omnibus.py b/tasks/libs/common/omnibus.py
+--- a/tasks/libs/common/omnibus.py
++++ b/tasks/libs/common/omnibus.py
+@@ -24,6 +24,10 @@ ENV_PASSHTROUGH = {
+     'BUNDLE_FROZEN': 'Forbids Bundler from changing the committed lockfile',
+     'BUNDLE_USER_CACHE': 'Persistent Bundler metadata and compact-index cache',
+     'BUNDLE_USER_CONFIG': 'Pinned Bundler mirror configuration',
++    'GIT_AUTHOR_EMAIL': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_AUTHOR_NAME': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_COMMITTER_EMAIL': 'Deterministic identity for Omnibus incremental-cache commits',
++    'GIT_COMMITTER_NAME': 'Deterministic identity for Omnibus incremental-cache commits',
+     'CI': "dda and `bazel` rely on this to be able to tell whether they're running on CI and adapt behavior",
+     'DD_CC': 'Points at c compiler',
+     'DD_CXX': 'Points at c++ compiler',
+@@ -31,6 +35,7 @@ ENV_PASSHTROUGH = {
+     'GOPRIVATE': 'Go private module patterns, set by .adms/go/gitlab.yaml and forwarded to Bazel via --repo_env',
+     'GOPROXY': 'Go module proxy, set by .adms/go/gitlab.yaml and forwarded to Bazel via --repo_env',
+     'GOSUMDB': 'Go checksum database mirror',
++    'GOTMPDIR': 'Pinned disk-backed temporary directory used by the Go toolchain',
+     'SKIP_PKG_COMPRESSION': 'Skip package XZ compression (set to true for faster local builds)',
+     'DDA_NO_DYNAMIC_DEPS': 'Variable affecting dda behavior',
+     'E2E_COVERAGE_PIPELINE': 'Used to do a special build of the agent to generate coverage data',
+@@ -58,6 +63,7 @@ ENV_PASSHTROUGH = {
+     'S3_OMNIBUS_CACHE_ANONYMOUS_ACCESS': 'Use to determine whether Omnibus can write to the artifact cache',
+     'S3_OMNIBUS_CACHE_BUCKET': 'Points at bucket used for Omnibus source artifacts',
+     'SSH_AUTH_SOCK': 'Developer environments configure Git to use SSH authentication',
++    'TMPDIR': 'Pinned disk-backed temporary directory used by Go and cgo subprocesses',
+     'UV_CACHE_DIR': 'Persistent uv download and build cache',
+     'XDG_CACHE_HOME': "Runner-dependent cache path used by `bazel` (natively on POSIX OSes, emulated on Windows)",
+     'rvm_path': 'rvm / Ruby stuff to make sure Omnibus itself runs correctly',
+
+diff --git a/deps/patchelf.BUILD.bazel b/deps/patchelf.BUILD.bazel
+--- a/deps/patchelf.BUILD.bazel
++++ b/deps/patchelf.BUILD.bazel
+@@ -20,8 +20,10 @@ cc_binary(
+         "-std=c++17",
+     ],
+     linkopts = [
+-        "-lstdc++",
++        "-static-libgcc",
++        "-Wl,-Bstatic,-lstdc++,-Bdynamic",
+     ],
+     local_defines = [
+         "D_FILE_OFFSET_BITS=64",
++        "PACKAGE_STRING=\\\"patchelf\\\\0400.18.0\\\"",
+     ],

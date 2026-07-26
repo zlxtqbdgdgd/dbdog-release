@@ -1,0 +1,13 @@
+diff --git a/omnibus/lib/ostools.rb b/omnibus/lib/ostools.rb
+--- a/omnibus/lib/ostools.rb
++++ b/omnibus/lib/ostools.rb
+@@ -2,6 +2,9 @@
+ # OS-detection helper functions
+ # ------------------------------------
+ def linux_target?()
++    if not Omnibus::Config.host_distribution().nil?
++      return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? Omnibus::Config.host_distribution()
++    end
+     return %w(rhel debian fedora suse gentoo slackware arch exherbo).include? ohai['platform_family']
+ end
+ 
