@@ -101,9 +101,19 @@ PG/CH 使用只监听本机的默认连接。已有真实配置不会被覆盖�
 Settings → 用户管理创建其他用户，因此 Web 不开放匿名注册。
 
 安装末尾自动调用的 `verify.sh` 会检查配置占位值、实际执行 PG/CH 查询，并等待
-server、ddsql、web、MCP
-HTTP 就绪；最后出现 `基础部署验收通过` 才可继续业务场景验证。它不证明 DDSQL 查询、
-鉴权或 agent 链路已经端到端通过。`dbdogctl status all` 只反映进程状态，不等于健康。
+server、ddsql、web、MCP HTTP 就绪；同时验证 Web OAuth 表、授权服务器元数据、MCP
+受保护资源元数据以及 401 `WWW-Authenticate` 挑战。最后出现
+`基础部署及 OAuth 自动发现链验收通过` 才可继续业务场景验证。浏览器登录、用户授权和
+真实工具调用仍属于业务场景验收。`dbdogctl status all` 只反映进程状态，不等于健康。
+
+Claude Code 使用 Streamable HTTP 正常连接，不需要手工复制内部 Token：
+
+```bash
+claude mcp add --transport http --scope user dbdog http://<全家桶主机>:8090/mcp
+```
+
+随后在 Claude Code 的 `/mcp` 中选择 `Authenticate`，浏览器会转到 Web `3000` 端口登录并
+授权。服务端自动发布 OAuth discovery；不要把固定 Bearer Token 写进 Claude 配置作为默认方案。
 
 旧版本若曾停在“已落包、未迁移”的中间状态，更新 release 仓后可执行一次
 `./scripts/install.sh --finish` 恢复；这不是新安装的正常步骤。
@@ -144,6 +154,8 @@ cd ~/dbdog/release
 数据库结构升级已经包含在上述正常流程中，不需要另跑迁移命令。`upgrade.sh` 会先按依赖
 顺序处理基础运行时，再升级 server、web 和 MCP；server 的 Goose 与 web 的 Drizzle
 迁移都在各自模块切换前自动执行，失败即停止升级。迁移文件随模块产物发布并校验完整性。
+Web/MCP 升级还会自动补齐缺失或空的本机 OAuth/public URL，迁移已知旧模板地址，重启受
+影响的运行中服务，并执行 OAuth 专项验收；已有自定义域名、反代地址和真实凭证不覆盖。
 表结构的唯一所有者和跨模块兼容规则见
 [数据库结构所有权与发布契约](docs/schema-ownership.md)。
 

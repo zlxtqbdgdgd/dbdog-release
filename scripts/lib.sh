@@ -22,6 +22,14 @@ MODULE_ARTIFACT_SHA256_MARKER=".dbdog-artifact-sha256"
 # 基础运行时必须先于应用；应用按当前依赖图先 server、再 web、最后 MCP。
 # 表结构的跨模块兼容不能依赖这个顺序，必须使用 expand/contract 迁移。
 UPGRADE_MODULE_ORDER=(node goose postgresql clickhouse dbdog-server dbdog-web dbdog-mcp)
+# 配置校准会在 upgrade 切包前发生；调用方用这些标记决定是否需要重启仍在运行、
+# 但因产物身份相同而被 upgrade_one 跳过的服务。
+# shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
+DBDOG_SERVER_CONFIG_CHANGED=0
+# shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
+DBDOG_WEB_CONFIG_CHANGED=0
+# shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
+DBDOG_MCP_CONFIG_CHANGED=0
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -116,7 +124,125 @@ migrate_legacy_web_public_urls() { # <dbdog-web.env>；只迁移旧公网验收�
     "http://${advertise_host}:8080" "$ingest"
   ensure_env_default "$file" PUBLIC_MCP_URL \
     "http://${advertise_host}:8090/mcp" "$mcp"
+  # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
+  DBDOG_WEB_CONFIG_CHANGED=1
   log "已把旧验收模板的 PUBLIC_* URL 迁移为本机地址（${advertise_host}）"
+}
+
+migrate_legacy_mcp_public_urls() { # <dbdog-mcp.env>；只迁移旧公网验收模板的三联 URL
+  local file="$1" issuer resource app legacy_host advertise_host
+  [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  issuer="$(env_literal_value "$file" DBDOG_OAUTH_ISSUER)"
+  resource="$(env_literal_value "$file" DBDOG_PUBLIC_MCP_URL)"
+  app="$(env_literal_value "$file" DBDOG_APP_BASE_URL)"
+  case "$issuer" in http://*:25629) ;; *) return 0 ;; esac
+  legacy_host="${issuer#http://}"; legacy_host="${legacy_host%:25629}"
+  [ -n "$legacy_host" ] || return 0
+  [ "$issuer" = "http://${legacy_host}:25629" ] \
+    && [ "$app" = "$issuer" ] \
+    && [ "$resource" = "http://${legacy_host}:24267/mcp" ] \
+    || return 0
+
+  advertise_host="$(detect_advertise_host)"
+  ensure_env_default "$file" DBDOG_OAUTH_ISSUER \
+    "http://${advertise_host}:3000" "$issuer"
+  ensure_env_default "$file" DBDOG_APP_BASE_URL \
+    "http://${advertise_host}:3000" "$app"
+  ensure_env_default "$file" DBDOG_PUBLIC_MCP_URL \
+    "http://${advertise_host}:8090/mcp" "$resource"
+  # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
+  DBDOG_MCP_CONFIG_CHANGED=1
+  log "已把旧验收模板的 MCP OAuth/public URL 迁移为本机地址（${advertise_host}）"
+}
+
+configure_local_database_clients() {
+  local server_env="$ETC_DIR/dbdog-server.env" web_env="$ETC_DIR/dbdog-web.env"
+  local pg_dsn="postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable"
+  # 只接管缺失值和随产物发布的 user:pass 占位；已有真实 DSN 永不覆盖。
+  ensure_env_default "$server_env" PG_DSN "$pg_dsn" user:pass
+  ensure_env_default "$web_env" DATABASE_URL "$pg_dsn" user:pass
+  log "已校准 server/web 的本机 ctl 数据库连接（已有真实 DSN 保持不变）"
+}
+
+generate_secret() {
+  "$MODULES_DIR/node/current/bin/node" -e \
+    'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
+}
+
+choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
+  local key="$1" chosen="" value file; shift
+  for file in "$@"; do
+    value="$(env_literal_value "$file" "$key")"
+    case "$value" in "" | change-me*) continue ;; esac
+    [ "${#value}" -ge 16 ] || die "$file 的 $key 少于 16 字符，拒绝启动"
+    if [ -z "$chosen" ]; then
+      chosen="$value"
+    elif [ "$chosen" != "$value" ]; then
+      die "$key 在多个服务配置中不一致，拒绝猜测应覆盖哪一个"
+    fi
+  done
+  [ -n "$chosen" ] || chosen="$(generate_secret)"
+  printf '%s\n' "$chosen"
+}
+
+configure_ready_to_use_stack() {
+  local server_env="$ETC_DIR/dbdog-server.env"
+  local web_env="$ETC_DIR/dbdog-web.env"
+  local mcp_env="$ETC_DIR/dbdog-mcp.env"
+  local internal_token oauth_secret advertise_host app_url ingest_url mcp_url config_file
+  local server_before web_before mcp_before
+  for config_file in "$server_env" "$web_env" "$mcp_env"; do
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] \
+      || die "缺少可校准的应用配置: $config_file"
+  done
+  server_before="$(cksum "$server_env")"
+  web_before="$(cksum "$web_env")"
+  mcp_before="$(cksum "$mcp_env")"
+
+  configure_local_database_clients
+  internal_token="$(choose_shared_secret DBDOG_INTERNAL_TOKEN "$server_env" "$web_env" "$mcp_env")"
+  oauth_secret="$(choose_shared_secret DBDOG_OAUTH_JWT_SECRET "$web_env" "$mcp_env")"
+  advertise_host="$(detect_advertise_host)"
+  app_url="http://${advertise_host}:3000"
+  ingest_url="http://${advertise_host}:8080"
+  mcp_url="http://${advertise_host}:8090/mcp"
+
+  ensure_env_default "$server_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$server_env" DBDOG_HTTP_ADDR :8080 change-me
+  ensure_env_default "$server_env" DBDOG_PUBLIC_BASE_URL "$app_url" change-me
+
+  ensure_env_default "$web_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$web_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me
+  ensure_env_default "$web_env" DBDOG_SERVER_URL http://127.0.0.1:8080 change-me
+  ensure_env_default "$web_env" PORT 3000 change-me
+  ensure_env_default "$web_env" HOSTNAME 0.0.0.0 change-me
+  ensure_env_default "$web_env" COOKIE_SECURE 0 change-me
+  ensure_env_default "$web_env" PUBLIC_APP_URL "$app_url" change-me
+  ensure_env_default "$web_env" PUBLIC_INGEST_URL "$ingest_url" change-me
+  ensure_env_default "$web_env" PUBLIC_MCP_URL "$mcp_url" change-me
+
+  ensure_env_default "$mcp_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$mcp_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me
+  ensure_env_default "$mcp_env" DBDOG_BASE_URL http://127.0.0.1:8080 change-me
+  ensure_env_default "$mcp_env" DBDOG_HTTP_HOST 0.0.0.0 change-me
+  ensure_env_default "$mcp_env" DBDOG_HTTP_PORT 8090 change-me
+  ensure_env_default "$mcp_env" DBDOG_OAUTH_ISSUER "$app_url" change-me
+  ensure_env_default "$mcp_env" DBDOG_PUBLIC_MCP_URL "$mcp_url" change-me
+  ensure_env_default "$mcp_env" DBDOG_APP_BASE_URL "$app_url" change-me
+
+  if [ "$server_before" != "$(cksum "$server_env")" ]; then
+    # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
+    DBDOG_SERVER_CONFIG_CHANGED=1
+  fi
+  if [ "$web_before" != "$(cksum "$web_env")" ]; then
+    # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
+    DBDOG_WEB_CONFIG_CHANGED=1
+  fi
+  if [ "$mcp_before" != "$(cksum "$mcp_env")" ]; then
+    # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
+    DBDOG_MCP_CONFIG_CHANGED=1
+  fi
+  log "已生成可直接使用的本机配置（访问地址: ${app_url}；已有真实配置保持不变）"
 }
 
 # ---- manifest 访问 ----

@@ -408,6 +408,28 @@ for requested in "$@"; do
 done
 
 ensure_layout
+oauth_requested=0
+if [ "$#" -eq 0 ]; then
+  # 无参升级也负责收口已知的旧模板配置；即使模块产物未变，配置漂移仍是一项升级。
+  oauth_requested=1
+else
+  for requested in "$@"; do
+    case "$requested" in
+      dbdog-web | dbdog-mcp) oauth_requested=1 ;;
+    esac
+  done
+fi
+if [ "$oauth_requested" -eq 1 ]; then
+  migrate_legacy_web_public_urls "$ETC_DIR/dbdog-web.env"
+  migrate_legacy_mcp_public_urls "$ETC_DIR/dbdog-mcp.env"
+  # 已有完整应用栈时，升级与首次安装共用同一套默认配置校准：缺失/空值/占位
+  # 自动补齐，真实自定义地址和凭证保持不变。
+  if [ -f "$ETC_DIR/dbdog-server.env" ] \
+    && [ -f "$ETC_DIR/dbdog-web.env" ] \
+    && [ -f "$ETC_DIR/dbdog-mcp.env" ]; then
+    configure_ready_to_use_stack
+  fi
+fi
 if [ $# -gt 0 ]; then
   targets=("$@")
 else
@@ -419,19 +441,77 @@ else
     [ -e "$MODULES_DIR/$m/current" ] || [ -L "$MODULES_DIR/$m/current" ] || continue
     current_matches_artifact_identity "$m" "$version" "$sha256" || targets+=("$m")
   done < <(manifest_rows)
+  # 配置校准本身也是升级工作。把已安装的同版本模块放入计划后，upgrade_one 可以
+  # 安全跳过产物切换，下面仍会重启受影响服务并执行 OAuth 验收。
+  if [ "$DBDOG_SERVER_CONFIG_CHANGED" -eq 1 ] \
+    && { [ -e "$MODULES_DIR/dbdog-server/current" ] \
+      || [ -L "$MODULES_DIR/dbdog-server/current" ]; }; then
+    found=0
+    for m in "${targets[@]}"; do [ "$m" = dbdog-server ] && found=1; done
+    [ "$found" -eq 1 ] || targets+=(dbdog-server)
+  fi
+  if [ "$DBDOG_WEB_CONFIG_CHANGED" -eq 1 ] \
+    && { [ -e "$MODULES_DIR/dbdog-web/current" ] \
+      || [ -L "$MODULES_DIR/dbdog-web/current" ]; }; then
+    found=0
+    for m in "${targets[@]}"; do [ "$m" = dbdog-web ] && found=1; done
+    [ "$found" -eq 1 ] || targets+=(dbdog-web)
+  fi
+  if [ "$DBDOG_MCP_CONFIG_CHANGED" -eq 1 ] \
+    && { [ -e "$MODULES_DIR/dbdog-mcp/current" ] \
+      || [ -L "$MODULES_DIR/dbdog-mcp/current" ]; }; then
+    found=0
+    for m in "${targets[@]}"; do [ "$m" = dbdog-mcp ] && found=1; done
+    [ "$found" -eq 1 ] || targets+=(dbdog-mcp)
+  fi
   [ ${#targets[@]} -gt 0 ] || { log "没有可升级的模块（check-upgrade.sh 可查看详情）"; exit 0; }
 fi
 
 canonicalize_upgrade_modules "${targets[@]}"
 targets=("${ORDERED_UPGRADE_MODULES[@]}")
-# 0.1.3 及更早的 Web 发布模板曾带一组三联公网验收端口。只在三个 URL 同时精确
-# 命中该模板形状时自动迁移；正常的内网域名、反代地址和任意自定义配置都不覆盖。
+# Web/MCP 升级在切包后执行 OAuth 专项验收；前面的配置校准只补默认值或迁移精确
+# 命中的旧模板，正常的内网域名、反代地址和任意自定义配置都不覆盖。
+oauth_upgrade=0
 for m in "${targets[@]}"; do
-  if [ "$m" = "dbdog-web" ]; then
-    migrate_legacy_web_public_urls "$ETC_DIR/dbdog-web.env"
-    break
-  fi
+  case "$m" in
+    dbdog-web | dbdog-mcp) oauth_upgrade=1 ;;
+  esac
 done
+server_was_running=0
+ddsql_was_running=0
+web_was_running=0
+mcp_was_running=0
+if [ "$DBDOG_SERVER_CONFIG_CHANGED" -eq 1 ] \
+  && "$DBDOGCTL" status dbdog-server | grep -q '运行中'; then
+  server_was_running=1
+fi
+if [ "$DBDOG_SERVER_CONFIG_CHANGED" -eq 1 ] \
+  && "$DBDOGCTL" status ddsql-server | grep -q '运行中'; then
+  ddsql_was_running=1
+fi
+if [ "$DBDOG_WEB_CONFIG_CHANGED" -eq 1 ] \
+  && "$DBDOGCTL" status dbdog-web | grep -q '运行中'; then
+  web_was_running=1
+fi
+if [ "$DBDOG_MCP_CONFIG_CHANGED" -eq 1 ] \
+  && "$DBDOGCTL" status dbdog-mcp | grep -q '运行中'; then
+  mcp_was_running=1
+fi
 log "升级计划: ${targets[*]}"
 for m in "${targets[@]}"; do upgrade_one "$m"; done
+if [ "$server_was_running" -eq 1 ]; then
+  "$DBDOGCTL" restart dbdog-server
+fi
+if [ "$ddsql_was_running" -eq 1 ]; then
+  "$DBDOGCTL" restart ddsql-server
+fi
+if [ "$web_was_running" -eq 1 ]; then
+  "$DBDOGCTL" restart dbdog-web
+fi
+if [ "$mcp_was_running" -eq 1 ]; then
+  "$DBDOGCTL" restart dbdog-mcp
+fi
+if [ "$oauth_upgrade" -eq 1 ]; then
+  "$SCRIPTS_DIR/verify.sh" --oauth
+fi
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"

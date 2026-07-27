@@ -117,6 +117,11 @@ grep -Fqx 'PUBLIC_APP_URL=http://dbdog.internal:3000' "$ETC_DIR/dbdog-web.env" \
   || fail "web 默认访问 URL 未生成"
 grep -Fqx 'DBDOG_PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$ETC_DIR/dbdog-mcp.env" \
   || fail "MCP 默认访问 URL 未生成"
+grep -Fqx 'DBDOG_OAUTH_ISSUER=http://dbdog.internal:3000' "$ETC_DIR/dbdog-mcp.env" \
+  || fail "MCP OAuth issuer 缺失时未自动生成"
+grep -Fqx 'DBDOG_APP_BASE_URL=http://dbdog.internal:3000' "$ETC_DIR/dbdog-mcp.env" \
+  || fail "MCP app URL 缺失时未自动生成"
+[ "$DBDOG_MCP_CONFIG_CHANGED" -eq 1 ] || fail "MCP 缺失配置未标记运行态重启"
 [ "$(env_literal_value "$ETC_DIR/dbdog-server.env" DBDOG_INTERNAL_TOKEN)" = \
   "$(env_literal_value "$ETC_DIR/dbdog-web.env" DBDOG_INTERNAL_TOKEN)" ] \
   || fail "server/web 内部 token 不一致"
@@ -140,4 +145,64 @@ grep -Fqx 'PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$legacy_web_env" \
   || fail "旧 Web PUBLIC_MCP_URL 未自动迁移"
 pass "正常 Web 升级自动迁移旧验收模板 URL，且无需记录旧域名"
 
-printf 'ALL PASS: 7 release contract tests\n'
+legacy_mcp_env="$TEST_ROOT/legacy-mcp.env"
+cat >"$legacy_mcp_env" <<'EOF'
+DBDOG_OAUTH_ISSUER=http://legacy.example:25629
+DBDOG_PUBLIC_MCP_URL=http://legacy.example:24267/mcp
+DBDOG_APP_BASE_URL=http://legacy.example:25629
+EOF
+DBDOG_ADVERTISE_HOST=dbdog.internal migrate_legacy_mcp_public_urls "$legacy_mcp_env" >/dev/null
+grep -Fqx 'DBDOG_OAUTH_ISSUER=http://dbdog.internal:3000' "$legacy_mcp_env" \
+  || fail "旧 MCP OAuth issuer 未自动迁移"
+grep -Fqx 'DBDOG_PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$legacy_mcp_env" \
+  || fail "旧 MCP resource URL 未自动迁移"
+grep -Fqx 'DBDOG_APP_BASE_URL=http://dbdog.internal:3000' "$legacy_mcp_env" \
+  || fail "旧 MCP app URL 未自动迁移"
+[ "$DBDOG_MCP_CONFIG_CHANGED" -eq 1 ] || fail "MCP 配置迁移未要求重启运行态"
+pass "正常 Web/MCP 升级同步迁移 OAuth 三联 URL，并标记运行态重启"
+
+custom_mcp_env="$TEST_ROOT/custom-mcp.env"
+cat >"$custom_mcp_env" <<'EOF'
+DBDOG_OAUTH_ISSUER=https://console.internal.example
+DBDOG_PUBLIC_MCP_URL=https://mcp.internal.example/mcp
+DBDOG_APP_BASE_URL=https://console.internal.example
+EOF
+DBDOG_MCP_CONFIG_CHANGED=0
+DBDOG_ADVERTISE_HOST=dbdog.internal migrate_legacy_mcp_public_urls "$custom_mcp_env" >/dev/null
+grep -Fqx 'DBDOG_OAUTH_ISSUER=https://console.internal.example' "$custom_mcp_env" \
+  || fail "自定义 MCP OAuth issuer 被覆盖"
+grep -Fqx 'DBDOG_PUBLIC_MCP_URL=https://mcp.internal.example/mcp' "$custom_mcp_env" \
+  || fail "自定义 MCP resource URL 被覆盖"
+[ "$DBDOG_MCP_CONFIG_CHANGED" -eq 0 ] || fail "自定义 MCP 配置被误判为旧模板"
+pass "自定义 MCP 域名和反代地址保持不变"
+
+# 用本机 Node + 假 PG/HTTP 响应跑完整的 OAuth 专项验收，保证 JSON 字段、发现链和
+# WWW-Authenticate 解析不是只写了代码却从未执行。
+mkdir -p "$MODULES_DIR/node/current/bin" "$MODULES_DIR/postgresql/current/bin"
+ln -s "$(command -v node)" "$MODULES_DIR/node/current/bin/node"
+cat >"$MODULES_DIR/postgresql/current/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+printf 't\n'
+EOF
+chmod 0755 "$MODULES_DIR/postgresql/current/bin/psql"
+# source 只加载函数；main guard 保证测试不会执行真实验收。
+source "$SCRIPTS_DIR/verify.sh"
+retry_http() {
+  case "$1" in
+    *:3000/.well-known/oauth-authorization-server)
+      printf '%s\n' '{"issuer":"http://dbdog.internal:3000","authorization_endpoint":"http://dbdog.internal:3000/oauth/authorize","token_endpoint":"http://dbdog.internal:3000/oauth/token","registration_endpoint":"http://dbdog.internal:3000/oauth/register","code_challenge_methods_supported":["S256"]}'
+      ;;
+    *:8090/.well-known/oauth-protected-resource)
+      printf '%s\n' '{"resource":"http://dbdog.internal:8090/mcp","authorization_servers":["http://dbdog.internal:3000"],"bearer_methods_supported":["header"]}'
+      ;;
+    *) return 1 ;;
+  esac
+}
+curl() {
+  printf 'HTTP/1.1 401 Unauthorized\r\n'
+  printf 'www-authenticate: Bearer resource_metadata="http://dbdog.internal:8090/.well-known/oauth-protected-resource"\r\n\r\n'
+}
+oauth_main >/dev/null || fail "OAuth 专项升级验收未通过完整执行"
+pass "OAuth 专项验收覆盖表结构、发现元数据与 401 challenge"
+
+printf 'ALL PASS: 10 release contract tests\n'

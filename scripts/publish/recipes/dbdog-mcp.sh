@@ -38,9 +38,23 @@ EOF
 
 mkdir -p "$PKG/etc"
 cat >"$PKG/etc/dbdog-mcp.env.example" <<'EOF'
-# [首跑校准] dbdog-mcp 环境变量（对照源仓 README 补齐）
+# [首跑校准] dbdog-mcp 完整环境合同；install/upgrade 会把 change-me 自动校准。
 DBDOG_BASE_URL=http://127.0.0.1:8080
+DBDOG_INTERNAL_TOKEN=change-me
+DBDOG_OAUTH_JWT_SECRET=change-me
+DBDOG_HTTP_HOST=0.0.0.0
+DBDOG_HTTP_PORT=8090
+DBDOG_OAUTH_ISSUER=change-me
+DBDOG_PUBLIC_MCP_URL=change-me
+DBDOG_APP_BASE_URL=change-me
 EOF
+for required_key in \
+  DBDOG_BASE_URL DBDOG_INTERNAL_TOKEN DBDOG_OAUTH_JWT_SECRET \
+  DBDOG_HTTP_HOST DBDOG_HTTP_PORT DBDOG_OAUTH_ISSUER \
+  DBDOG_PUBLIC_MCP_URL DBDOG_APP_BASE_URL; do
+  grep -q "^${required_key}=" "$PKG/etc/dbdog-mcp.env.example" \
+    || die "MCP 环境模板缺少必需字段: $required_key"
+done
 echo "$VERSION" >"$PKG/VERSION"
 
 # 纯 JS 单文件 bundle，不含原生模块——产物不分架构

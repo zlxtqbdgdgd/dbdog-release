@@ -162,6 +162,19 @@ probe_web_pg_migrations() (
     -Atc "SELECT to_regclass('drizzle.__drizzle_migrations') IS NOT NULL" | grep -qx 't'
 )
 
+probe_web_oauth_schema() (
+  clear_probe_env
+  load_env dbdog-web || return 1
+  [ -n "${DATABASE_URL:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "
+    SELECT
+      to_regclass('public.oauth_clients') IS NOT NULL
+      AND to_regclass('public.oauth_auth_codes') IS NOT NULL
+      AND to_regclass('public.oauth_refresh_tokens') IS NOT NULL
+      AND to_regclass('public.oauth_refresh_token_families') IS NOT NULL
+  " | grep -qx 't'
+)
+
 probe_tenant_pg_blueprint() (
   clear_probe_env
   load_env dbdog-server || return 1
@@ -247,7 +260,110 @@ probe_mcp() (
   retry_http "http://127.0.0.1:${DBDOG_HTTP_PORT:-8090}/healthz"
 )
 
+probe_oauth_discovery() (
+  clear_probe_env
+  local node web_port mcp_port app_url issuer resource web_metadata resource_metadata challenge
+  node="$MODULES_DIR/node/current/bin/node"
+  [ -x "$node" ] || return 1
+  web_port="$(env_value dbdog-web PORT)" || return 1
+  mcp_port="$(env_value dbdog-mcp DBDOG_HTTP_PORT)" || return 1
+  app_url="$(env_value dbdog-web PUBLIC_APP_URL)" || return 1
+  issuer="$(env_value dbdog-mcp DBDOG_OAUTH_ISSUER)" || return 1
+  resource="$(env_value dbdog-mcp DBDOG_PUBLIC_MCP_URL)" || return 1
+  [ -n "$web_port" ] && [ -n "$mcp_port" ] \
+    && valid_url "$app_url" && valid_url "$issuer" && valid_url "$resource" \
+    || return 1
+  [ "${app_url%/}" = "${issuer%/}" ] || return 1
+
+  web_metadata="$(retry_http \
+    "http://127.0.0.1:${web_port}/.well-known/oauth-authorization-server")" \
+    || return 1
+  # shellcheck disable=SC2016 # 下方是传给 Node 的 JavaScript 模板字符串
+  if ! printf '%s' "$web_metadata" | "$node" --input-type=commonjs -e '
+      const fs = require("node:fs");
+      const expected = process.argv[1].replace(/\/+$/, "");
+      const m = JSON.parse(fs.readFileSync(0, "utf8"));
+      const ok = m.issuer === expected
+        && m.authorization_endpoint === `${expected}/oauth/authorize`
+        && m.token_endpoint === `${expected}/oauth/token`
+        && m.registration_endpoint === `${expected}/oauth/register`
+        && Array.isArray(m.code_challenge_methods_supported)
+        && m.code_challenge_methods_supported.includes("S256");
+      if (!ok) process.exit(1);
+    ' "$app_url"; then
+    return 1
+  fi
+
+  resource_metadata="$(retry_http \
+    "http://127.0.0.1:${mcp_port}/.well-known/oauth-protected-resource")" \
+    || return 1
+  if ! printf '%s' "$resource_metadata" | "$node" --input-type=commonjs -e '
+      const fs = require("node:fs");
+      const configured = new URL(process.argv[1]);
+      configured.search = "";
+      configured.hash = "";
+      const expectedResource = configured.toString().replace(/\/$/, "");
+      const expectedIssuer = process.argv[2].replace(/\/+$/, "");
+      const m = JSON.parse(fs.readFileSync(0, "utf8"));
+      const ok = m.resource === expectedResource
+        && Array.isArray(m.authorization_servers)
+        && m.authorization_servers.length === 1
+        && m.authorization_servers[0] === expectedIssuer;
+      if (!ok) process.exit(1);
+    ' "$resource" "$issuer"; then
+    return 1
+  fi
+
+  challenge="$(curl -sS --noproxy '*' --connect-timeout 1 --max-time 2 \
+    -D - -o /dev/null -X POST \
+    -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "http://127.0.0.1:${mcp_port}/mcp")" || return 1
+  # shellcheck disable=SC2016 # 下方是传给 Node 的 JavaScript 模板字符串
+  printf '%s' "$challenge" | "$node" --input-type=commonjs -e '
+    const fs = require("node:fs");
+    const resource = new URL(process.argv[1]);
+    resource.pathname = "/.well-known/oauth-protected-resource";
+    resource.search = "";
+    resource.hash = "";
+    const expected = resource.toString();
+    const lines = fs.readFileSync(0, "utf8").split(/\r?\n/);
+    const statusOk = /^HTTP\/\S+ 401(?:\s|$)/.test(lines[0] ?? "");
+    const auth = lines.find((line) => line.toLowerCase().startsWith("www-authenticate:")) ?? "";
+    if (!statusOk || !auth.includes(`Bearer resource_metadata="${expected}"`)) process.exit(1);
+  ' "$resource"
+)
+
+finish_checks() { # <成功文案>
+  local success_message="$1"
+  echo
+  if [ "$failures" -gt 0 ]; then
+    die "$failures 项基础验收失败；查看 $LOGS_DIR/ 下对应服务日志"
+  fi
+  log "$success_message"
+}
+
+oauth_main() {
+  check "server/web/MCP 内部 token 一致且非占位" probe_shared_internal_token
+  check "web/MCP OAuth JWT 一致且非占位" probe_shared_oauth_secret
+  check "web 后端与 PUBLIC_* URL 已配置" probe_web_urls
+  check "MCP 后端/OAuth/public URL 已配置" probe_mcp_urls
+  check "Web OAuth 表结构已迁移" probe_web_oauth_schema
+  check "MCP OAuth discovery 与 401 challenge 可用" probe_oauth_discovery
+  finish_checks "OAuth 自动认证链验收通过"
+}
+
 main() {
+  case "${1:-}" in
+    --oauth)
+      [ "$#" -eq 1 ] || die "用法: verify.sh [--oauth]"
+      ensure_layout
+      oauth_main
+      return
+      ;;
+    "") ;;
+    *) die "用法: verify.sh [--oauth]" ;;
+  esac
   ensure_layout
   echo "进程状态（仅供参考）："
   "$SCRIPTS_DIR/dbdogctl" status all
@@ -263,6 +379,7 @@ main() {
   check "web DATABASE_URL 可查询 ctl" probe_web_postgresql
   check "server Goose 迁移记录已落库" probe_server_pg_migrations
   check "web Drizzle 迁移记录已落库" probe_web_pg_migrations
+  check "Web OAuth 表结构已迁移" probe_web_oauth_schema
   check "web 至少有一个可登录管理员" probe_web_admin
   check "ClickHouse 可查询目标库" probe_clickhouse
   check "默认租户 PG 蓝图已推进且无错误" probe_tenant_pg_blueprint
@@ -272,12 +389,9 @@ main() {
   check "DDSQL 可查询 dd.database_instances（允许 0 行）" probe_ddsql_database_instances
   check "dbdog-web /login（仅 HTTP smoke）" probe_web
   check "dbdog-mcp /healthz（仅存活）" probe_mcp
+  check "MCP OAuth discovery 与 401 challenge 可用" probe_oauth_discovery
 
-  echo
-  if [ "$failures" -gt 0 ]; then
-    die "$failures 项基础验收失败；查看 $LOGS_DIR/ 下对应服务日志"
-  fi
-  log "基础部署验收通过；鉴权和 agent 仍需业务场景验证"
+  finish_checks "基础部署及 OAuth 自动发现链验收通过；agent 仍需业务场景验证"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
