@@ -170,8 +170,16 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
     "$m"-*) ;;
     *) die "[$m] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
   esac
-  [ "$rpath" = "$BUILD_WORK/$m/out/$BUILT_ARTIFACT" ] \
-    || die "[$m] 配方产物不在约定的远端 out 目录: $rpath"
+  local expected_rpath
+  if [ "$m" = dbdog-agent ]; then
+    # Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个 build attempt；
+    # 它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的路径/owner/mode 门禁。
+    expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build1/out/$BUILT_ARTIFACT"
+  else
+    expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
+  fi
+  [ "$rpath" = "$expected_rpath" ] || \
+    die "[$m] 配方产物不在约定的远端 out 目录: $rpath"
   log "[$m] 取回产物 $BUILT_ARTIFACT"
   fetch_remote_artifact "$rpath" "$SCRATCH/$BUILT_ARTIFACT"
   local artifact_arch

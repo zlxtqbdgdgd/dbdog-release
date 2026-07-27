@@ -41,6 +41,13 @@ chmod 0755 "$hook_root/hooks/pre-switch.sh"
 DBDOG_MIGRATION_REQUIRED=1 run_hook "$hook_root" pre-switch >/dev/null
 pass "升级编排把 required=1 传入模块迁移钩子"
 
+# shellcheck disable=SC2016
+grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build1/out/$BUILT_ARTIFACT"' \
+  "$SCRIPTS_DIR/publish/publish.sh" || fail "Agent 发布器未钉住 seal 的 canonical out 路径"
+# shellcheck disable=SC2016
+grep -Fq 'expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"' \
+  "$SCRIPTS_DIR/publish/publish.sh" || fail "其他模块的通用 out 路径门禁被放宽"
+
 env_file="$TEST_ROOT/service.env"
 cat >"$env_file" <<'EOF'
 PG_DSN=postgres://user:pass@127.0.0.1:5432/ctl
