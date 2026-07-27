@@ -86,6 +86,58 @@ update_manifest_row() { # <module> <version> <artifact> <sha256> <source_sha>
     "$MANIFEST" >"$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
 }
 
+fetch_remote_artifact() { # <远端绝对路径> <本地文件>；校验远端 SHA，支持断点续传
+  local remote_path="$1" dest="$2" remote_q metadata remote_size remote_sha
+  local local_size=0 local_sha="" remote_prefix_sha=""
+  printf -v remote_q '%q' "$remote_path"
+  metadata="$(ssh "$BUILD_HOST" \
+    "stat -c '%s' -- $remote_q && sha256sum -- $remote_q")" \
+    || die "无法读取构建机产物元数据: $remote_path"
+  remote_size="$(sed -n '1p' <<<"$metadata")"
+  remote_sha="$(sed -n '2p' <<<"$metadata" | awk '{print $1}')"
+  case "$remote_size" in '' | *[!0-9]*) die "构建机产物大小非法: $remote_size" ;; esac
+  [ "${#remote_sha}" -eq 64 ] || die "构建机产物 SHA-256 长度非法: $remote_sha"
+  case "$remote_sha" in *[!0-9a-f]*) die "构建机产物 SHA-256 非法: $remote_sha" ;; esac
+
+  if [ -f "$dest" ]; then
+    local_size="$(wc -c <"$dest" | tr -d '[:space:]')"
+    if [ "$local_size" -eq "$remote_size" ]; then
+      local_sha="$(shasum -a 256 "$dest" | awk '{print $1}')"
+      if [ "$local_sha" = "$remote_sha" ]; then
+        log "复用已完整取回的产物（远端 SHA-256 一致）"
+        return 0
+      fi
+    fi
+
+    if [ "$local_size" -gt 0 ] && [ "$local_size" -lt "$remote_size" ]; then
+      local_sha="$(shasum -a 256 "$dest" | awk '{print $1}')"
+      remote_prefix_sha="$(ssh "$BUILD_HOST" \
+        "head -c $local_size -- $remote_q | sha256sum" | awk '{print $1}')" \
+        || die "无法校验构建机产物前缀"
+      if [ "$local_sha" != "$remote_prefix_sha" ]; then
+        warn "本地产物前缀与构建机不一致，从头取回"
+        truncate -s 0 -- "$dest"
+        local_size=0
+      fi
+    else
+      truncate -s 0 -- "$dest"
+      local_size=0
+    fi
+  fi
+
+  if [ "$local_size" -gt 0 ]; then
+    log "从 $local_size / $remote_size 字节继续取回"
+  fi
+  # 目标构建机的 SFTP 链路可能极慢；SSH stdout 既能复用现有认证，也能从精确字节续传。
+  # banner 走 stderr，不会混入产物。失败时保留已验证前缀，下一次 publish 可继续。
+  ssh "$BUILD_HOST" "tail -c +$((local_size + 1)) -- $remote_q" >>"$dest" \
+    || die "从构建机取回产物失败（已保留断点）"
+  [ "$(wc -c <"$dest" | tr -d '[:space:]')" -eq "$remote_size" ] \
+    || die "取回后的产物大小与构建机不一致"
+  sha256_verify "$dest" "$remote_sha" \
+    || die "取回后的产物 SHA-256 与构建机不一致"
+}
+
 build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUILT_ARTIFACT/BUILT_SHA256
   local m="$1" ver="$2" sha="" core=""
   local recipe="$HERE/recipes/$m.sh"
@@ -118,8 +170,10 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
     "$m"-*) ;;
     *) die "[$m] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
   esac
+  [ "$rpath" = "$BUILD_WORK/$m/out/$BUILT_ARTIFACT" ] \
+    || die "[$m] 配方产物不在约定的远端 out 目录: $rpath"
   log "[$m] 取回产物 $BUILT_ARTIFACT"
-  scp -q "$BUILD_HOST:$rpath" "$SCRATCH/$BUILT_ARTIFACT"
+  fetch_remote_artifact "$rpath" "$SCRATCH/$BUILT_ARTIFACT"
   local artifact_arch
   case "$BUILT_ARTIFACT" in
     *-"$ARCH".tar.gz) artifact_arch="$ARCH" ;;
