@@ -172,7 +172,7 @@ assert_manifest_is_origin_main() {
 
 prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，再删非当前资产
   local execute="$1"; shift
-  local asset_rows assets protected m current expected remote_digest f
+  local asset_rows assets protected m current expected remote_digest f asset_id
   local modules=("$@") victims=""
 
   if [ ${#modules[@]} -eq 0 ]; then
@@ -181,10 +181,10 @@ prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，�
 
   [ "$execute" -eq 1 ] && assert_manifest_is_origin_main
 
-  asset_rows="$(gh release view "$BUCKET_TAG" -R "$REPO" --json assets \
-    --jq '.assets[] | [.name, (.digest // "")] | @tsv')" \
+  asset_rows="$(gh api "repos/$REPO/releases/tags/$BUCKET_TAG" \
+    --jq '.assets[] | [.id, .name, (.digest // "")] | @tsv')" \
     || die "读取产物桶失败"
-  assets="$(printf '%s\n' "$asset_rows" | cut -f1)"
+  assets="$(printf '%s\n' "$asset_rows" | cut -f2)"
   protected="$(manifest_rows | cut -f6)"
 
   # 删除任何文件前，先保证当前资产的模块归属、存在性和内容都正确。
@@ -198,7 +198,7 @@ prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，�
       || die "[$m] manifest 当前资产不在产物桶，拒绝清理: $current"
     expected="$(manifest_get "$m" 7)"
     remote_digest="$(printf '%s\n' "$asset_rows" | awk -F'\t' -v a="$current" \
-      '$1==a { sub(/^sha256:/, "", $2); print $2; exit }')"
+      '$2==a { sub(/^sha256:/, "", $3); print $3; exit }')"
     [ -n "$remote_digest" ] && [ "$remote_digest" = "$expected" ] \
       || die "[$m] 产物桶 SHA-256 与 manifest 不一致，拒绝清理: $current"
   done
@@ -228,7 +228,9 @@ prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，�
     while IFS= read -r f; do
       # 缩小并发发布窗口；检测到 main 漂移时宁可留下旧文件。
       assert_manifest_is_origin_main
-      gh release delete-asset "$BUCKET_TAG" "$f" -y -R "$REPO" \
+      asset_id="$(printf '%s\n' "$asset_rows" | awk -F'\t' -v a="$f" '$2==a {print $1; exit}')"
+      [ -n "$asset_id" ] || die "找不到旧产物的 asset ID，拒绝删除: $f"
+      gh api --method DELETE "repos/$REPO/releases/assets/$asset_id" \
         || die "删除旧产物失败: $f"
     done <<<"$victims"
     log "清理完成"
