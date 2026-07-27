@@ -191,8 +191,12 @@ systemd。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入�
 - 下载并校验 manifest 产物，确认它确实包含 GaussDB integration、编译后的
   `psycopg_c`/私有 `libpq` 和五个核心二进制；
 - 从运行中的 `gaussdb` 进程、`/proc/<pid>/environ`、`postmaster.pid` 与配置发现实际端口、
-  `GAUSSHOME`、`PGDATA`、`GAUSSLOG`。只有进程环境缺值时才把目标用户 profile 当静态文本
-  读取字面量，绝不 `source .bashrc`；
+  Unix socket、`GAUSSHOME`、`PGDATA`、`GAUSSLOG`、`PATH` 与 `LD_LIBRARY_PATH`。运行进程环境
+  优先；同时在清空的环境中，以数据库 OS 用户权限和硬超时加载 `.profile`、`.bash_profile`、
+  `.bashrc`，以及 `MPPDB_ENV_SEPARATE_PATH`、`gauss_env_file`/`gsql_env.sh` 等常见环境文件，
+  最终只把 gsql 启动所需的白名单变量交给 root 安装器；
+- 用发现出的同一套客户端环境依次执行 `ldd gsql`、`gsql --version` 和本地 `SELECT 1`
+  预检，全部通过后才修改监控用户、兼容对象或 HBA；
 - 用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备：创建/刷新 `dbdog`
   MONADMIN、`dbdog.statements`/`dbdog.activity`/explain 兼容对象，并为本机
   `127.0.0.1` 监控连接落一条受管 HBA 规则。`gsql` 不参与日常采集；
@@ -204,7 +208,8 @@ systemd。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入�
   validate、Remote Config trust root、四服务 active、forwarder health 和真实
   `agent check gaussdb` 全部通过才返回成功，否则恢复上一套 runtime/config/unit。
 
-Agent 包里的 `23.9.1` 是 **GaussDB integration 版本**，不是被监控 GaussDB 的服务端版本。
+Agent 包里的 `1.0.0` 是 **GaussDB integration 自身的首版版本**，不是被监控 GaussDB 的服务端版本，
+两者没有版本绑定关系。
 日常采集由该 integration 通过 psycopg `ConnectionPool` 和包内 libpq 完成，服务端版本则在
 运行期执行 `SHOW SERVER_VERSION` / `SELECT version()` 识别。安装器不会因为目标 GaussDB
 版本字符串变化而拒装；若新版本真实改变了协议或系统视图，末尾 check 会 fail closed，此时应
@@ -221,10 +226,14 @@ git pull --ff-only
 sudo ./scripts/upgrade.sh dbdog-agent
 ```
 
-显式设置 `DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、`DBDOG_GAUSSDB_DEPLOYMENT`、
-`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的特殊部署。正常集中式安装
-不需要这些覆盖。上一套 root/config 会保留在安装输出给出的 `.dbdog-agent-before-*` 目录，
-Agent 的数据库 check 诊断留在 `/var/log/dbdog-agent/install-gaussdb-check.log`（0600）。
+显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`、
+`DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、
+`DBDOG_GAUSSDB_DEPLOYMENT`、`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的
+特殊部署。正常集中式安装不需要这些覆盖。上一套 root/config 会保留在安装输出给出的
+`.dbdog-agent-before-*` 目录。安装验收诊断均为 root `0600` 文件：配置检查在
+`/var/log/dbdog-agent/install-configcheck.log`，forwarder health 在
+`/var/log/dbdog-agent/install-agent-health.log`，数据库 check 在
+`/var/log/dbdog-agent/install-gaussdb-check.log`。
 
 ## 公网：发布（维护者）
 

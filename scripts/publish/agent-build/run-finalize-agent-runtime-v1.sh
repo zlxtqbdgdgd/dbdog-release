@@ -1,5 +1,5 @@
 #!/usr/bin/bash
-# Narrow root entry point for the pinned Kylin V10 AArch64 dbdog-agent
+# Narrow root entry point for the pinned Kylin V11 AArch64 dbdog-agent
 # finalizer. Install this file and the matching finalizer as root-owned,
 # read-only controls. Do not grant this control NOPASSWD access: the finalizer
 # deliberately executes binaries from the completed build tree and therefore
@@ -15,20 +15,21 @@ unset BASH_ENV CDPATH ENV GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
 
 readonly EXPECTED_SELF=/home/dbdog/cache/dbdog-agent/controls/run-finalize-agent-runtime-v1.sh
 readonly FINALIZER=/home/dbdog/cache/dbdog-agent/controls/finalize-agent-runtime-v1.sh
-readonly FINALIZER_SHA256=237f20579fbb1e9155183211d07cc5b6bbf45908d912021b21a87a17d7c9f79d
-readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build1
+readonly FINALIZER_SHA256=5f0e666753426540c5767e96eeadd8b83c51db461fbb73dfa1c00867e4d2e400
+readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
 readonly INSTALL_DIR=/opt/dbdog-agent
-readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build1/out
+readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2/out
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
-readonly CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
-readonly MANIFEST_REL="manifests/$AGENT_SHA-$CORE_SHA-aarch64-kylin10-v7"
-readonly OVERLAY_REL="control-overlays/$AGENT_SHA-$CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
+readonly OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
+readonly CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
+readonly MANIFEST_REL="manifests/$AGENT_SHA-$OMNIBUS_CORE_SHA-aarch64-kylin10-v7"
+readonly OVERLAY_REL="control-overlays/$AGENT_SHA-$OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v11"
 readonly OVERLAY_DIR="$CACHE_ROOT/$OVERLAY_REL"
-readonly RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
+readonly RUNNER_SHA256=b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184
 readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly CONTROL_INFO_SHA256=6f9cbfd956792d68c2b512159d6cdb19df07a5d0433e682e06e6bf7e3c95264a
-readonly CONTROL_MANIFEST_SHA256=f1cefa64ce393e7025c1b8822899e3ea856a000bba5372ad1ffd0b910886e7ac
+readonly CONTROL_INFO_SHA256=3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647
+readonly CONTROL_MANIFEST_SHA256=5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81
 readonly PATCHELF_TOOL_REL=tools/patchelf/0.18.0-aarch64-kylin10-v2
 readonly PATCHELF_REL="$PATCHELF_TOOL_REL/bin/patchelf"
 readonly PATCHELF_TOOL_DIR="$CACHE_ROOT/$PATCHELF_TOOL_REL"
@@ -179,25 +180,25 @@ os_version=$(/usr/bin/awk -F= '$1 == "VERSION_ID" { value=$0; sub(/^[^=]*=/, "",
 [[ $os_id == kylin && $os_version == V10 ]] || \
   die "root finalizer requires Kylin V10, found $os_id $os_version"
 
-[[ -d $OVERLAY_DIR && ! -L $OVERLAY_DIR ]] || die "missing v10 control overlay: $OVERLAY_DIR"
+[[ -d $OVERLAY_DIR && ! -L $OVERLAY_DIR ]] || die "missing v11 control overlay: $OVERLAY_DIR"
 [[ $(/usr/bin/readlink -e -- "$OVERLAY_DIR") == "$OVERLAY_DIR" ]] || \
-  die 'v10 control overlay resolves through an unexpected path'
+  die 'v11 control overlay resolves through an unexpected path'
 [[ $(/usr/bin/stat -c '%u:%g:%a' -- "$OVERLAY_DIR") == 0:0:555 ]] || \
-  die 'v10 control overlay must be root:root mode 0555'
+  die 'v11 control overlay must be root:root mode 0555'
 overlay_inventory=$(/usr/bin/find "$OVERLAY_DIR" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)
 expected_overlay_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
 [[ $overlay_inventory == "$expected_overlay_inventory" ]] || \
-  die 'v10 control-overlay inventory differs from the pinned four-file set'
+  die 'v11 control-overlay inventory differs from the pinned four-file set'
 for overlay_data in CONTROL-INFO CONTROL.sha256 agent-build-kylin-platform.patch; do
   [[ -f $OVERLAY_DIR/$overlay_data && ! -L $OVERLAY_DIR/$overlay_data ]] || \
-    die "v10 control is not a regular file: $overlay_data"
+    die "v11 control is not a regular file: $overlay_data"
   [[ $(/usr/bin/stat -c '%u:%g:%a' -- "$OVERLAY_DIR/$overlay_data") == 0:0:444 ]] || \
-    die "v10 control must be root:root mode 0444: $overlay_data"
+    die "v11 control must be root:root mode 0444: $overlay_data"
 done
 [[ -f $OVERLAY_DIR/run-agent-omnibus.sh && ! -L $OVERLAY_DIR/run-agent-omnibus.sh ]] || \
-  die 'v10 runner is not a regular file'
+  die 'v11 runner is not a regular file'
 [[ $(/usr/bin/stat -c '%u:%g:%a' -- "$OVERLAY_DIR/run-agent-omnibus.sh") == 0:0:555 ]] || \
-  die 'v10 runner must be root:root mode 0555'
+  die 'v11 runner must be root:root mode 0555'
 if ! /usr/bin/cmp -s -- "$OVERLAY_DIR/CONTROL.sha256" <(
   printf '%s  %s\n' \
     "$RUNNER_SHA256" \
@@ -209,18 +210,18 @@ if ! /usr/bin/cmp -s -- "$OVERLAY_DIR/CONTROL.sha256" <(
     "$PATCHELF_SHA256" \
     "$PATCHELF_REL"
 ); then
-  die 'v10 CONTROL.sha256 differs from the pinned four-entry manifest'
+  die 'v11 CONTROL.sha256 differs from the pinned four-entry manifest'
 fi
 printf '%s  %s\n' "$CONTROL_MANIFEST_SHA256" "$OVERLAY_DIR/CONTROL.sha256" | \
-  /usr/bin/sha256sum -c - >/dev/null || die 'v10 CONTROL.sha256 checksum mismatch'
+  /usr/bin/sha256sum -c - >/dev/null || die 'v11 CONTROL.sha256 checksum mismatch'
 (cd "$CACHE_ROOT" && /usr/bin/sha256sum -c "$OVERLAY_REL/CONTROL.sha256" >/dev/null) || \
-  die 'v10 control-overlay content checksum mismatch'
+  die 'v11 control-overlay content checksum mismatch'
 printf '%s  %s\n' "$RUNNER_SHA256" "$OVERLAY_DIR/run-agent-omnibus.sh" | \
-  /usr/bin/sha256sum -c - >/dev/null || die 'v10 runner checksum mismatch'
+  /usr/bin/sha256sum -c - >/dev/null || die 'v11 runner checksum mismatch'
 printf '%s  %s\n' "$PLATFORM_PATCH_SHA256" "$OVERLAY_DIR/agent-build-kylin-platform.patch" | \
-  /usr/bin/sha256sum -c - >/dev/null || die 'v10 platform patch checksum mismatch'
+  /usr/bin/sha256sum -c - >/dev/null || die 'v11 platform patch checksum mismatch'
 printf '%s  %s\n' "$CONTROL_INFO_SHA256" "$OVERLAY_DIR/CONTROL-INFO" | \
-  /usr/bin/sha256sum -c - >/dev/null || die 'v10 CONTROL-INFO checksum mismatch'
+  /usr/bin/sha256sum -c - >/dev/null || die 'v11 CONTROL-INFO checksum mismatch'
 verify_patchelf_tool_authority
 
 readonly OMNIBUS_SUCCESS="$BUILD_DIR/omnibus.success"
@@ -229,7 +230,7 @@ if ! /usr/bin/cmp -s -- "$OMNIBUS_SUCCESS" <(
   printf '%s\n' \
     "manifest_rel=$MANIFEST_REL" \
     "agent_sha=$AGENT_SHA" \
-    "core_sha=$CORE_SHA" \
+    "core_sha=$OMNIBUS_CORE_SHA" \
     "omnibus_ruby_sha=$OMNIBUS_RUBY_SHA" \
     "control_overlay_rel=$OVERLAY_REL" \
     "control_overlay_runner_sha256=$RUNNER_SHA256" \
@@ -238,7 +239,7 @@ if ! /usr/bin/cmp -s -- "$OMNIBUS_SUCCESS" <(
     "patchelf_sha256=$PATCHELF_SHA256" \
     'host_distribution=rhel'
 ); then
-  die 'Omnibus success handoff does not match the exact v7/v10 controls'
+  die 'Omnibus success handoff does not match the exact v7/v11 controls'
 fi
 
 exec /usr/bin/env -i \

@@ -10,7 +10,12 @@ export LC_ALL=C
 readonly OFFICIAL_INSTALL_DIR=/opt/datadog-agent
 readonly PRIVATE_INSTALL_DIR=/opt/dbdog-agent
 readonly MAX_GLIBC_VERSION=2.28
-readonly DEFAULT_GAUSSDB_VERSION=23.9.1
+readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
+readonly EXPECTED_GAUSSDB_INTEGRATION_VERSION=1.0.0
+readonly EXPECTED_INTEGRATION_CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
+readonly OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
+readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
+readonly GAUSSDB_WHEEL_SHA256=06fd5eea7acd51a0ebf519be58a2700f1ca4142a13b0668cb7f5e66ef022f7f6
 readonly ADP_SOFTWARE_NAME=datadog-agent-data-plane
 readonly ADP_VERSION=1.2.2
 readonly ADP_INPUT_REL=sources/agent-data-plane-1.2.2-linux-arm64.tar.gz
@@ -18,11 +23,11 @@ readonly ADP_INPUT_SHA256=f071bd14e06308754848140f7b5beac27b02e11105e0970b293417
 readonly AGENT_CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly EXPECTED_MANIFEST_REL=manifests/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7
 readonly EXPECTED_OMNIBUS_RUBY_SHA=5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749
-readonly EXPECTED_CONTROL_OVERLAY_REL=control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v10
-readonly EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
+readonly EXPECTED_CONTROL_OVERLAY_REL=control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v11
+readonly EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184
 readonly EXPECTED_PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly EXPECTED_CONTROL_INFO_SHA256=6f9cbfd956792d68c2b512159d6cdb19df07a5d0433e682e06e6bf7e3c95264a
-readonly EXPECTED_CONTROL_MANIFEST_SHA256=f1cefa64ce393e7025c1b8822899e3ea856a000bba5372ad1ffd0b910886e7ac
+readonly EXPECTED_CONTROL_INFO_SHA256=3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647
+readonly EXPECTED_CONTROL_MANIFEST_SHA256=5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81
 readonly EXPECTED_PATCHELF_TOOL_REL=tools/patchelf/0.18.0-aarch64-kylin10-v2
 readonly EXPECTED_PATCHELF_REL=$EXPECTED_PATCHELF_TOOL_REL/bin/patchelf
 readonly EXPECTED_PATCHELF_SHA256=01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf
@@ -58,7 +63,6 @@ Optional environment:
   ARCH=aarch64
   AGENT_SOURCE_DIR=$BUILD_DIR/src
   CORE_REPO=/home/dbdog/cache/dbdog-agent/git/dbdog-agent-core.git
-  GAUSSDB_VERSION=23.9.1
   SOURCE_DATE_EPOCH=<non-negative Unix timestamp>
   BUILDER_IMAGE_DIGEST=sha256:<64 lowercase hex>
   BUILDER_IDENTITY=<explicit native-builder identity; alternative to image digest>
@@ -134,7 +138,7 @@ verify_omnibus_success_marker() {
     printf '%s\n' \
       "manifest_rel=$EXPECTED_MANIFEST_REL" \
       "agent_sha=$agent_sha" \
-      "core_sha=$core_sha" \
+      "core_sha=$OMNIBUS_CORE_SHA" \
       "omnibus_ruby_sha=$EXPECTED_OMNIBUS_RUBY_SHA" \
       "control_overlay_rel=$EXPECTED_CONTROL_OVERLAY_REL" \
       "control_overlay_runner_sha256=$EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256" \
@@ -143,7 +147,7 @@ verify_omnibus_success_marker() {
       "patchelf_sha256=$EXPECTED_PATCHELF_SHA256" \
       "host_distribution=$EXPECTED_HOST_DISTRIBUTION"
   ); then
-    die "omnibus.success does not match the exact Kylin v10 control handoff"
+    die "omnibus.success does not match the exact Kylin v11 control handoff"
   fi
 }
 
@@ -232,27 +236,27 @@ verify_omnibus_control_overlay() {
     die "agent cache root must resolve exactly to $AGENT_CACHE_ROOT"
   overlay_dir="$cache_root/$EXPECTED_CONTROL_OVERLAY_REL"
   [[ -d $overlay_dir && ! -L $overlay_dir ]] ||
-    die "missing real Omnibus v10 control-overlay directory"
+    die "missing real Omnibus v11 control-overlay directory"
   [[ $(readlink -e -- "$overlay_dir") == "$overlay_dir" ]] ||
-    die "Omnibus v10 control overlay resolves through an unexpected path"
+    die "Omnibus v11 control overlay resolves through an unexpected path"
   [[ $(stat -c '%u:%g:%a' -- "$overlay_dir") == 0:0:555 ]] ||
-    die "Omnibus v10 control-overlay directory must be root:root mode 0555"
+    die "Omnibus v11 control-overlay directory must be root:root mode 0555"
 
   expected_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
   actual_inventory=$(find "$overlay_dir" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
   [[ $actual_inventory == "$expected_inventory" ]] ||
-    die "Omnibus v10 control-overlay inventory differs from the exact four-file set"
+    die "Omnibus v11 control-overlay inventory differs from the exact four-file set"
 
   for overlay_file in CONTROL-INFO CONTROL.sha256 agent-build-kylin-platform.patch; do
     [[ -f $overlay_dir/$overlay_file && ! -L $overlay_dir/$overlay_file ]] ||
-      die "Omnibus v10 control file is not a real regular file: $overlay_file"
+      die "Omnibus v11 control file is not a real regular file: $overlay_file"
     [[ $(stat -c '%u:%g:%a' -- "$overlay_dir/$overlay_file") == 0:0:444 ]] ||
-      die "Omnibus v10 control file must be root:root mode 0444: $overlay_file"
+      die "Omnibus v11 control file must be root:root mode 0444: $overlay_file"
   done
   [[ -f $overlay_dir/run-agent-omnibus.sh && ! -L $overlay_dir/run-agent-omnibus.sh ]] ||
-    die "Omnibus v10 runner is not a real regular file"
+    die "Omnibus v11 runner is not a real regular file"
   [[ $(stat -c '%u:%g:%a' -- "$overlay_dir/run-agent-omnibus.sh") == 0:0:555 ]] ||
-    die "Omnibus v10 runner must be root:root mode 0555"
+    die "Omnibus v11 runner must be root:root mode 0555"
 
   if ! cmp -s -- "$overlay_dir/CONTROL.sha256" <(
     printf '%s  %s\n' \
@@ -265,15 +269,15 @@ verify_omnibus_control_overlay() {
       "$EXPECTED_PATCHELF_SHA256" \
       "$EXPECTED_PATCHELF_REL"
   ); then
-    die "Omnibus v10 CONTROL.sha256 does not match the pinned four-entry manifest"
+    die "Omnibus v11 CONTROL.sha256 does not match the pinned four-entry manifest"
   fi
   printf '%s  %s\n' "$EXPECTED_CONTROL_MANIFEST_SHA256" \
     "$overlay_dir/CONTROL.sha256" | sha256sum -c - >/dev/null ||
-    die "Omnibus v10 CONTROL.sha256 digest differs from the pinned value"
+    die "Omnibus v11 CONTROL.sha256 digest differs from the pinned value"
   (
     cd "$cache_root"
     sha256sum -c "$EXPECTED_CONTROL_OVERLAY_REL/CONTROL.sha256"
-  ) >/dev/null || die "Omnibus v10 control-overlay checksum verification failed"
+  ) >/dev/null || die "Omnibus v11 control-overlay checksum verification failed"
 
   verify_patchelf_tool_authority "$cache_root"
 }
@@ -722,6 +726,87 @@ for path in sys.argv[1:]:
 PYEOF
 }
 
+install_pinned_gaussdb_integration() {
+  local root=$1
+  local python="$root/embedded/bin/python3"
+  local cache_root wheel wheel_real version_source
+
+  cache_root=$(canonical_existing_dir AGENT_CACHE_ROOT "$AGENT_CACHE_ROOT")
+  [[ $cache_root == "$AGENT_CACHE_ROOT" ]] ||
+    die "agent cache root moved unexpectedly while installing $GAUSSDB_INTEGRATION_NAME"
+  wheel="$cache_root/$GAUSSDB_WHEEL_REL"
+  [[ -f $wheel && ! -L $wheel ]] ||
+    die "pinned $GAUSSDB_INTEGRATION_NAME wheel is missing or is a symlink: $wheel"
+  wheel_real=$(require_path_within "pinned $GAUSSDB_INTEGRATION_NAME wheel" "$cache_root" "$wheel")
+  [[ $wheel_real == "$wheel" ]] ||
+    die "pinned $GAUSSDB_INTEGRATION_NAME wheel resolves through an unexpected path"
+  [[ $(stat -c '%u:%g:%a' -- "$wheel") == 0:0:444 ]] ||
+    die "pinned $GAUSSDB_INTEGRATION_NAME wheel must be root:root mode 0444"
+  printf '%s  %s\n' "$GAUSSDB_WHEEL_SHA256" "$wheel" |
+    sha256sum -c - >/dev/null || die "pinned $GAUSSDB_INTEGRATION_NAME wheel checksum mismatch"
+  [[ -x $python ]] || die "embedded Python is missing while installing $GAUSSDB_INTEGRATION_NAME"
+
+  env -i \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/usr/bin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$python" -I -B - \
+      "$wheel" "$GAUSSDB_INTEGRATION_NAME" "$EXPECTED_GAUSSDB_INTEGRATION_VERSION" <<'PYEOF'
+from email.parser import BytesParser
+from pathlib import PurePosixPath
+import sys
+import zipfile
+
+wheel_path, expected_name, expected_version = sys.argv[1:]
+with zipfile.ZipFile(wheel_path) as archive:
+    names = archive.namelist()
+    for name in names:
+        path = PurePosixPath(name)
+        if path.is_absolute() or ".." in path.parts or "\\" in name:
+            raise SystemExit(f"unsafe wheel member: {name!r}")
+        if name.lower().endswith((".so", ".dylib", ".dll", ".pyd")):
+            raise SystemExit(f"wheel is not pure Python: {name!r}")
+    metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+    wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
+    if len(metadata_names) != 1 or len(wheel_names) != 1:
+        raise SystemExit("wheel must contain one METADATA and one WHEEL record")
+    metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
+    wheel_metadata = BytesParser().parsebytes(archive.read(wheel_names[0]))
+    if metadata.get("Name") != expected_name or metadata.get("Version") != expected_version:
+        raise SystemExit(
+            f"wheel identity mismatch: {metadata.get('Name')!r} {metadata.get('Version')!r}"
+        )
+    if wheel_metadata.get("Root-Is-Purelib") != "true":
+        raise SystemExit("wheel does not declare Root-Is-Purelib: true")
+    if wheel_metadata.get_all("Tag", []) != ["py3-none-any"]:
+        raise SystemExit("wheel does not have the exact py3-none-any tag")
+PYEOF
+
+  version_source=$(
+    git_in "$core_repo" show "$core_sha:gaussdb/datadog_checks/gaussdb/__about__.py"
+  ) || die "cannot read GaussDB integration version source at CORE_SHA"
+  grep -Eq "^__version__[[:space:]]*=[[:space:]]*['\"]${EXPECTED_GAUSSDB_INTEGRATION_VERSION}['\"]$" \
+    <<<"$version_source" ||
+    die "CORE_SHA does not declare $GAUSSDB_INTEGRATION_NAME $EXPECTED_GAUSSDB_INTEGRATION_VERSION"
+
+  log "installing pinned pure-Python $GAUSSDB_INTEGRATION_NAME wheel over the Omnibus integration"
+  env -i \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/usr/bin:/bin \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$python" -I -B -m pip install \
+      --no-index \
+      --no-deps \
+      --force-reinstall \
+      --no-cache-dir \
+      "$wheel" >/dev/null || die "offline $GAUSSDB_INTEGRATION_NAME wheel install failed"
+}
+
 verify_gaussdb() {
   local root=$1
   local python="$root/embedded/bin/python3"
@@ -735,18 +820,25 @@ verify_gaussdb() {
       LC_ALL=C.UTF-8 \
       PATH=/usr/bin:/bin \
       PYTHONDONTWRITEBYTECODE=1 \
-      "$python" -I -B - "$root" "$gaussdb_version" <<'PYEOF'
+      "$python" -I -B - "$root" <<'PYEOF'
 from importlib import metadata
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1]).resolve()
-expected = sys.argv[2]
 import datadog_checks.gaussdb as gaussdb
 from datadog_checks.gaussdb import GaussDb  # noqa: F401
 
 module_path = Path(gaussdb.__file__).resolve()
-distribution = metadata.distribution("datadog-gaussdb")
+normalize = lambda value: value.lower().replace("_", "-").replace(".", "-")
+distributions = [
+    distribution
+    for distribution in metadata.distributions()
+    if normalize(distribution.metadata.get("Name", "")) == "datadog-gaussdb"
+]
+if len(distributions) != 1:
+    raise SystemExit(f"expected one datadog-gaussdb distribution, found {len(distributions)}")
+distribution = distributions[0]
 distribution_path = Path(distribution._path).resolve()
 version = gaussdb.__version__
 distribution_version = distribution.version
@@ -756,9 +848,9 @@ for label, path in (("module", module_path), ("distribution", distribution_path)
         path.relative_to(root)
     except ValueError as error:
         raise SystemExit(f"gaussdb {label} resolved outside runtime: {path}") from error
-if version != expected or distribution_version != expected:
+if version != distribution_version:
     raise SystemExit(
-        f"gaussdb version mismatch: import={version}, metadata={distribution_version}, expected={expected}"
+        f"gaussdb package metadata mismatch: import={version}, metadata={distribution_version}"
     )
 print(
     "\t".join(
@@ -775,10 +867,173 @@ PYEOF
 
   IFS=$'\t' read -r module_relative dist_relative imported_version dist_version <<<"$output"
   [[ -n $module_relative && -n $dist_relative ]] || die "gaussdb validation returned incomplete paths"
-  [[ $imported_version == "$gaussdb_version" && $dist_version == "$gaussdb_version" ]] ||
-    die "gaussdb validation returned unexpected versions"
+  [[ $imported_version == "$dist_version" ]] ||
+    die "gaussdb import and distribution metadata versions differ"
+  [[ $imported_version == "$EXPECTED_GAUSSDB_INTEGRATION_VERSION" ]] ||
+    die "unexpected $GAUSSDB_INTEGRATION_NAME integration version: $imported_version (expected $EXPECTED_GAUSSDB_INTEGRATION_VERSION)"
   printf '%s\t%s\t%s\t%s\n' \
     "$module_relative" "$dist_relative" "$imported_version" "$dist_version"
+}
+
+write_gaussdb_provenance() {
+  local root=$1 output=$2 information
+  local module_relative dist_relative imported_version dist_version
+
+  information=$(verify_gaussdb "$root")
+  IFS=$'\t' read -r module_relative dist_relative imported_version dist_version <<<"$information"
+  printf '%s\n' \
+    "integration_name=$GAUSSDB_INTEGRATION_NAME" \
+    "integration_version=$imported_version" \
+    "integration_source_git_sha=$core_sha" \
+    "wheel_rel=$GAUSSDB_WHEEL_REL" \
+    "wheel_sha256=$GAUSSDB_WHEEL_SHA256" \
+    "module_path=./$module_relative" \
+    "distribution_path=./$dist_relative" \
+    "import_version=$imported_version" \
+    "distribution_version=$dist_version" \
+    >"$output"
+}
+
+collect_agent_version_evidence() {
+  local root=$1 expected=$2
+  local agent_binary="$root/bin/agent/agent"
+  local manifest_text="$root/version-manifest.txt"
+  local manifest_json="$root/version-manifest.json"
+  local version_output compiled_version manifest_header_version manifest_component_version manifest_json_version
+  local binary_sha256 version_output_sha256 manifest_text_sha256 manifest_json_sha256
+
+  [[ -f $agent_binary && ! -L $agent_binary && -x $agent_binary ]] ||
+    die "Agent version probe binary is missing, linked, or not executable under $root"
+  [[ -f $manifest_text && ! -L $manifest_text ]] ||
+    die "Omnibus version-manifest.txt is missing or is a symlink under $root"
+  [[ -f $manifest_json && ! -L $manifest_json ]] ||
+    die "Omnibus version-manifest.json is missing or is a symlink under $root"
+  require_path_within 'Agent version probe binary' "$root" "$agent_binary" >/dev/null
+  require_path_within 'Omnibus version-manifest.txt' "$root" "$manifest_text" >/dev/null
+  require_path_within 'Omnibus version-manifest.json' "$root" "$manifest_json" >/dev/null
+  (($(stat -c %s -- "$manifest_text") <= 16777216)) ||
+    die "Omnibus version-manifest.txt is unexpectedly large"
+  (($(stat -c %s -- "$manifest_json") <= 16777216)) ||
+    die "Omnibus version-manifest.json is unexpectedly large"
+
+  version_output=$(
+    env -i \
+      HOME=/nonexistent \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      PATH="$root/embedded/bin:/usr/bin:/bin" \
+      "$agent_binary" version 2>&1
+  ) || die "compiled Agent version probe failed under $root"
+  reject_control_characters 'compiled Agent version output' "$version_output"
+  case "$version_output" in
+    'Agent '*) ;;
+    *) die "compiled Agent version output has an unexpected format: $version_output" ;;
+  esac
+  compiled_version=${version_output#Agent }
+  compiled_version=${compiled_version%% *}
+  [[ $compiled_version == "$expected" ]] ||
+    die "compiled Agent version is $compiled_version, expected release VERSION $expected"
+  case "$version_output" in
+    "Agent $expected - Meta: "*) ;;
+    *) die "compiled Agent version output does not bind the exact release VERSION: $version_output" ;;
+  esac
+
+  manifest_header_version=$(
+    awk 'NR == 1 && NF == 2 && $1 == "agent" { print $2; found++ }
+      END { exit(found == 1 ? 0 : 1) }' "$manifest_text"
+  ) || die "version-manifest.txt lacks one exact agent header"
+  manifest_component_version=$(
+    awk '$1 == "datadog-agent" { if (NF < 2) exit 2; value=$2; found++ }
+      END { if (found == 1) print value; else exit 1 }' "$manifest_text"
+  ) || die "version-manifest.txt lacks one exact datadog-agent component row"
+  [[ $manifest_header_version == "$expected" ]] ||
+    die "version-manifest.txt agent header is $manifest_header_version, expected $expected"
+  [[ $manifest_component_version == "$expected" ]] ||
+    die "version-manifest.txt datadog-agent component is $manifest_component_version, expected $expected"
+
+  manifest_json_version=$(env -i \
+    HOME=/nonexistent \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/usr/bin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$root/embedded/bin/python3" -I -B - "$manifest_json" "$expected" <<'PYEOF'
+import json
+from pathlib import Path
+import sys
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+path = Path(sys.argv[1])
+expected = sys.argv[2]
+try:
+    document = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"invalid Omnibus version manifest: {error}") from error
+if type(document) is not dict or document.get("manifest_format") != 2:
+    raise SystemExit("Omnibus version manifest must be a format-2 object")
+build_version = document.get("build_version")
+if build_version != expected:
+    raise SystemExit(
+        f"Omnibus version manifest build_version is {build_version!r}, expected {expected!r}"
+    )
+software = document.get("software")
+if type(software) is not dict:
+    raise SystemExit("Omnibus version manifest software must be an object")
+entry = software.get("datadog-agent")
+if type(entry) is not dict or entry.get("source_type") != "path":
+    raise SystemExit("Omnibus version manifest lacks the datadog-agent path entry")
+locked_source = entry.get("locked_source")
+if type(locked_source) is not dict or locked_source.get("path") != "..":
+    raise SystemExit("Omnibus datadog-agent source path is not the expected project root")
+print(build_version)
+PYEOF
+  ) || die "Omnibus version-manifest.json does not bind the exact release VERSION"
+  [[ $manifest_json_version == "$expected" ]] ||
+    die "version-manifest.json parser returned $manifest_json_version, expected $expected"
+
+  binary_sha256=$(sha256sum -- "$agent_binary" | awk '{ print $1 }')
+  version_output_sha256=$(printf '%s\n' "$version_output" | sha256sum | awk '{ print $1 }')
+  manifest_text_sha256=$(sha256sum -- "$manifest_text" | awk '{ print $1 }')
+  manifest_json_sha256=$(sha256sum -- "$manifest_json" | awk '{ print $1 }')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$compiled_version" "$manifest_header_version" "$manifest_component_version" "$manifest_json_version" \
+    "$binary_sha256" "$version_output_sha256" "$manifest_text_sha256" \
+    "$manifest_json_sha256" "$version_output"
+}
+
+write_agent_version_provenance() {
+  local root=$1 expected=$2 output=$3 information
+  local compiled_version manifest_header_version manifest_component_version manifest_json_version
+  local binary_sha256 version_output_sha256 manifest_text_sha256 manifest_json_sha256 version_output
+
+  information=$(collect_agent_version_evidence "$root" "$expected")
+  IFS=$'\t' read -r \
+    compiled_version manifest_header_version manifest_component_version manifest_json_version \
+    binary_sha256 version_output_sha256 manifest_text_sha256 manifest_json_sha256 version_output \
+    <<<"$information"
+  printf '%s\n' \
+    "compiled_version=$compiled_version" \
+    "manifest_header_version=$manifest_header_version" \
+    "manifest_component_version=$manifest_component_version" \
+    "manifest_json_version=$manifest_json_version" \
+    'binary_path=./bin/agent/agent' \
+    "binary_sha256=$binary_sha256" \
+    "version_output=$version_output" \
+    "version_output_sha256=$version_output_sha256" \
+    'version_manifest_text_path=./version-manifest.txt' \
+    "version_manifest_text_sha256=$manifest_text_sha256" \
+    'version_manifest_json_path=./version-manifest.json' \
+    "version_manifest_json_sha256=$manifest_json_sha256" \
+    >"$output"
 }
 
 verify_adp_version_manifest() {
@@ -986,6 +1241,8 @@ verify_archive() {
   local glibc_report=$6
   local linkage_report=$7
   local adp_report=$8
+  local agent_version_report=$9
+  local gaussdb_report=${10}
   local member
 
   tar --quoting-style=literal -tzf "$archive" >"$list_file"
@@ -1037,6 +1294,12 @@ verify_archive() {
   write_adp_provenance "$verify_root" "$adp_report"
   cmp -s -- "$verify_root/provenance/agent-data-plane.txt" "$adp_report" ||
     die "extracted ADP evidence differs from packaged provenance"
+  write_agent_version_provenance "$verify_root" "$version" "$agent_version_report"
+  cmp -s -- "$verify_root/provenance/agent-version.txt" "$agent_version_report" ||
+    die "extracted Agent version evidence differs from packaged provenance"
+  write_gaussdb_provenance "$verify_root" "$gaussdb_report"
+  cmp -s -- "$verify_root/provenance/gaussdb.txt" "$gaussdb_report" ||
+    die "extracted GaussDB integration evidence differs from packaged provenance"
   write_glibc_report "$verify_root" "$glibc_report"
   cmp -s -- "$verify_root/provenance/glibc-requirements.tsv" "$glibc_report" ||
     die "extracted GLIBC report differs from packaged report"
@@ -1047,7 +1310,6 @@ verify_archive() {
   grep -Fq 'SCHEMA_RECOMMENDATION_FIELDS_ENV' \
     "$verify_root/embedded/lib/python3.13/site-packages/datadog_checks/postgres/schemas.py" ||
     die "extracted PostgreSQL patch marker is absent"
-  verify_gaussdb "$verify_root" >/dev/null
 }
 
 require_root_private_dir() {
@@ -1211,7 +1473,6 @@ version=${VERSION:-}
 arch=${ARCH:-aarch64}
 agent_sha=${AGENT_SHA:-}
 core_sha=${CORE_SHA:-}
-gaussdb_version=${GAUSSDB_VERSION:-$DEFAULT_GAUSSDB_VERSION}
 builder_image_digest=${BUILDER_IMAGE_DIGEST:-}
 builder_identity=${BUILDER_IDENTITY:-}
 
@@ -1256,8 +1517,8 @@ reject_control_characters VERSION "$version"
 [[ $arch == aarch64 ]] || die "ARCH must be aarch64 for this build"
 [[ $agent_sha =~ ^[0-9a-f]{40}$ ]] || die "AGENT_SHA must be a full lowercase 40-hex commit"
 [[ $core_sha =~ ^[0-9a-f]{40}$ ]] || die "CORE_SHA must be a full lowercase 40-hex commit"
-[[ $gaussdb_version =~ ^[0-9]+([.][0-9]+)*([+-][A-Za-z0-9._-]+)?$ ]] ||
-  die "unsafe GAUSSDB_VERSION: $gaussdb_version"
+[[ $core_sha == "$EXPECTED_INTEGRATION_CORE_SHA" ]] ||
+  die "CORE_SHA must be the pinned post-Omnibus integration source $EXPECTED_INTEGRATION_CORE_SHA"
 reject_control_characters BUILDER_IMAGE_DIGEST "$builder_image_digest"
 reject_control_characters BUILDER_IDENTITY "$builder_identity"
 if [[ -n $builder_image_digest ]]; then
@@ -1272,8 +1533,8 @@ fi
   die "record BUILDER_IMAGE_DIGEST or an explicit native BUILDER_IDENTITY"
 
 success_marker="$build_dir/omnibus.success"
-[[ $EXPECTED_MANIFEST_REL == "manifests/$agent_sha-$core_sha-aarch64-kylin10-v7" ]] ||
-  die "AGENT_SHA or CORE_SHA differs from the exact Kylin v7 build"
+[[ $EXPECTED_MANIFEST_REL == "manifests/$agent_sha-$OMNIBUS_CORE_SHA-aarch64-kylin10-v7" ]] ||
+  die "AGENT_SHA or OMNIBUS_CORE_SHA differs from the exact Kylin v7 build"
 verify_omnibus_success_marker "$success_marker"
 verify_omnibus_control_overlay
 manifest_rel=$EXPECTED_MANIFEST_REL
@@ -1285,7 +1546,7 @@ adp_inputs_manifest_sha256=$(verify_adp_input_handoff)
 [[ $(git_in "$agent_source_dir" rev-parse HEAD) == "$agent_sha" ]] ||
   die "agent source HEAD differs from AGENT_SHA"
 git_in "$core_repo" cat-file -e "$core_sha^{commit}" ||
-  die "CORE_SHA is absent from CORE_REPO"
+  die "post-Omnibus integration CORE_SHA is absent from CORE_REPO"
 
 patch_disable_rel=dbdog-deploy/scripts/patch-disable-dbmhealth.sh
 patch_schema_rel=dbdog-deploy/scripts/patch-postgres-schema-recommendation-fields.sh
@@ -1454,6 +1715,7 @@ env -i \
   PATCH_ONLY=true \
   /usr/bin/bash "$patch_schema"
 verify_python_sources "$health_py" "$schemas_py"
+install_pinned_gaussdb_integration "$install_dir"
 
 clean_runtime_tree
 shebang_report="$work_dir/shebang-rewrites.tsv"
@@ -1465,8 +1727,10 @@ linkage_report="$work_dir/primary-elf-linkage.tsv"
 write_primary_linkage_report "$install_dir" "$linkage_report"
 adp_report="$work_dir/agent-data-plane.txt"
 write_adp_provenance "$install_dir" "$adp_report"
-
-gaussdb_info=$(verify_gaussdb "$install_dir")
+agent_version_report="$work_dir/agent-version.txt"
+write_agent_version_provenance "$install_dir" "$version" "$agent_version_report"
+gaussdb_report="$work_dir/gaussdb.txt"
+write_gaussdb_provenance "$install_dir" "$gaussdb_report"
 env -i \
   HOME=/nonexistent \
   LANG=C.UTF-8 \
@@ -1493,29 +1757,32 @@ install -m 0644 "$success_marker" "$provenance_dir/omnibus.success"
 install -m 0644 "$glibc_report" "$provenance_dir/glibc-requirements.tsv"
 install -m 0644 "$linkage_report" "$provenance_dir/primary-elf-linkage.tsv"
 install -m 0644 "$adp_report" "$provenance_dir/agent-data-plane.txt"
+install -m 0644 "$agent_version_report" "$provenance_dir/agent-version.txt"
+install -m 0644 "$gaussdb_report" "$provenance_dir/gaussdb.txt"
 install -m 0644 "$symlink_report" "$provenance_dir/symlinks.tsv"
 install -m 0644 "$shebang_report" "$provenance_dir/shebang-rewrites.tsv"
 
-IFS=$'\t' read -r gauss_module_rel gauss_dist_rel gauss_import_version gauss_dist_version <<<"$gaussdb_info"
-printf '%s\n' \
-  "module_path=./$gauss_module_rel" \
-  "distribution_path=./$gauss_dist_rel" \
-  "import_version=$gauss_import_version" \
-  "distribution_version=$gauss_dist_version" \
-  >"$provenance_dir/gaussdb.txt"
-chmod 0644 "$provenance_dir/gaussdb.txt"
+gauss_import_version=$(awk -F= '$1 == "integration_version" { print $2; found++ }
+  END { exit(found == 1 ? 0 : 1) }' "$gaussdb_report") ||
+  die "GaussDB integration provenance lacks one integration_version"
 
 finalizer_sha256=$(sha256sum -- "$(readlink -e -- "$0")" | awk '{ print $1 }')
 patch_disable_sha256=$(sha256sum -- "$patch_disable" | awk '{ print $1 }')
 patch_schema_sha256=$(sha256sum -- "$patch_schema" | awk '{ print $1 }')
 omnibus_success_sha256=$(sha256sum -- "$success_marker" | awk '{ print $1 }')
+agent_binary_sha256=$(awk -F= '$1 == "binary_sha256" { print $2 }' "$agent_version_report")
+agent_version_output_sha256=$(awk -F= '$1 == "version_output_sha256" { print $2 }' "$agent_version_report")
+agent_version_manifest_text_sha256=$(awk -F= '$1 == "version_manifest_text_sha256" { print $2 }' "$agent_version_report")
+agent_version_manifest_json_sha256=$(awk -F= '$1 == "version_manifest_json_sha256" { print $2 }' "$agent_version_report")
 cat >"$provenance_dir/build.txt" <<EOF
 format_version=1
 product=dbdog-agent
 version=$version
+compiled_agent_version=$version
 architecture=$arch
 install_prefix=$install_dir
 agent_git_sha=$agent_sha
+omnibus_integrations_core_git_sha=$OMNIBUS_CORE_SHA
 integrations_core_git_sha=$core_sha
 omnibus_ruby_git_sha=$omnibus_ruby_sha
 manifest_rel=$manifest_rel
@@ -1530,7 +1797,14 @@ patchelf_sha256=$EXPECTED_PATCHELF_SHA256
 patchelf_info_sha256=$EXPECTED_PATCHELF_INFO_SHA256
 patchelf_sums_sha256=$EXPECTED_PATCHELF_SUMS_SHA256
 host_distribution=$EXPECTED_HOST_DISTRIBUTION
-gaussdb_version=$gaussdb_version
+integration_name=$GAUSSDB_INTEGRATION_NAME
+integration_version=$gauss_import_version
+integration_wheel_rel=$GAUSSDB_WHEEL_REL
+integration_wheel_sha256=$GAUSSDB_WHEEL_SHA256
+agent_binary_sha256=$agent_binary_sha256
+agent_version_output_sha256=$agent_version_output_sha256
+agent_version_manifest_text_sha256=$agent_version_manifest_text_sha256
+agent_version_manifest_json_sha256=$agent_version_manifest_json_sha256
 agent_data_plane_version=$ADP_VERSION
 agent_data_plane_input_sha256=$ADP_INPUT_SHA256
 source_date_epoch=$source_date_epoch
@@ -1590,7 +1864,9 @@ verify_archive \
   "$work_dir/extracted-symlinks.tsv" \
   "$work_dir/extracted-glibc.tsv" \
   "$work_dir/extracted-linkage.tsv" \
-  "$work_dir/extracted-agent-data-plane.txt"
+  "$work_dir/extracted-agent-data-plane.txt" \
+  "$work_dir/extracted-agent-version.txt" \
+  "$work_dir/extracted-gaussdb.txt"
 
 # Verification has consumed every byte it needs from the extracted copy.
 # Remove it before publishing the archive so publication cannot recreate a

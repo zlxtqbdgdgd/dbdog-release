@@ -24,18 +24,49 @@ PROC="$TEST_ROOT/proc"
 PID=4242
 DATA="$TEST_ROOT/gauss/data"
 GAUSSLOG="$TEST_ROOT/gauss/log"
-mkdir -p "$PROC/$PID" "$DATA" "$GAUSSLOG/gs_log/dn_6001"
+GAUSSHOME="$TEST_ROOT/gauss/app"
+SOCKET_DIR="$TEST_ROOT/gauss/socket"
+OWNER_HOME="$TEST_ROOT/gauss-owner"
+FAKE_BIN="$TEST_ROOT/fake-bin"
+mkdir -p "$PROC/$PID" "$DATA" "$GAUSSLOG/gs_log/dn_6001" \
+  "$GAUSSHOME/bin" "$GAUSSHOME/lib/libsimsearch" "$SOCKET_DIR" "$OWNER_HOME" "$FAKE_BIN"
+printf '#!/bin/sh\nexit 0\n' >"$GAUSSHOME/bin/gsql"
+chmod 0755 "$GAUSSHOME/bin/gsql"
+cat >"$FAKE_BIN/timeout" <<'EOF'
+#!/bin/sh
+case "$1" in --kill-after=*) shift ;; esac
+shift
+exec "$@"
+EOF
+cat >"$FAKE_BIN/runuser" <<'EOF'
+#!/bin/sh
+[ "$1" = -u ] || exit 97
+shift 2
+[ "$1" = -- ] || exit 98
+shift
+exec "$@"
+EOF
+chmod 0755 "$FAKE_BIN/timeout" "$FAKE_BIN/runuser"
+export DBDOG_TIMEOUT_BIN="$FAKE_BIN/timeout"
+export DBDOG_RUNUSER_BIN="$FAKE_BIN/runuser"
+export DBDOG_TEST_OWNER_HOME="$OWNER_HOME"
+agent_owner_home() { printf '%s\n' "$DBDOG_TEST_OWNER_HOME"; }
+agent_owner_name() { id -un; }
+
 printf 'gaussdb\n' >"$PROC/$PID/comm"
-printf '/opt/gauss/bin/gaussdb\0-D\0%s\0' "$DATA" >"$PROC/$PID/cmdline"
-printf 'GAUSSHOME=/opt/gauss\0GAUSSLOG=%s\0PGPORT=37001\0' "$GAUSSLOG" >"$PROC/$PID/environ"
+printf '%s\0-D\0%s\0' "$GAUSSHOME/bin/gaussdb" "$DATA" >"$PROC/$PID/cmdline"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=37001\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$GAUSSLOG" "$SOCKET_DIR" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
+  >"$PROC/$PID/environ"
 printf 'Name:\tgaussdb\nUid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$PROC/$PID/status"
-printf '4242\n%s\n0\n15432\n' "$DATA" >"$DATA/postmaster.pid"
+printf '4242\n%s\n0\n15432\n%s\n' "$DATA" "$SOCKET_DIR" >"$DATA/postmaster.pid"
 # 模拟同实例的另一个 gaussdb backend；安装事实必须按端口去重。
 mkdir -p "$PROC/4243"
 printf 'gaussdb\n' >"$PROC/4243/comm"
 printf 'gaussdb: dbdog postgres 127.0.0.1\0' >"$PROC/4243/cmdline"
-printf 'GAUSSHOME=/opt/gauss\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0' \
-  "$GAUSSLOG" "$DATA" >"$PROC/4243/environ"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$GAUSSLOG" "$DATA" "$SOCKET_DIR" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
+  >"$PROC/4243/environ"
 cp "$PROC/$PID/status" "$PROC/4243/status"
 
 DBDOG_PROC_ROOT="$PROC"
@@ -43,19 +74,123 @@ export DBDOG_PROC_ROOT
 agent_detect_gaussdb
 [ "${AGENT_GAUSS_PORTS[*]}" = 15432 ] || fail "没有优先使用运行态 postmaster.pid 端口"
 [ "${#AGENT_GAUSS_PID_PORTS[@]}" -eq 1 ] || fail "把同一实例的 backend 进程重复识别为多个实例"
+[ "${AGENT_GAUSS_PID_HOSTS[*]}" = "$SOCKET_DIR" ] || fail "没有发现实例 Unix socket"
+[ "${AGENT_GAUSS_PID_GSQLS[*]}" = "$GAUSSHOME/bin/gsql" ] || fail "没有使用目标实例 gsql"
+case ":${AGENT_GAUSS_PID_LD_LIBRARY_PATHS[0]}:" in
+  *":$GAUSSHOME/lib/libsimsearch:"*) ;;
+  *) fail "没有继承目标实例 libsimsearch 动态库目录" ;;
+esac
 [ "${AGENT_GAUSS_LOG_GLOBS[*]}" = "$GAUSSLOG/gs_log/*/gaussdb-*.log" ] || \
   fail "没有从进程 GAUSSLOG 生成日志 glob"
 [ "$AGENT_GAUSS_DEPLOYMENT" = centralized ] || fail "单实例拓扑推断错误"
-pass "从目标机运行进程发现 GaussDB 端口、目录与日志，不执行 .bashrc"
+pass "优先从目标机运行进程发现 GaussDB 端口、socket、客户端库与日志"
+
+DBDOG_GAUSSDB_PGHOST="$TEST_ROOT/explicit-socket"
+DBDOG_GAUSSDB_LD_LIBRARY_PATH="$TEST_ROOT/explicit-lib"
+export DBDOG_GAUSSDB_PGHOST DBDOG_GAUSSDB_LD_LIBRARY_PATH
+agent_detect_gaussdb
+[ "${AGENT_GAUSS_PID_HOSTS[0]}" = "$TEST_ROOT/explicit-socket" ] || fail "显式 PGHOST 未覆盖自动发现"
+case "${AGENT_GAUSS_PID_LD_LIBRARY_PATHS[0]}" in
+  "$TEST_ROOT/explicit-lib" | "$TEST_ROOT/explicit-lib:"*) ;;
+  *) fail "显式 LD_LIBRARY_PATH 没有最高优先级" ;;
+esac
+unset DBDOG_GAUSSDB_PGHOST DBDOG_GAUSSDB_LD_LIBRARY_PATH
+agent_detect_gaussdb
+pass "特殊部署可显式覆盖 PGHOST/LD_LIBRARY_PATH，正常路径恢复自动发现"
 
 PROFILE_HOME="$TEST_ROOT/profile-home"
-mkdir -p "$PROFILE_HOME"
-printf 'export GAUSSLOG=/srv/gauss/runtime-log\ntouch %s/should-not-exist\n' "$TEST_ROOT" \
-  >"$PROFILE_HOME/.bashrc"
-[ "$(agent_profile_literal "$PROFILE_HOME" GAUSSLOG)" = /srv/gauss/runtime-log ] || \
-  fail "未能静态读取 profile 中的 GAUSSLOG 字面量"
-[ ! -e "$TEST_ROOT/should-not-exist" ] || fail "错误执行了目标用户 .bashrc"
-pass "profile 仅作静态字面量兜底，不执行目标用户 shell 代码"
+mkdir -p "$PROFILE_HOME/socket" "$PROFILE_HOME/gauss/lib/libsimsearch"
+cat >"$PROFILE_HOME/.bashrc" <<'EOF'
+export GAUSSHOME="$HOME/gauss"
+export LD_LIBRARY_PATH="$GAUSSHOME/lib:$GAUSSHOME/lib/libsimsearch"
+export MPPDB_ENV_SEPARATE_PATH="$HOME/gauss_env_file"
+EOF
+cat >"$PROFILE_HOME/gauss_env_file" <<'EOF'
+export GAUSSLOG="$HOME/runtime-log"
+export PGHOST="$HOME/socket"
+export PGPORT=15432
+EOF
+EXPLICIT_ENV="$PROFILE_HOME/explicit.env"
+cat >"$EXPLICIT_ENV" <<'EOF'
+export PGHOST="$HOME/explicit-socket"
+export LD_LIBRARY_PATH="$HOME/explicit-lib"
+EOF
+agent_load_owner_environment "$(id -un)" "$PROFILE_HOME" "" "$EXPLICIT_ENV" || \
+  fail "无法在受限数据库用户 shell 中加载 profile"
+[ "$AGENT_OWNER_ENV_GAUSSHOME" = "$PROFILE_HOME/gauss" ] || fail "profile 变量展开失败"
+[ "$AGENT_OWNER_ENV_GAUSSLOG" = "$PROFILE_HOME/runtime-log" ] || fail "gauss_env_file 未加载"
+[ "$AGENT_OWNER_ENV_PGHOST" = "$PROFILE_HOME/explicit-socket" ] || fail "显式 env 文件未覆盖 PGHOST"
+[ "$AGENT_OWNER_ENV_LD_LIBRARY_PATH" = "$PROFILE_HOME/explicit-lib" ] || \
+  fail "显式 env 文件未覆盖 LD_LIBRARY_PATH"
+BROKEN_EXPLICIT_ENV="$PROFILE_HOME/broken-explicit.env"
+printf 'return 7\n' >"$BROKEN_EXPLICIT_ENV"
+if agent_load_owner_environment "$(id -un)" "$PROFILE_HOME" "" "$BROKEN_EXPLICIT_ENV"; then
+  fail "显式 GaussDB 环境文件 source 失败后仍被接受"
+fi
+pass "以数据库 OS 用户、空环境和硬超时加载 profile/MPP env，并只返回白名单"
+
+for _ in 1 2 3 4 5; do
+  GENERATED_PASSWORD="$(agent_generate_gaussdb_password)" || fail "随机密码生成失败"
+  [ "${#GENERATED_PASSWORD}" -eq 32 ] || fail "随机密码不是 32 字符"
+  agent_validate_gaussdb_password "$GENERATED_PASSWORD" || fail "随机密码不符合 GaussDB 复杂度"
+done
+agent_validate_gaussdb_password 'Ab1_short' || fail "合法显式密码被拒绝"
+if agent_validate_gaussdb_password '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; then
+  fail "错误接受了 64 字符纯 hex 密码"
+fi
+if agent_validate_gaussdb_password 'abcdefgh12345678'; then fail "错误接受了只有两类字符的密码"; fi
+if agent_validate_gaussdb_password 'Aa1 bad_password'; then fail "错误接受了带空白的密码"; fi
+pass "监控密码固定不超过 32 字符且满足至少三类字符约束"
+
+VALID_TUF_ROOT="$TEST_ROOT/valid-tuf-root.json"
+INVALID_TUF_ROOT="$TEST_ROOT/invalid-tuf-root.json"
+printf '%s\n' \
+  '{"signed":{"_type":"root","version":1,"keys":{"k":{}},"roles":{"root":{}}},"signatures":[{"keyid":"k","sig":"s"}]}' \
+  >"$VALID_TUF_ROOT"
+printf '%s\n' '{"error":"not found"}' >"$INVALID_TUF_ROOT"
+COMPACT_TUF_ROOT="$(bash -c '
+  source "$1"
+  trap - EXIT
+  compact_tuf_root_file "$2"
+' bash "$SCRIPTS_DIR/agent-install.sh" "$VALID_TUF_ROOT")" || fail "合法 TUF root 被拒绝"
+case "$COMPACT_TUF_ROOT" in *'"_type":"root"'*'"signatures":['*) ;; *) fail "TUF root 压缩结果异常" ;; esac
+if bash -c '
+  source "$1"
+  trap - EXIT
+  compact_tuf_root_file "$2"
+' bash "$SCRIPTS_DIR/agent-install.sh" "$INVALID_TUF_ROOT" >/dev/null 2>&1; then
+  fail "错误响应对象被当作 Remote Config trust root 接受"
+fi
+pass "Remote Config bootstrap 只接受带签名且结构完整的 TUF root"
+
+HBA_TEST_ROOT="$TEST_ROOT/hba"
+mkdir -p "$HBA_TEST_ROOT"
+printf '# base\nhost all all 127.0.0.1/32 md5\n' >"$HBA_TEST_ROOT/valid"
+printf '# dbdog-release BEGIN: local Agent monitor\nhost all dbdog 127.0.0.1/32 md5\n' \
+  >"$HBA_TEST_ROOT/broken"
+printf '# original\n' >"$HBA_TEST_ROOT/before"
+printf '# managed\n' >"$HBA_TEST_ROOT/applied"
+cp "$HBA_TEST_ROOT/applied" "$HBA_TEST_ROOT/current"
+bash -c '
+  source "$1"
+  trap - EXIT
+  agent_validate_hba_markers "$2/valid"
+  if agent_validate_hba_markers "$2/broken"; then exit 91; fi
+  DB_HBA_PATHS=()
+  DB_HBA_BACKUPS=()
+  DB_HBA_APPLIED=()
+  DB_HBA_PATHS[1]="$2/current"
+  DB_HBA_BACKUPS[1]="$2/before"
+  DB_HBA_APPLIED[1]="$2/applied"
+  agent_gsql() { printf "t\n"; }
+  agent_restore_hba_rules
+  cmp -s "$2/current" "$2/before"
+  [ -z "${DB_HBA_PATHS[1]:-}" ]
+' bash "$SCRIPTS_DIR/agent-install.sh" "$HBA_TEST_ROOT" || \
+  fail "HBA 标记校验或稀疏实例回滚合同失败"
+grep -Fq 'legacy_trust' "$SCRIPTS_DIR/agent-install.sh" || fail "没有自动迁移旧本机 dbdog trust HBA"
+grep -Fq 'install-hba-recovery.' "$SCRIPTS_DIR/agent-install.sh" || fail "HBA 恢复失败未持久化恢复材料"
+pass "HBA 改写拒绝残缺标记、迁移旧 trust，并按真实实例下标可靠回滚"
 
 CONF="$TEST_ROOT/rendered"
 UNITS="$TEST_ROOT/units"
@@ -112,6 +247,128 @@ pass "主机 checks 与 Core/Trace/Process/System Probe 四服务一次生成且
   fail "升级无法保留 GaussDB 密码"
 pass "重复运行安装器可保留现有 server URL 与两项凭证"
 
+INSTALL_SCRIPT="$SCRIPTS_DIR/agent-install.sh"
+if grep -Fq 'SET password_encryption_type' "$INSTALL_SCRIPT"; then
+  fail "安装器仍尝试在会话中修改 password_encryption_type"
+fi
+if grep -Eq 'host[[:space:]]+all[[:space:]]+dbdog.*[[:space:]]trust([[:space:]]|$)' "$INSTALL_SCRIPT"; then
+  fail "安装器绝不能给 MONADMIN 安装 trust HBA"
+fi
+grep -Fq "SHOW password_encryption_type;" "$INSTALL_SCRIPT" || fail "没有预检认证模式"
+grep -Fq 'host all dbdog 127.0.0.1/32 md5' "$INSTALL_SCRIPT" || fail "缺少受管本机 MD5 HBA"
+grep -Fq 'ALTER USER dbdog WITH MONADMIN;' "$INSTALL_SCRIPT" || fail "升级仍会重复设置未变化密码"
+grep -Fq 'install-configcheck.log' "$INSTALL_SCRIPT" || fail "configcheck 诊断没有持久化"
+grep -Fq 'for ((i=1; i<=8; i++))' "$INSTALL_SCRIPT" || fail "configcheck 没有 readiness 重试"
+if grep -Fq 'PGPASSWORD=' "$INSTALL_SCRIPT"; then fail "数据库密码仍暴露在子进程 argv 环境赋值中"; fi
+grep -Fq 'error.sqlstate == "28P01"' "$INSTALL_SCRIPT" || fail "密码探测没有区分明确认证拒绝和基础设施错误"
+MAIN_BODY="$(awk '/^main\(\)/ { scan=1 } scan { print }' "$INSTALL_SCRIPT")"
+PREFLIGHT_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'preflight_gaussdb_clients' | head -1 | cut -d: -f1)"
+CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  cutover$' | head -1 | cut -d: -f1)"
+BOOTSTRAP_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'bootstrap_gaussdb_monitoring' | head -1 | cut -d: -f1)"
+[ "$PREFLIGHT_LINE" -lt "$CUTOVER_LINE" ] && [ "$CUTOVER_LINE" -lt "$BOOTSTRAP_LINE" ] || \
+  fail "gsql 精确预检没有发生在文件/数据库 mutation 之前"
+RECOVERY_BASE="$TEST_ROOT/recovery/etc/dbdog-agent"
+mkdir -p "$RECOVERY_BASE.failed.20260727010101" "$RECOVERY_BASE.failed.20260727020202"
+RECOVERED="$(PATH="$FAKE_BIN:$PATH" bash -c '
+  source "$1"
+  trap - EXIT
+  AGENT_CONFIG_DIR="$2"
+  latest_failed_agent_config
+' bash "$INSTALL_SCRIPT" "$RECOVERY_BASE")" || fail "无法发现首装失败配置"
+[ "$RECOVERED" = "$RECOVERY_BASE.failed.20260727020202" ] || fail "没有选择最新首装失败配置"
+pass "认证模式 fail closed、禁止 trust、密码幂等与 configcheck 持久诊断均有流程门禁"
+
+PREFLIGHT_ROOT="$TEST_ROOT/preflight"
+mkdir -p "$PREFLIGHT_ROOT/bin" "$PREFLIGHT_ROOT/work"
+cat >"$PREFLIGHT_ROOT/bin/ldd" <<'EOF'
+#!/bin/sh
+printf '\tlibc.so.6 => /lib/libc.so.6 (0x1)\n'
+EOF
+cat >"$PREFLIGHT_ROOT/bin/gsql" <<'EOF'
+#!/bin/sh
+root=${0%/*}
+printf 'PGHOST=%s\nLD_LIBRARY_PATH=%s\nARGS=%s\n' \
+  "${PGHOST:-}" "${LD_LIBRARY_PATH:-}" "$*" >>"$root/calls"
+query=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) printf 'gsql test-version\n'; exit 0 ;;
+    -c) shift; query=$1 ;;
+  esac
+  shift
+done
+case "$query" in
+  'SELECT 1;') printf '1\n' ;;
+  'SHOW password_encryption_type;') cat "$root/mode" ;;
+  *pg_user*) cat "$root/exists" ;;
+  '') cat >"$root/stdin.sql" ;;
+  *) printf '1\n' ;;
+esac
+EOF
+cat >"$PREFLIGHT_ROOT/bin/fake-python" <<'EOF'
+#!/bin/sh
+# agent_monitor_password_works 的合同替身：消费 stdin 中的 Python 程序并模拟成功登录。
+cat >/dev/null
+exit 0
+EOF
+chmod 0755 "$PREFLIGHT_ROOT/bin/ldd" "$PREFLIGHT_ROOT/bin/gsql" \
+  "$PREFLIGHT_ROOT/bin/fake-python"
+cp "$FAKE_BIN/timeout" "$PREFLIGHT_ROOT/bin/timeout"
+printf '1\n' >"$PREFLIGHT_ROOT/bin/mode"
+printf '1\n' >"$PREFLIGHT_ROOT/bin/exists"
+
+run_fake_gauss_action() { # <preflight|set-password>
+  PATH="$FAKE_BIN:$PATH" bash -c '
+    source "$1"
+    trap - EXIT
+    WORK_DIR="$2/work"
+    DBDOG_GAUSSDB_DBNAME=postgres
+    DBDOG_GAUSSDB_MONITOR_PASSWORD=Aa1_valid_monitor_password
+    DBDOG_AGENT_PYTHON="$2/bin/fake-python"
+    PREVIOUS_DB_PASSWORD=""
+    AGENT_GAUSS_PID_PORTS=(15432)
+    AGENT_GAUSS_PID_HOMES=("$2")
+    AGENT_GAUSS_PID_OWNERS=("$(id -un)")
+    AGENT_GAUSS_PID_OWNER_HOMES=("$2")
+    AGENT_GAUSS_PID_HOSTS=("$2/socket")
+    AGENT_GAUSS_PID_LD_LIBRARY_PATHS=("$2/lib:$2/lib/libsimsearch")
+    AGENT_GAUSS_PID_PATHS=("$2/bin:/usr/bin:/bin")
+    AGENT_GAUSS_PID_GSQLS=("$2/bin/gsql")
+    case "$3" in
+      preflight)
+        preflight_gaussdb_clients
+        printf "RESULT=%s:%s\n" "${AGENT_GAUSS_PID_PASSWORD_MODES[0]}" \
+          "${AGENT_GAUSS_PID_USER_EXISTS[0]}"
+        ;;
+      set-password)
+        PREVIOUS_DB_PASSWORD=Aa1_valid_monitor_password
+        agent_set_gaussdb_password "$PREVIOUS_DB_PASSWORD"
+        ;;
+    esac
+  ' bash "$INSTALL_SCRIPT" "$PREFLIGHT_ROOT" "$1"
+}
+
+PREFLIGHT_OUTPUT="$(run_fake_gauss_action preflight)" || fail "模拟 gsql 精确预检失败"
+[ "${PREFLIGHT_OUTPUT##*$'\n'}" = 'RESULT=1:1' ] || fail "预检没有记录认证模式和用户状态"
+grep -Fq "PGHOST=$PREFLIGHT_ROOT/socket" "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 PGHOST"
+grep -Fq "LD_LIBRARY_PATH=$PREFLIGHT_ROOT/lib:$PREFLIGHT_ROOT/lib/libsimsearch" \
+  "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 LD_LIBRARY_PATH"
+run_fake_gauss_action set-password >/dev/null || fail "未变化密码的幂等路径失败"
+grep -Fqx 'ALTER USER dbdog WITH MONADMIN;' "$PREFLIGHT_ROOT/bin/stdin.sql" || \
+  fail "升级仍然重置了未变化的 GaussDB 密码"
+if grep -Fq PASSWORD "$PREFLIGHT_ROOT/bin/stdin.sql"; then fail "幂等升级 SQL 仍含 PASSWORD"; fi
+
+printf '2\n' >"$PREFLIGHT_ROOT/bin/mode"
+printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode2.out" 2>&1; then
+  fail "需要创建/重置密码时错误接受了不兼容的认证模式"
+fi
+if ! grep -Fq 'password_encryption_type=2' "$PREFLIGHT_ROOT/mode2.out"; then
+  sed -n '1,80p' "$PREFLIGHT_ROOT/mode2.out" >&2
+  fail "认证不兼容没有给出清晰且非侵入式的错误"
+fi
+pass "真实命令形态完成 ldd/version/SELECT 预检、环境传递、幂等密码与认证 fail-closed"
+
 if [ -f "$RELEASE_DIR/../dbdog-agent-core/gaussdb/datadog_checks/gaussdb/connection_pool.py" ]; then
   grep -Fq 'ConnectionPool' \
     "$RELEASE_DIR/../dbdog-agent-core/gaussdb/datadog_checks/gaussdb/connection_pool.py" || \
@@ -151,4 +408,4 @@ if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then
 fi
 pass "安装器要求预编译 GaussDB integration + psycopg/libpq，运行期不走 gsql 短连接"
 
-printf 'ALL PASS: 6 agent install contract tests\n'
+printf 'ALL PASS: 12 agent install contract groups\n'

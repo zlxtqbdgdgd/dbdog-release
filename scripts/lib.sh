@@ -210,7 +210,7 @@ configure_ready_to_use_stack() {
   local server_env="$ETC_DIR/dbdog-server.env"
   local web_env="$ETC_DIR/dbdog-web.env"
   local mcp_env="$ETC_DIR/dbdog-mcp.env"
-  local internal_token oauth_secret advertise_host app_url ingest_url mcp_url config_file
+  local internal_token oauth_secret advertise_host app_url ingest_url mcp_url config_file rc_key_path
   local server_before web_before mcp_before
   for config_file in "$server_env" "$web_env" "$mcp_env"; do
     [ -f "$config_file" ] && [ ! -L "$config_file" ] \
@@ -236,6 +236,14 @@ configure_ready_to_use_stack() {
   ensure_env_default "$server_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
   ensure_env_default "$server_env" DBDOG_HTTP_ADDR :8080 change-me
   ensure_env_default "$server_env" DBDOG_PUBLIC_BASE_URL "$app_url" change-me
+  # Agent 首装会从 server 获取并信任 TUF root。这里启用 server 自己持久化的
+  # signing seed，让普通安装/升级无需再手工开启 Remote Config。已有绝对路径保留。
+  ensure_env_default "$server_env" DBDOG_RC_KEY_PATH "$DATA_DIR/remote-config.seed" change-me
+  rc_key_path="$(env_literal_value "$server_env" DBDOG_RC_KEY_PATH)"
+  case "$rc_key_path" in
+    /*) ;;
+    *) die "$server_env 的 DBDOG_RC_KEY_PATH 必须是绝对路径" ;;
+  esac
 
   ensure_env_default "$web_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
   ensure_env_default "$web_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me

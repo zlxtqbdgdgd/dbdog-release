@@ -7,6 +7,26 @@ AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
 
+agent_generate_gaussdb_password() {
+  local random
+  # 14 随机字节给出 112 bit 熵；固定前缀确保四类字符，整体恰好 32 字符。
+  random="$(od -An -N14 -tx1 /dev/urandom | tr -d '[:space:]')" || return 1
+  [ "${#random}" -eq 28 ] || return 1
+  printf 'Aa1_%s\n' "$random"
+}
+
+agent_validate_gaussdb_password() { # <密码>；符合 GaussDB 默认长度与三类字符约束
+  local password="$1" classes=0
+  [ "${#password}" -ge 8 ] && [ "${#password}" -le 32 ] || return 1
+  printf '%s' "$password" | LC_ALL=C grep -q '[^[:print:]]' && return 1
+  printf '%s' "$password" | LC_ALL=C grep -q '[[:space:]]' && return 1
+  case "$password" in *[A-Z]*) classes=$((classes + 1)) ;; esac
+  case "$password" in *[a-z]*) classes=$((classes + 1)) ;; esac
+  case "$password" in *[0-9]*) classes=$((classes + 1)) ;; esac
+  case "$password" in *[!A-Za-z0-9]*) classes=$((classes + 1)) ;; esac
+  [ "$classes" -ge 3 ]
+}
+
 agent_require_single_line() { # <字段名> <值>
   local name="$1" value="$2"
   case "$value" in
@@ -102,6 +122,166 @@ agent_proc_env() { # <pid> <KEY>
     awk -v prefix="$key=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
 }
 
+agent_merge_path_lists() { # <colon-list>...；保序去重并丢弃隐式当前目录
+  local result="" list part finished
+  for list in "$@"; do
+    finished=0
+    while [ "$finished" -eq 0 ]; do
+      case "$list" in
+        *:*) part="${list%%:*}"; list="${list#*:}" ;;
+        *) part="$list"; list=""; finished=1 ;;
+      esac
+      [ -n "$part" ] || continue
+      case ":$result:" in *":$part:"*) continue ;; esac
+      if [ -n "$result" ]; then result="$result:$part"; else result="$part"; fi
+    done
+  done
+  printf '%s\n' "$result"
+}
+
+agent_find_in_path() { # <PATH> <程序名>
+  local paths="$1" program="$2" dir finished=0
+  while [ "$finished" -eq 0 ]; do
+    case "$paths" in
+      *:*) dir="${paths%%:*}"; paths="${paths#*:}" ;;
+      *) dir="$paths"; paths=""; finished=1 ;;
+    esac
+    [ -n "$dir" ] || continue
+    if [ -x "$dir/$program" ] && [ ! -d "$dir/$program" ]; then
+      printf '%s\n' "$dir/$program"
+      return 0
+    fi
+  done
+  return 1
+}
+
+agent_proc_socket_dir() { # <port>；从运行态 Unix socket 表发现目录
+  local port="$1" root="${DBDOG_PROC_ROOT:-/proc}" sockets
+  sockets="$root/net/unix"
+  [ -r "$sockets" ] || return 1
+  awk -v suffix="/.s.PGSQL.$port" '
+    NF >= 8 && length($NF) > length(suffix) && \
+      substr($NF, length($NF) - length(suffix) + 1) == suffix {
+      print substr($NF, 1, length($NF) - length(suffix))
+      exit
+    }
+  ' "$sockets"
+}
+
+agent_load_owner_environment() { # <owner> <home> <进程中的 MPPDB_ENV_SEPARATE_PATH> <显式 env 文件>
+  local owner="$1" home="$2" seed_mpp="$3" explicit_file="$4"
+  local capture timeout_bin runuser_bin env_bin bash_bin record key value rc=0 invalid_capture=0
+  AGENT_OWNER_ENV_GAUSSHOME=""
+  AGENT_OWNER_ENV_GAUSSLOG=""
+  AGENT_OWNER_ENV_PGDATA=""
+  AGENT_OWNER_ENV_PGHOST=""
+  AGENT_OWNER_ENV_PGPORT=""
+  AGENT_OWNER_ENV_LD_LIBRARY_PATH=""
+  AGENT_OWNER_ENV_PATH=""
+  [ -n "$owner" ] && [ -n "$home" ] || return 1
+  case "$explicit_file" in "" | /*) ;; *) return 1 ;; esac
+
+  timeout_bin="${DBDOG_TIMEOUT_BIN:-$(command -v timeout 2>/dev/null || true)}"
+  runuser_bin="${DBDOG_RUNUSER_BIN:-$(command -v runuser 2>/dev/null || true)}"
+  env_bin="${DBDOG_ENV_BIN:-$(command -v env 2>/dev/null || true)}"
+  bash_bin="${DBDOG_BASH_BIN:-/bin/bash}"
+  [ -x "$timeout_bin" ] && [ -x "$runuser_bin" ] && [ -x "$env_bin" ] && \
+    [ -x "$bash_bin" ] || return 1
+  capture="$(mktemp "${TMPDIR:-/tmp}/dbdog-gauss-env.XXXXXX")" || return 1
+
+  # profile 可能含命令，因此只在数据库 OS 用户权限下、空环境与硬超时中执行；
+  # 输出只保留客户端启动所需白名单，绝不把 profile 的任意变量带回 root 安装器。
+  # shellcheck disable=SC2016 # 下方单引号内容由目标数据库用户的内层 bash 解释。
+  "$timeout_bin" --kill-after=2 10 "$runuser_bin" -u "$owner" -- "$env_bin" -i \
+    HOME="$home" USER="$owner" LOGNAME="$owner" SHELL="$bash_bin" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    DBDOG_SEED_MPP="$seed_mpp" DBDOG_EXPLICIT_ENV_FILE="$explicit_file" \
+    "$bash_bin" --noprofile --norc -c '
+      loaded=:
+      load_env_file() {
+        file=$1
+        [ -n "$file" ] || return 0
+        case "$file" in /*) ;; *) file="$HOME/$file" ;; esac
+        [ -f "$file" ] && [ -r "$file" ] || return 0
+        case "$loaded" in *":$file:"*) return 0 ;; esac
+        { . "$file" </dev/null; } >/dev/null 2>&1 || return 1
+        loaded="${loaded}${file}:"
+      }
+
+      load_env_file "$HOME/.profile"
+      load_env_file "$HOME/.bash_profile"
+      load_env_file "$HOME/.bashrc"
+      mpp=${MPPDB_ENV_SEPARATE_PATH:-$DBDOG_SEED_MPP}
+      load_env_file "$mpp"
+      load_env_file "$HOME/gauss_env_file"
+      load_env_file "$HOME/.gauss_env"
+      load_env_file "$HOME/gsql_env.sh"
+      if [ -n "${GAUSSHOME:-}" ]; then
+        load_env_file "$GAUSSHOME/gsql_env.sh"
+        load_env_file "$GAUSSHOME/bin/gsql_env.sh"
+      fi
+      if [ -n "$DBDOG_EXPLICIT_ENV_FILE" ]; then
+        [ -f "$DBDOG_EXPLICIT_ENV_FILE" ] && [ -r "$DBDOG_EXPLICIT_ENV_FILE" ] || exit 42
+        load_env_file "$DBDOG_EXPLICIT_ENV_FILE" required || exit 43
+      fi
+      printf "GAUSSHOME=%s\0" "${GAUSSHOME:-}"
+      printf "GAUSSLOG=%s\0" "${GAUSSLOG:-}"
+      printf "PGDATA=%s\0" "${PGDATA:-}"
+      printf "PGHOST=%s\0" "${PGHOST:-}"
+      printf "PGPORT=%s\0" "${PGPORT:-}"
+      printf "LD_LIBRARY_PATH=%s\0" "${LD_LIBRARY_PATH:-}"
+      printf "PATH=%s\0" "${PATH:-}"
+      printf "MPPDB_ENV_SEPARATE_PATH=%s\0" "${MPPDB_ENV_SEPARATE_PATH:-$mpp}"
+    ' >"$capture" 2>/dev/null || rc=$?
+
+  if [ "$rc" -ne 0 ] || [ ! -s "$capture" ]; then
+    rm -f -- "$capture"
+    return 1
+  fi
+  while IFS= read -r -d '' record; do
+    key="${record%%=*}"
+    value="${record#*=}"
+    case "$value" in *$'\n'* | *$'\r'*) invalid_capture=1; break ;; esac
+    case "$key" in
+      GAUSSHOME) AGENT_OWNER_ENV_GAUSSHOME="$value" ;;
+      GAUSSLOG) AGENT_OWNER_ENV_GAUSSLOG="$value" ;;
+      PGDATA) AGENT_OWNER_ENV_PGDATA="$value" ;;
+      PGHOST) AGENT_OWNER_ENV_PGHOST="$value" ;;
+      PGPORT) AGENT_OWNER_ENV_PGPORT="$value" ;;
+      LD_LIBRARY_PATH) AGENT_OWNER_ENV_LD_LIBRARY_PATH="$value" ;;
+      PATH) AGENT_OWNER_ENV_PATH="$value" ;;
+      MPPDB_ENV_SEPARATE_PATH) : ;; # 仅驱动 profile 内二次加载，不向安装器传播。
+    esac
+  done <"$capture"
+  rm -f -- "$capture"
+  [ "$invalid_capture" -eq 0 ] || return 1
+}
+
+agent_cached_owner_environment() { # 参数同 agent_load_owner_environment；一次探测内按事实源复用
+  local owner="$1" home="$2" seed_mpp="$3" explicit_file="$4" key index
+  key="$owner|$home|$seed_mpp|$explicit_file"
+  for ((index=0; index<${#AGENT_OWNER_ENV_CACHE_KEYS[@]}; index++)); do
+    [ "${AGENT_OWNER_ENV_CACHE_KEYS[$index]}" = "$key" ] || continue
+    AGENT_OWNER_ENV_GAUSSHOME="${AGENT_OWNER_ENV_CACHE_HOMES[$index]}"
+    AGENT_OWNER_ENV_GAUSSLOG="${AGENT_OWNER_ENV_CACHE_LOGS[$index]}"
+    AGENT_OWNER_ENV_PGDATA="${AGENT_OWNER_ENV_CACHE_DATA[$index]}"
+    AGENT_OWNER_ENV_PGHOST="${AGENT_OWNER_ENV_CACHE_HOSTS[$index]}"
+    AGENT_OWNER_ENV_PGPORT="${AGENT_OWNER_ENV_CACHE_PORTS[$index]}"
+    AGENT_OWNER_ENV_LD_LIBRARY_PATH="${AGENT_OWNER_ENV_CACHE_LDS[$index]}"
+    AGENT_OWNER_ENV_PATH="${AGENT_OWNER_ENV_CACHE_PATHS[$index]}"
+    return 0
+  done
+  agent_load_owner_environment "$owner" "$home" "$seed_mpp" "$explicit_file" || return 1
+  AGENT_OWNER_ENV_CACHE_KEYS+=("$key")
+  AGENT_OWNER_ENV_CACHE_HOMES+=("$AGENT_OWNER_ENV_GAUSSHOME")
+  AGENT_OWNER_ENV_CACHE_LOGS+=("$AGENT_OWNER_ENV_GAUSSLOG")
+  AGENT_OWNER_ENV_CACHE_DATA+=("$AGENT_OWNER_ENV_PGDATA")
+  AGENT_OWNER_ENV_CACHE_HOSTS+=("$AGENT_OWNER_ENV_PGHOST")
+  AGENT_OWNER_ENV_CACHE_PORTS+=("$AGENT_OWNER_ENV_PGPORT")
+  AGENT_OWNER_ENV_CACHE_LDS+=("$AGENT_OWNER_ENV_LD_LIBRARY_PATH")
+  AGENT_OWNER_ENV_CACHE_PATHS+=("$AGENT_OWNER_ENV_PATH")
+}
+
 agent_cmdline_facts() { # <pid>；设置 AGENT_CMD_DATA_DIR / AGENT_CMD_PORT
   local pid="$1" root="${DBDOG_PROC_ROOT:-/proc}" arg expect=""
   AGENT_CMD_DATA_DIR=""
@@ -119,38 +299,6 @@ agent_cmdline_facts() { # <pid>；设置 AGENT_CMD_DATA_DIR / AGENT_CMD_PORT
       --port=*) AGENT_CMD_PORT="${arg#*=}" ;;
     esac
   done <"$root/$pid/cmdline"
-}
-
-agent_profile_literal() { # <用户 home> <KEY>；只解析静态 export，不执行 shell 文件
-  local home="$1" key="$2" file value
-  [ -n "$home" ] || return 1
-  for file in "$home/.bash_profile" "$home/.bashrc" "$home/.profile"; do
-    [ -r "$file" ] || continue
-    value="$(awk -v key="$key" '
-      {
-        line=$0
-        sub(/^[[:space:]]*/, "", line)
-        sub(/^export[[:space:]]+/, "", line)
-        if (index(line, key "=") == 1) {
-          print substr(line, length(key) + 2)
-          exit
-        }
-      }
-    ' "$file")"
-    [ -n "$value" ] || continue
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    case "$value" in
-      \"*\") value="${value#\"}"; value="${value%\"}" ;;
-      \'*\') value="${value#\'}"; value="${value%\'}" ;;
-    esac
-    # 只接受字面量。包含 shell 展开/命令语法时宁可让调用方继续找其他事实源。
-    case "$value" in *'$'* | *'`'* | *';'* | *'&'* | *'|'*) continue ;; esac
-    [ -n "$value" ] || continue
-    printf '%s\n' "$value"
-    return 0
-  done
-  return 1
 }
 
 agent_owner_home() { # <uid>
@@ -182,7 +330,7 @@ agent_find_gauss_pids() { # 设置 AGENT_GAUSS_PIDS
     case "$requested" in *[!0-9]* | '') die "DBDOG_GAUSSDB_PID 不是合法 PID" ;; esac
     [ -r "$root/$requested/comm" ] || die "找不到指定 GaussDB PID: $requested"
     comm="$(tr -d '\r\n' <"$root/$requested/comm")"
-    [ "$comm" = gaussdb ] || die "指定 PID $requested 不是 gaussdb（comm=$comm）"
+    [ "$comm" = gaussdb ] || die "指定 PID ${requested} 不是 gaussdb（comm=${comm}）"
     AGENT_GAUSS_PIDS+=("$requested")
     return
   fi
@@ -206,13 +354,30 @@ agent_add_unique() { # <数组名> <值>；数组名仅限本文件内常量调�
 
 agent_detect_gaussdb() {
   local root="${DBDOG_PROC_ROOT:-/proc}" pid data port env_port env_home env_log env_data
-  local uid home owner exe map_index mapped old_conf="${AGENT_EXISTING_GAUSS_CONFIG:-}"
+  local env_host env_ld env_path env_mpp uid owner_home owner exe gsql socket_dir
+  local map_index mapped explicit_env="${DBDOG_GAUSSDB_ENV_FILE:-}"
+  local old_conf="${AGENT_EXISTING_GAUSS_CONFIG:-}"
+  case "$explicit_env" in "" | /*) ;; *) die "DBDOG_GAUSSDB_ENV_FILE 必须是绝对路径" ;; esac
   AGENT_GAUSS_PORTS=()
   AGENT_GAUSS_LOG_GLOBS=()
   AGENT_GAUSS_PID_PORTS=()
   AGENT_GAUSS_PID_DATA_DIRS=()
   AGENT_GAUSS_PID_HOMES=()
   AGENT_GAUSS_PID_OWNERS=()
+  AGENT_GAUSS_PID_OWNER_HOMES=()
+  AGENT_GAUSS_PID_HOSTS=()
+  AGENT_GAUSS_PID_LD_LIBRARY_PATHS=()
+  AGENT_GAUSS_PID_PATHS=()
+  AGENT_GAUSS_PID_GSQLS=()
+  AGENT_GAUSS_PID_SOURCE_PIDS=()
+  AGENT_OWNER_ENV_CACHE_KEYS=()
+  AGENT_OWNER_ENV_CACHE_HOMES=()
+  AGENT_OWNER_ENV_CACHE_LOGS=()
+  AGENT_OWNER_ENV_CACHE_DATA=()
+  AGENT_OWNER_ENV_CACHE_HOSTS=()
+  AGENT_OWNER_ENV_CACHE_PORTS=()
+  AGENT_OWNER_ENV_CACHE_LDS=()
+  AGENT_OWNER_ENV_CACHE_PATHS=()
   agent_find_gauss_pids
 
   if [ "${#AGENT_GAUSS_PIDS[@]}" -eq 0 ]; then
@@ -223,7 +388,7 @@ agent_detect_gaussdb() {
   fi
 
   for pid in ${AGENT_GAUSS_PIDS[@]+"${AGENT_GAUSS_PIDS[@]}"}; do
-    home=""
+    owner_home=""
     owner=""
     agent_cmdline_facts "$pid"
     data="$AGENT_CMD_DATA_DIR"
@@ -232,16 +397,49 @@ agent_detect_gaussdb() {
     env_home="$(agent_proc_env "$pid" GAUSSHOME 2>/dev/null || true)"
     env_log="$(agent_proc_env "$pid" GAUSSLOG 2>/dev/null || true)"
     env_data="$(agent_proc_env "$pid" PGDATA 2>/dev/null || true)"
+    env_host="$(agent_proc_env "$pid" PGHOST 2>/dev/null || true)"
+    env_ld="$(agent_proc_env "$pid" LD_LIBRARY_PATH 2>/dev/null || true)"
+    env_path="$(agent_proc_env "$pid" PATH 2>/dev/null || true)"
+    env_mpp="$(agent_proc_env "$pid" MPPDB_ENV_SEPARATE_PATH 2>/dev/null || true)"
+
+    if [ -z "$env_home" ] && [ -L "$root/$pid/exe" ]; then
+      exe="$(readlink -f "$root/$pid/exe" 2>/dev/null || true)"
+      case "$exe" in */bin/gaussdb) env_home="${exe%/bin/gaussdb}" ;; esac
+    fi
 
     if [ -r "$root/$pid/status" ]; then
       uid="$(awk '/^Uid:/ { print $2; exit }' "$root/$pid/status")"
-      home="$(agent_owner_home "$uid" 2>/dev/null || true)"
+      owner_home="$(agent_owner_home "$uid" 2>/dev/null || true)"
       owner="$(agent_owner_name "$uid" 2>/dev/null || true)"
-      [ -n "$env_port" ] || env_port="$(agent_profile_literal "$home" PGPORT 2>/dev/null || true)"
-      [ -n "$env_home" ] || env_home="$(agent_profile_literal "$home" GAUSSHOME 2>/dev/null || true)"
-      [ -n "$env_log" ] || env_log="$(agent_profile_literal "$home" GAUSSLOG 2>/dev/null || true)"
-      [ -n "$env_data" ] || env_data="$(agent_profile_literal "$home" PGDATA 2>/dev/null || true)"
+      if ! agent_cached_owner_environment "$owner" "$owner_home" "$env_mpp" "$explicit_env"; then
+        [ -z "$explicit_env" ] || \
+          die "无法以 GaussDB 运行用户加载 DBDOG_GAUSSDB_ENV_FILE: $explicit_env"
+        warn "未能加载 GaussDB 运行用户 profile；继续使用 /proc 运行态环境"
+      else
+        if [ -n "$explicit_env" ]; then
+          # 显式环境文件代表操作者确认过的完整客户端环境，优先级高于自动事实。
+          [ -z "$AGENT_OWNER_ENV_PGPORT" ] || env_port="$AGENT_OWNER_ENV_PGPORT"
+          [ -z "$AGENT_OWNER_ENV_GAUSSHOME" ] || env_home="$AGENT_OWNER_ENV_GAUSSHOME"
+          [ -z "$AGENT_OWNER_ENV_GAUSSLOG" ] || env_log="$AGENT_OWNER_ENV_GAUSSLOG"
+          [ -z "$AGENT_OWNER_ENV_PGDATA" ] || env_data="$AGENT_OWNER_ENV_PGDATA"
+          [ -z "$AGENT_OWNER_ENV_PGHOST" ] || env_host="$AGENT_OWNER_ENV_PGHOST"
+          [ -z "$AGENT_OWNER_ENV_LD_LIBRARY_PATH" ] || env_ld="$AGENT_OWNER_ENV_LD_LIBRARY_PATH"
+          [ -z "$AGENT_OWNER_ENV_PATH" ] || env_path="$AGENT_OWNER_ENV_PATH"
+        else
+          [ -n "$env_port" ] || env_port="$AGENT_OWNER_ENV_PGPORT"
+          [ -n "$env_home" ] || env_home="$AGENT_OWNER_ENV_GAUSSHOME"
+          [ -n "$env_log" ] || env_log="$AGENT_OWNER_ENV_GAUSSLOG"
+          [ -n "$env_data" ] || env_data="$AGENT_OWNER_ENV_PGDATA"
+          [ -n "$env_host" ] || env_host="$AGENT_OWNER_ENV_PGHOST"
+          # gaussdb 服务进程和 gsql 客户端可能需要不同的补充库目录；运行态在前，profile 在后。
+          env_ld="$(agent_merge_path_lists "$env_ld" "$AGENT_OWNER_ENV_LD_LIBRARY_PATH")"
+          env_path="$(agent_merge_path_lists "$env_path" "$AGENT_OWNER_ENV_PATH")"
+        fi
+      fi
     fi
+    [ -z "${DBDOG_GAUSSDB_PGHOST:-}" ] || env_host="$DBDOG_GAUSSDB_PGHOST"
+    [ -z "${DBDOG_GAUSSDB_LD_LIBRARY_PATH:-}" ] || \
+      env_ld="$DBDOG_GAUSSDB_LD_LIBRARY_PATH"
     [ -n "$data" ] || data="$env_data"
     if [ -z "$port" ] && [ -n "$data" ] && [ -r "$data/postmaster.pid" ]; then
       port="$(sed -n '4p' "$data/postmaster.pid" | tr -d '[:space:]')"
@@ -262,10 +460,26 @@ agent_detect_gaussdb() {
     agent_valid_port "$port" || die "无法从 gaussdb PID $pid 确定有效监听端口"
     agent_add_unique AGENT_GAUSS_PORTS "$port"
 
-    if [ -z "$env_home" ] && [ -L "$root/$pid/exe" ]; then
-      exe="$(readlink -f "$root/$pid/exe" 2>/dev/null || true)"
-      case "$exe" in */bin/gaussdb) env_home="${exe%/bin/gaussdb}" ;; esac
+    if [ -z "$env_host" ] && [ -n "$data" ] && [ -r "$data/postmaster.pid" ]; then
+      socket_dir="$(sed -n '5p' "$data/postmaster.pid" | awk '{$1=$1; print}')"
+      [ -z "$socket_dir" ] || env_host="$socket_dir"
     fi
+    [ -n "$env_host" ] || env_host="$(agent_proc_socket_dir "$port" 2>/dev/null || true)"
+    [ -n "$env_home" ] || die "无法从 gaussdb PID $pid 确定 GAUSSHOME"
+    [ -n "$owner" ] || die "无法从 gaussdb PID $pid 确定运行用户"
+    [ -n "$env_host" ] || \
+      die "无法发现 GaussDB 本地 socket；可显式设置 DBDOG_GAUSSDB_PGHOST"
+
+    # 实际运行环境优先，并只追加当前安装中真实存在的标准相对目录。
+    [ ! -d "$env_home/lib" ] || env_ld="$(agent_merge_path_lists "$env_ld" "$env_home/lib")"
+    [ ! -d "$env_home/lib/libsimsearch" ] || \
+      env_ld="$(agent_merge_path_lists "$env_ld" "$env_home/lib/libsimsearch")"
+    env_path="$(agent_merge_path_lists "$env_path" \
+      "$env_home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")"
+    gsql="$env_home/bin/gsql"
+    [ -x "$gsql" ] || gsql="$(agent_find_in_path "$env_path" gsql 2>/dev/null || true)"
+    [ -n "$gsql" ] || die "目标 GaussDB 客户端环境中找不到可执行 gsql"
+
     # GaussDB 可能让多个后端进程都使用 comm=gaussdb；安装事实按实际端口去重，
     # 不能把每个 backend 误当成一个数据库实例重复初始化。
     mapped=0
@@ -275,6 +489,13 @@ agent_detect_gaussdb() {
       [ -n "${AGENT_GAUSS_PID_DATA_DIRS[$map_index]}" ] || AGENT_GAUSS_PID_DATA_DIRS[map_index]="$data"
       [ -n "${AGENT_GAUSS_PID_HOMES[$map_index]}" ] || AGENT_GAUSS_PID_HOMES[map_index]="$env_home"
       [ -n "${AGENT_GAUSS_PID_OWNERS[$map_index]}" ] || AGENT_GAUSS_PID_OWNERS[map_index]="$owner"
+      [ -n "${AGENT_GAUSS_PID_OWNER_HOMES[$map_index]}" ] || AGENT_GAUSS_PID_OWNER_HOMES[map_index]="$owner_home"
+      [ -n "${AGENT_GAUSS_PID_HOSTS[$map_index]}" ] || AGENT_GAUSS_PID_HOSTS[map_index]="$env_host"
+      AGENT_GAUSS_PID_LD_LIBRARY_PATHS[map_index]="$(agent_merge_path_lists \
+        "${AGENT_GAUSS_PID_LD_LIBRARY_PATHS[$map_index]}" "$env_ld")"
+      AGENT_GAUSS_PID_PATHS[map_index]="$(agent_merge_path_lists \
+        "${AGENT_GAUSS_PID_PATHS[$map_index]}" "$env_path")"
+      [ -n "${AGENT_GAUSS_PID_GSQLS[$map_index]}" ] || AGENT_GAUSS_PID_GSQLS[map_index]="$gsql"
       break
     done
     if [ "$mapped" -eq 0 ]; then
@@ -282,6 +503,12 @@ agent_detect_gaussdb() {
       AGENT_GAUSS_PID_DATA_DIRS+=("$data")
       AGENT_GAUSS_PID_HOMES+=("$env_home")
       AGENT_GAUSS_PID_OWNERS+=("$owner")
+      AGENT_GAUSS_PID_OWNER_HOMES+=("$owner_home")
+      AGENT_GAUSS_PID_HOSTS+=("$env_host")
+      AGENT_GAUSS_PID_LD_LIBRARY_PATHS+=("$env_ld")
+      AGENT_GAUSS_PID_PATHS+=("$env_path")
+      AGENT_GAUSS_PID_GSQLS+=("$gsql")
+      AGENT_GAUSS_PID_SOURCE_PIDS+=("$pid")
     fi
 
     [ -n "$env_log" ] && agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/*/gaussdb-*.log"

@@ -32,6 +32,12 @@ PREVIOUS_INSTALL=0
 HAD_CONFIG=0
 PREVIOUS_DB_PASSWORD=""
 DB_PASSWORD_CHANGED=0
+DB_PASSWORD_RESET_WITHOUT_ROLLBACK=0
+DB_HBA_PATHS=()
+DB_HBA_BACKUPS=()
+DB_HBA_APPLIED=()
+HBA_RECOVERY_DIR=""
+PRESERVE_WORK_DIR=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
 
@@ -45,6 +51,9 @@ usage() {
 
 可选覆盖（正常情况下自动发现或使用稳定默认值）：
   DBDOG_GAUSSDB_MONITOR_PASSWORD         默认首次生成、升级保留
+  DBDOG_GAUSSDB_ENV_FILE                 显式 GaussDB 客户端环境文件（绝对路径）
+  DBDOG_GAUSSDB_PGHOST                   显式本地 Unix socket 目录
+  DBDOG_GAUSSDB_LD_LIBRARY_PATH           显式 gsql 动态库搜索路径
   DBDOG_GAUSSDB_PORT                     仅在无法从运行进程发现时使用
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
   DBDOG_GAUSSDB_DBNAME                   默认 postgres
@@ -65,10 +74,40 @@ remove_known_stage() { # <路径> <允许的精确前缀>
 }
 
 cleanup_stages() {
-  remove_known_stage "$WORK_DIR" /tmp/dbdog-agent-install.
+  if [ "$PRESERVE_WORK_DIR" -eq 1 ]; then
+    warn "为人工恢复保留安装工作目录: $WORK_DIR"
+  else
+    remove_known_stage "$WORK_DIR" /tmp/dbdog-agent-install.
+  fi
   remove_known_stage "$RUNTIME_STAGE" /opt/.dbdog-agent-stage.
   remove_known_stage "$CONFIG_STAGE" /etc/.dbdog-agent-stage.
   remove_known_stage "$UNIT_STAGE" /etc/systemd/system/.dbdog-agent-units.
+}
+
+persist_hba_recovery_materials() {
+  local recovery index path backup applied metadata
+  install -d -o root -g root -m 0755 "$AGENT_LOG_DIR" || return 1
+  recovery="$(mktemp -d "$AGENT_LOG_DIR/install-hba-recovery.XXXXXXXX")" || return 1
+  chown root:root "$recovery" || return 1
+  chmod 0700 "$recovery" || return 1
+  metadata="$recovery/README"
+  : >"$metadata" || return 1
+  chmod 0600 "$metadata" || return 1
+  for index in "${!DB_HBA_PATHS[@]}"; do
+    path="${DB_HBA_PATHS[$index]:-}"
+    [ -n "$path" ] || continue
+    backup="${DB_HBA_BACKUPS[$index]:-}"
+    applied="${DB_HBA_APPLIED[$index]:-}"
+    printf 'instance_index=%s\nhba_path=%s\n\n' "$index" "$path" >>"$metadata" || return 1
+    [ ! -f "$backup" ] || \
+      install -o root -g root -m 0600 "$backup" "$recovery/pg_hba.$index.before" || return 1
+    [ ! -f "$applied" ] || \
+      install -o root -g root -m 0600 "$applied" "$recovery/pg_hba.$index.applied" || return 1
+    [ ! -f "$path" ] || \
+      install -o root -g root -m 0600 "$path" "$recovery/pg_hba.$index.current" || return 1
+  done
+  HBA_RECOVERY_DIR="$recovery"
+  warn "HBA 自动恢复未完全成功；原始、受管和当前副本已保留在 $HBA_RECOVERY_DIR"
 }
 
 unit_exists() {
@@ -138,15 +177,26 @@ rollback_install() {
 on_exit() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ] && [ "$MUTATION_STARTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
-    rollback_install
+  if [ "$rc" -ne 0 ] && [ "${#DB_HBA_PATHS[@]}" -gt 0 ]; then
+    if ! agent_restore_hba_rules; then
+      warn "部分 GaussDB HBA 规则未能自动恢复"
+      if ! persist_hba_recovery_materials; then
+        PRESERVE_WORK_DIR=1
+        warn "持久化 HBA 恢复材料也失败；保留 root 安装工作目录供人工恢复"
+      fi
+    fi
   fi
   if [ "$rc" -ne 0 ] && [ "$DB_PASSWORD_CHANGED" -eq 1 ] && \
     [ -n "$PREVIOUS_DB_PASSWORD" ]; then
     warn "恢复安装前的 GaussDB 监控用户密码"
-    if ! agent_set_gaussdb_password "$PREVIOUS_DB_PASSWORD"; then
+    if ! agent_set_gaussdb_password "$PREVIOUS_DB_PASSWORD" force; then
       warn "GaussDB 监控用户密码自动恢复失败，请立即人工核对"
     fi
+  elif [ "$rc" -ne 0 ] && [ "$DB_PASSWORD_RESET_WITHOUT_ROLLBACK" -eq 1 ]; then
+    warn "本次设置前没有旧 Agent 密码可恢复；新密码保留在失败配置目录 *.failed.* 中"
+  fi
+  if [ "$rc" -ne 0 ] && [ "$MUTATION_STARTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
+    rollback_install
   fi
   cleanup_stages
   exit "$rc"
@@ -161,8 +211,8 @@ require_root_host() {
   [ "$arch" = aarch64 ] || [ "$arch" = arm64 ] || die "dbdog-agent 产物仅支持 aarch64，当前为 $arch"
   [ -d /run/systemd/system ] || die "当前主机不是运行中的 systemd 环境"
   local command
-  for command in awk chmod chown cp curl file find grep hostname install mktemp mv od \
-    readlink rm runuser sed sort systemctl tar timeout tr; do
+  for command in awk bash cat chmod chown cmp cp curl env file find grep hostname install ldd \
+    mktemp mv od readlink rm runuser sed sort systemctl tar timeout tr; do
     command -v "$command" >/dev/null 2>&1 || die "缺少安装依赖命令: $command"
   done
   [ -x /usr/bin/timeout ] || die "systemd 单元需要 /usr/bin/timeout"
@@ -184,14 +234,32 @@ prompt_value() { # <变量名> <提示> <是否隐藏:0|1>
   export "$name=$value"
 }
 
-generate_agent_secret() {
-  od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]'
+latest_failed_agent_config() { # 首装验收失败后复用同一次生成的凭证
+  local dir suffix latest=""
+  for dir in "$AGENT_CONFIG_DIR".failed.*; do
+    [ -d "$dir" ] || continue
+    suffix="${dir#"$AGENT_CONFIG_DIR.failed."}"
+    case "$suffix" in "" | *[!0-9]*) continue ;; esac
+    [ "${#suffix}" -eq 14 ] || continue
+    if [ -z "$latest" ] || [[ "$dir" > "$latest" ]]; then latest="$dir"; fi
+  done
+  [ -n "$latest" ] || return 1
+  printf '%s\n' "$latest"
 }
 
 resolve_inputs() {
   local old_datadog="$AGENT_CONFIG_DIR/datadog.yaml"
   local old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
-  local old
+  local old recovery=""
+
+  if [ ! -f "$old_gauss" ]; then
+    recovery="$(latest_failed_agent_config 2>/dev/null || true)"
+    if [ -n "$recovery" ] && [ -f "$recovery/conf.d/gaussdb.d/conf.yaml" ]; then
+      old_datadog="$recovery/datadog.yaml"
+      old_gauss="$recovery/conf.d/gaussdb.d/conf.yaml"
+      log "复用上次首装失败目录中的凭证，避免重复重置 GaussDB 监控密码: $recovery"
+    fi
+  fi
 
   PREVIOUS_DB_PASSWORD="$(agent_existing_gauss_scalar "$old_gauss" password 2>/dev/null || true)"
 
@@ -211,7 +279,8 @@ resolve_inputs() {
   prompt_value DBDOG_SERVER_URL "dbdog-server 地址（如 http://10.0.0.8:8080）" 0
   prompt_value DBDOG_API_KEY "dbdog-web 签发的 Agent ingest key" 1
   if [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
-    DBDOG_GAUSSDB_MONITOR_PASSWORD="$(generate_agent_secret)"
+    DBDOG_GAUSSDB_MONITOR_PASSWORD="$(agent_generate_gaussdb_password)" || \
+      die "无法生成 GaussDB 监控用户随机密码"
     log "已生成 GaussDB dbdog 监控用户随机密码（只写入 root 0600 配置）"
   fi
 
@@ -220,7 +289,15 @@ resolve_inputs() {
   agent_require_single_line DBDOG_GAUSSDB_MONITOR_PASSWORD "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
   [ -n "$DBDOG_API_KEY" ] || die "DBDOG_API_KEY 不能为空"
   [ -n "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ] || die "GaussDB 监控密码不能为空"
+  agent_validate_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
+    die "GaussDB 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类"
   case "$DBDOG_API_KEY" in *[!A-Za-z0-9._-]*) die "DBDOG_API_KEY 含不支持的字符" ;; esac
+
+  agent_require_single_line DBDOG_GAUSSDB_ENV_FILE "${DBDOG_GAUSSDB_ENV_FILE:-}"
+  agent_require_single_line DBDOG_GAUSSDB_PGHOST "${DBDOG_GAUSSDB_PGHOST:-}"
+  agent_require_single_line DBDOG_GAUSSDB_LD_LIBRARY_PATH \
+    "${DBDOG_GAUSSDB_LD_LIBRARY_PATH:-}"
+  case "${DBDOG_GAUSSDB_ENV_FILE:-}" in "" | /*) ;; *) die "DBDOG_GAUSSDB_ENV_FILE 必须是绝对路径" ;; esac
 
   DBDOG_GAUSSDB_USER="${DBDOG_GAUSSDB_USER:-dbdog}"
   DBDOG_GAUSSDB_DBNAME="${DBDOG_GAUSSDB_DBNAME:-postgres}"
@@ -263,6 +340,50 @@ PY
   fi
 }
 
+compact_tuf_root_file() { # <输入文件>；只接受 Agent 可直接信任的 TUF root metadata
+  local input="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$input" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+signed = value.get("signed") if type(value) is dict else None
+valid = (
+    type(signed) is dict
+    and signed.get("_type") == "root"
+    and type(signed.get("version")) is int
+    and signed["version"] > 0
+    and type(signed.get("keys")) is dict
+    and type(signed.get("roles")) is dict
+    and type(value.get("signatures")) is list
+    and len(value["signatures"]) > 0
+)
+if not valid:
+    raise SystemExit("JSON is not signed TUF root metadata")
+print(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
+PY
+  elif command -v jq >/dev/null 2>&1; then
+    jq -ce '
+      select(
+        type == "object"
+        and (.signed | type) == "object"
+        and .signed._type == "root"
+        and (.signed.version | type) == "number"
+        and .signed.version > 0
+        and (.signed.version | floor) == .signed.version
+        and (.signed.keys | type) == "object"
+        and (.signed.roles | type) == "object"
+        and (.signatures | type) == "array"
+        and (.signatures | length) > 0
+      )
+    ' "$input"
+  else
+    die "缺少 python3 或 jq，无法校验 Remote Config trust root"
+  fi
+}
+
 fetch_server_bootstrap() { # 设置 RC_ROOT_JSON
   local header="$WORK_DIR/api-key.header" validate="$WORK_DIR/validate.json"
   local rc_root="$WORK_DIR/configuration-root.json" compact
@@ -279,7 +400,8 @@ fetch_server_bootstrap() { # 设置 RC_ROOT_JSON
   curl "${CURL_TLS_ARGS[@]}" -H "@$header" \
     "$DBDOG_SERVER_URL/api/v0.1/configuration-root" >"$rc_root" || \
     die "无法取得 Remote Config trust root"
-  RC_ROOT_JSON="$(compact_json_file "$rc_root")" || die "Remote Config trust root 非法"
+  RC_ROOT_JSON="$(compact_tuf_root_file "$rc_root")" || \
+    die "Remote Config trust root 不是带签名的 TUF root metadata"
   case "$RC_ROOT_JSON" in *$'\n'* | *$'\r'*) die "Remote Config trust root 含换行" ;; esac
 }
 
@@ -288,45 +410,251 @@ agent_sql_literal() { # SQL 单引号字面量内容（调用方负责外层引�
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
-agent_gsql() { # <进程索引> [gsql 参数...]；stdin 可传 SQL
-  local index="$1" home owner port gsql
+agent_gauss_exec() { # <进程索引> <命令> [参数...]；复用该实例真实客户端环境
+  local index="$1" home owner owner_home host port ld path
   shift
   home="${AGENT_GAUSS_PID_HOMES[$index]}"
   owner="${AGENT_GAUSS_PID_OWNERS[$index]}"
+  owner_home="${AGENT_GAUSS_PID_OWNER_HOMES[$index]}"
+  host="${AGENT_GAUSS_PID_HOSTS[$index]}"
   port="${AGENT_GAUSS_PID_PORTS[$index]}"
+  ld="${AGENT_GAUSS_PID_LD_LIBRARY_PATHS[$index]}"
+  path="${AGENT_GAUSS_PID_PATHS[$index]}"
   [ -n "$home" ] || die "无法从 gaussdb 进程确定 GAUSSHOME"
   [ -n "$owner" ] || die "无法从 gaussdb 进程确定运行用户"
-  gsql="$home/bin/gsql"
-  [ -x "$gsql" ] || die "目标 GaussDB 没有可执行 gsql: $gsql"
-  runuser -u "$owner" -- env \
-    GAUSSHOME="$home" \
-    LD_LIBRARY_PATH="$home/lib" \
-    PATH="$home/bin:/usr/bin:/bin" \
-    "$gsql" -q -A -t -v ON_ERROR_STOP=1 -p "$port" \
-    -d "$DBDOG_GAUSSDB_DBNAME" "$@"
+  [ -n "$host" ] || die "无法从 gaussdb 进程确定本地 socket"
+  runuser -u "$owner" -- env -i \
+    HOME="${owner_home:-/}" USER="$owner" LOGNAME="$owner" LC_ALL=C \
+    GAUSSHOME="$home" PGHOST="$host" PGPORT="$port" \
+    PGCONNECT_TIMEOUT=8 LD_LIBRARY_PATH="$ld" PATH="$path" "$@"
 }
 
-agent_set_gaussdb_password() { # <密码>；所有发现实例上设置同一个 dbdog MONADMIN 密码
-  local password="$1" escaped sql="$WORK_DIR/set-gaussdb-password.sql" index count exists
-  escaped="$(agent_sql_literal "$password")"
+agent_gauss_timed_exec() { # <进程索引> <秒> <命令> [参数...]
+  local index="$1" seconds="$2" timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
+  shift 2
+  [ -x "$timeout_bin" ] || return 1
+  agent_gauss_exec "$index" "$timeout_bin" --kill-after=2 "$seconds" "$@"
+}
+
+agent_gsql() { # <进程索引> [gsql 参数...]；stdin 可传 SQL
+  local index="$1" host port gsql
+  shift
+  host="${AGENT_GAUSS_PID_HOSTS[$index]}"
+  port="${AGENT_GAUSS_PID_PORTS[$index]}"
+  gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
+  [ -x "$gsql" ] || die "目标 GaussDB 没有可执行 gsql: $gsql"
+  agent_gauss_timed_exec "$index" 30 "$gsql" -X -q -A -t -v ON_ERROR_STOP=1 \
+    -h "$host" -p "$port" -d "$DBDOG_GAUSSDB_DBNAME" "$@"
+}
+
+agent_show_preflight_error() { # <文件> <错误>
+  local file="$1" message="$2"
+  [ ! -s "$file" ] || sed -n '1,160p' "$file" >&2
+  die "$message"
+}
+
+preflight_gaussdb_clients() {
+  local index count gsql ldd_bin out value mode exists
+  count="${#AGENT_GAUSS_PID_PORTS[@]}"
+  [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
+  AGENT_GAUSS_PID_PASSWORD_MODES=()
+  AGENT_GAUSS_PID_USER_EXISTS=()
+  log "预检目标 GaussDB 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
+  for ((index=0; index<count; index++)); do
+    gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
+    ldd_bin="$(agent_find_in_path "${AGENT_GAUSS_PID_PATHS[$index]}" ldd 2>/dev/null || true)"
+    [ -n "$ldd_bin" ] || die "GaussDB 客户端环境找不到 ldd（实例索引 ${index}）"
+
+    out="$WORK_DIR/gsql-ldd.$index.out"
+    if ! agent_gauss_timed_exec "$index" 20 "$ldd_bin" "$gsql" >"$out" 2>&1; then
+      agent_show_preflight_error "$out" "gsql 动态库预检执行失败（实例索引 ${index}）"
+    fi
+    if grep -Eq '(^|[[:space:]])not found($|[[:space:]])|=>[[:space:]]+not found' "$out"; then
+      agent_show_preflight_error "$out" \
+        "gsql 仍有未解析运行库；请核对数据库用户 profile 或设置 DBDOG_GAUSSDB_ENV_FILE/DBDOG_GAUSSDB_LD_LIBRARY_PATH"
+    fi
+
+    out="$WORK_DIR/gsql-version.$index.out"
+    agent_gauss_timed_exec "$index" 20 "$gsql" --version >"$out" 2>&1 || \
+      agent_show_preflight_error "$out" "gsql --version 失败（实例索引 ${index}）"
+    [ -s "$out" ] || agent_show_preflight_error "$out" "gsql --version 没有返回版本信息"
+
+    out="$WORK_DIR/gsql-select.$index.out"
+    agent_gsql "$index" -c 'SELECT 1;' >"$out" 2>&1 || \
+      agent_show_preflight_error "$out" \
+        "gsql 本地管理连接失败；PGHOST 必须指向该实例可用的 Unix socket，可用 DBDOG_GAUSSDB_PGHOST 覆盖"
+    value="$(awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }' "$out")"
+    [ "$value" = 1 ] || agent_show_preflight_error "$out" "gsql SELECT 1 返回异常（实例索引 ${index}）"
+
+    mode="$(agent_gsql "$index" -c 'SHOW password_encryption_type;' 2>"$WORK_DIR/gsql-password-mode.$index.err" \
+      | awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }')" || \
+      agent_show_preflight_error "$WORK_DIR/gsql-password-mode.$index.err" \
+        "无法读取 password_encryption_type（实例索引 ${index}）"
+    exists="$(agent_gsql "$index" -c \
+      "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
+      2>"$WORK_DIR/gsql-user-exists.$index.err" \
+      | awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }')" || \
+      agent_show_preflight_error "$WORK_DIR/gsql-user-exists.$index.err" \
+        "无法检查 dbdog 监控用户（实例索引 ${index}）"
+    case "$exists" in 0 | 1) ;; *) die "dbdog 监控用户存在性返回异常（实例索引 ${index}）" ;; esac
+    AGENT_GAUSS_PID_PASSWORD_MODES+=("$mode")
+    AGENT_GAUSS_PID_USER_EXISTS+=("$exists")
+
+    # 已有用户稍后会先经受管 MD5 HBA 做真实密码探测，成功则不重置；只有
+    # 确定需要 CREATE 时，才在任何数据库 mutation 前要求兼容加密模式。
+    if [ "$exists" = 0 ]; then
+      case "$mode" in
+        0 | 1) ;;
+        *) die "当前 password_encryption_type=${mode}，无法为标准 libpq 生成 MD5 兼容凭证；请由 GaussDB DBA 评估后调整为 1 并重跑。安装器不会修改生产库全局参数" ;;
+      esac
+    fi
+  done
+}
+
+agent_monitor_password_works() { # 0=有效，2=明确密码拒绝，1=探测基础设施失败
+  local index="$1" password="$2" python password_file out attempt rc success=0 rejected=0
+  local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
+  python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
+  [ -x "$python" ] && [ -x "$timeout_bin" ] || return 1
+  password_file="$WORK_DIR/monitor-password.$index"
+  printf '%s' "$password" >"$password_file" || return 1
+  chmod 0600 "$password_file" || return 1
+  out="$WORK_DIR/gsql-monitor-auth.$index.out"
+  for ((attempt=1; attempt<=5; attempt++)); do
+    : >"$out"
+    rc=0
+    "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
+      PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_PORTS[$index]}" \
+      "$DBDOG_GAUSSDB_DBNAME" >"$out" 2>&1 <<'PY' || rc=$?
+import pathlib
+import sys
+
+import psycopg
+
+password = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+try:
+    with psycopg.connect(
+        host="127.0.0.1",
+        port=int(sys.argv[2]),
+        dbname=sys.argv[3],
+        user="dbdog",
+        password=password,
+        connect_timeout=5,
+    ) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            if cursor.fetchone() != (1,):
+                raise RuntimeError("unexpected SELECT 1 result")
+except psycopg.Error as error:
+    if error.sqlstate == "28P01":
+        raise SystemExit(42)
+    print(f"database authentication probe failed: sqlstate={error.sqlstate or 'unknown'}", file=sys.stderr)
+    raise SystemExit(43)
+except Exception as error:
+    print(f"database authentication probe infrastructure failed: {type(error).__name__}", file=sys.stderr)
+    raise SystemExit(44)
+PY
+    case "$rc" in
+      0)
+      success=1
+      break
+        ;;
+      42)
+        rejected=1
+        break
+        ;;
+    esac
+    sleep 1
+  done
+  rm -f -- "$password_file" || return 1
+  [ "$success" -eq 1 ] && return 0
+  [ "$rejected" -eq 1 ] && return 2
+  return 1
+}
+
+agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置同一个 dbdog MONADMIN 密码
+  local password="$1" force="${2:-}" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
+  local index count exists mode reset=0 password_status
+  escaped="$(agent_sql_literal "$password")" || return 1
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || return 1
   for ((index=0; index<count; index++)); do
     exists="$(agent_gsql "$index" -c \
       "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
       | awk 'NF { value=$0 } END { print value }')" || return 1
+    mode="$(agent_gsql "$index" -c 'SHOW password_encryption_type;' \
+      | awk 'NF { value=$0 } END { print value }')" || return 1
     case "$exists" in
-      0) printf "SET password_encryption_type = 1;\nCREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" ;;
-      1) printf "SET password_encryption_type = 1;\nALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" ;;
-      *) die "无法判断 GaussDB 监控用户是否存在（实例索引 $index）" ;;
+      0)
+        case "$mode" in 0 | 1) ;; *) return 1 ;; esac
+        printf "CREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
+        reset=1
+        ;;
+      1)
+        password_status=2
+        if [ "$force" != force ]; then
+          password_status=0
+          agent_monitor_password_works "$index" "$password" || password_status=$?
+        fi
+        case "$password_status" in
+          0)
+            printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
+            ;;
+          2)
+          case "$mode" in 0 | 1) ;;
+            *) warn "实例索引 ${index} 的现有 dbdog 密码不可用，且 password_encryption_type=${mode} 不允许安全重置"; return 1 ;;
+          esac
+          printf "ALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
+          reset=1
+            ;;
+          *)
+            warn "实例索引 ${index} 无法可靠判定现有 dbdog 密码；拒绝把探测故障当作密码错误并重置"
+            return 1
+            ;;
+        esac
+        ;;
+      *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
     esac
-    chmod 0600 "$sql"
+    chmod 0600 "$sql" || return 1
+    # 服务端可能在客户端收到成功响应前就提交密码修改。先进入“不确定但需回滚”
+    # 状态，确保连接中断/超时也不会让旧配置与数据库凭证永久失配。
+    if [ "$reset" -eq 1 ]; then
+      if [ -n "$PREVIOUS_DB_PASSWORD" ] && [ "$PREVIOUS_DB_PASSWORD" != "$password" ]; then
+        DB_PASSWORD_CHANGED=1
+      elif [ -z "$PREVIOUS_DB_PASSWORD" ]; then
+        DB_PASSWORD_RESET_WITHOUT_ROLLBACK=1
+      fi
+    fi
     agent_gsql "$index" <"$sql" || return 1
+    reset=0
   done
 }
 
+agent_validate_hba_markers() { # <pg_hba.conf>；拒绝残缺、嵌套或重复受管块
+  awk '
+    BEGIN { inside=0; begin_count=0; end_count=0; bad=0 }
+    $0 == "# dbdog-release BEGIN: local Agent monitor" {
+      begin_count++
+      if (inside) bad=1
+      inside=1
+      next
+    }
+    $0 == "# dbdog-release END: local Agent monitor" {
+      end_count++
+      if (!inside) bad=1
+      inside=0
+      next
+    }
+    END {
+      if (inside || begin_count != end_count || begin_count > 1) bad=1
+      exit bad
+    }
+  ' "$1"
+}
+
 agent_install_hba_rule() { # <进程索引>
-  local index="$1" data hba backup temp reload
+  local index="$1" data hba backup applied temp reload legacy_trust unsafe_trust
   data="${AGENT_GAUSS_PID_DATA_DIRS[$index]}"
   hba="$(agent_gsql "$index" -c 'SHOW hba_file;' 2>/dev/null \
     | awk 'NF { value=$0 } END { print value }' || true)"
@@ -335,7 +663,26 @@ agent_install_hba_rule() { # <进程索引>
   case "$hba" in /*) ;; *) [ -n "$data" ] && hba="$data/$hba" ;; esac
   hba="$(readlink -f "$hba" 2>/dev/null || true)"
   [ -f "$hba" ] || die "GaussDB HBA 不是普通文件: $hba"
+  agent_validate_hba_markers "$hba" || \
+    die "GaussDB HBA 的 dbdog-release BEGIN/END 标记残缺、嵌套或重复；拒绝改写: $hba"
+  read -r legacy_trust unsafe_trust < <(awk '
+    /^[[:space:]]*#/ { next }
+    {
+      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
+      gsub(/^"|"$/, "", user)
+      if (kind ~ /^host/ && user == "dbdog" && method == "trust") {
+        if (kind == "host" && database == "all" && address == "127.0.0.1/32") legacy++
+        else unsafe++
+      }
+    }
+    END { print legacy + 0, unsafe + 0 }
+  ' "$hba")
+  [ "$unsafe_trust" -eq 0 ] || \
+    die "GaussDB HBA 含非受管的 dbdog trust 规则；拒绝在不明确其作用域时继续: $hba"
+  [ "$legacy_trust" -eq 0 ] || \
+    warn "发现旧安装遗留的本机 dbdog trust HBA，将在同一事务中替换为受管 md5"
   backup="$WORK_DIR/pg_hba.$index.before"
+  applied="$WORK_DIR/pg_hba.$index.applied"
   cp -a -- "$hba" "$backup"
   temp="$(mktemp "$(dirname "$hba")/.dbdog-pg-hba.XXXXXX")"
   if ! awk '
@@ -347,6 +694,12 @@ agent_install_hba_rule() { # <进程索引>
     }
     $0 == "# dbdog-release BEGIN: local Agent monitor" { skip=1; next }
     $0 == "# dbdog-release END: local Agent monitor" { skip=0; next }
+    {
+      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
+      gsub(/^"|"$/, "", user)
+      if (kind == "host" && database == "all" && user == "dbdog" \
+          && address == "127.0.0.1/32" && method == "trust") next
+    }
     !skip { print }
   ' "$hba" >"$temp"; then
     rm -f -- "$temp"
@@ -354,15 +707,48 @@ agent_install_hba_rule() { # <进程索引>
   fi
   chown --reference="$hba" "$temp"
   chmod --reference="$hba" "$temp"
+  if cmp -s "$hba" "$temp"; then
+    rm -f -- "$temp"
+    return 0
+  fi
+  cp -a -- "$temp" "$applied"
   mv -- "$temp" "$hba"
+  DB_HBA_PATHS[index]="$hba"
+  DB_HBA_BACKUPS[index]="$backup"
+  DB_HBA_APPLIED[index]="$applied"
   command -v restorecon >/dev/null 2>&1 && restorecon "$hba" >/dev/null 2>&1 || true
   reload="$(agent_gsql "$index" -c 'SELECT pg_reload_conf();' 2>/dev/null \
     | awk 'NF { value=$0 } END { print value }' || true)"
   if [ "$reload" != t ] && [ "$reload" != true ] && [ "$reload" != 1 ]; then
     cp -a -- "$backup" "$hba"
     agent_gsql "$index" -c 'SELECT pg_reload_conf();' >/dev/null 2>&1 || true
+    DB_HBA_PATHS[index]=""
     die "GaussDB HBA reload 失败，已恢复原文件"
   fi
+}
+
+agent_restore_hba_rules() {
+  local index path backup applied reload failed=0
+  # 使用真实数组下标而不是 length-1，避免实例 0 无改动、实例 1 有改动时漏回滚。
+  for index in "${!DB_HBA_PATHS[@]}"; do
+    path="${DB_HBA_PATHS[$index]:-}"
+    [ -n "$path" ] || continue
+    backup="${DB_HBA_BACKUPS[$index]}"
+    applied="${DB_HBA_APPLIED[$index]}"
+    if ! cmp -s "$path" "$applied"; then
+      warn "GaussDB HBA 在安装期间被其他操作修改，拒绝覆盖: $path"
+      failed=1
+      continue
+    fi
+    cp -a -- "$backup" "$path" || { failed=1; continue; }
+    command -v restorecon >/dev/null 2>&1 && restorecon "$path" >/dev/null 2>&1 || true
+    reload="$(agent_gsql "$index" -c 'SELECT pg_reload_conf();' 2>/dev/null \
+      | awk 'NF { value=$0 } END { print value }' || true)"
+    case "$reload" in t | true | 1) DB_HBA_PATHS[index]="" ;;
+      *) warn "恢复 HBA 后 reload 失败: $path"; failed=1 ;;
+    esac
+  done
+  [ "$failed" -eq 0 ]
 }
 
 bootstrap_gaussdb_monitoring() {
@@ -371,15 +757,13 @@ bootstrap_gaussdb_monitoring() {
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
   log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与兼容视图（仅安装阶段）..."
-  if [ -n "$PREVIOUS_DB_PASSWORD" ] && \
-    [ "$PREVIOUS_DB_PASSWORD" != "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ]; then
-    DB_PASSWORD_CHANGED=1
-  fi
+  # 先落受管 MD5 规则，才能用将交付给 integration 的凭证做真实登录探测；
+  # 后续任一步失败，EXIT trap 会用内容比对后的备份恢复 HBA。
+  for ((index=0; index<count; index++)); do agent_install_hba_rule "$index"; done
   agent_set_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
     die "无法通过目标 GaussDB 的本地管理连接准备监控用户"
   for ((index=0; index<count; index++)); do
-    agent_gsql "$index" <"$sql" || die "创建 GaussDB 兼容视图失败（实例索引 $index）"
-    agent_install_hba_rule "$index"
+    agent_gsql "$index" <"$sql" || die "创建 GaussDB 兼容视图失败（实例索引 ${index}）"
   done
 }
 
@@ -556,7 +940,10 @@ wait_socket() { # <path> <seconds>
 }
 
 start_and_verify() {
-  local unit health_out="$WORK_DIR/agent-health.out" check_out="$AGENT_LOG_DIR/install-gaussdb-check.log"
+  local unit health_out="$AGENT_LOG_DIR/install-agent-health.log"
+  local config_out="$AGENT_LOG_DIR/install-configcheck.log"
+  local config_attempt="$WORK_DIR/configcheck-attempt.out"
+  local check_out="$AGENT_LOG_DIR/install-gaussdb-check.log"
   systemctl start dbdog-agent-sysprobe.service
   wait_active dbdog-agent-sysprobe.service 60 || die "system-probe 未能启动"
   wait_socket "$AGENT_RUN_DIR/sysprobe.sock" 90 || die "system-probe socket 未就绪"
@@ -566,27 +953,52 @@ start_and_verify() {
   wait_active dbdog-agent-trace.service 90 || die "trace-agent 未能启动"
   wait_active dbdog-agent-process.service 90 || die "process-agent 未能启动"
 
-  timeout 30 "$AGENT_RUNTIME_DIR/bin/agent/agent" configcheck \
-    -c "$AGENT_CONFIG_DIR" >"$WORK_DIR/configcheck.out" 2>&1 || \
-    die "Agent 配置校验失败（不会保留本次切换）"
-
   local ready=0 i
-  for ((i=1; i<=30; i++)); do
-    if timeout 10 "$AGENT_RUNTIME_DIR/bin/agent/agent" health \
+  # configcheck 通过 Core command API 取配置，不是离线 YAML parser。即使 systemd
+  # 已 active，API 仍可能短暂未监听，所以直接保留有限重试与完整诊断。
+  : >"$config_out"
+  chmod 0600 "$config_out"
+  for ((i=1; i<=8; i++)); do
+    : >"$config_attempt"
+    if timeout 8 "$AGENT_RUNTIME_DIR/bin/agent/agent" configcheck \
+      -c "$AGENT_CONFIG_DIR" >"$config_attempt" 2>&1; then
+      printf '\n===== configcheck attempt %s: success =====\n' "$i" >>"$config_out"
+      cat "$config_attempt" >>"$config_out"
+      ready=1
+      break
+    fi
+    printf '\n===== configcheck attempt %s: failed =====\n' "$i" >>"$config_out"
+    cat "$config_attempt" >>"$config_out"
+    systemctl is-active --quiet dbdog-agent.service || break
+    sleep 2
+  done
+  if [ "$ready" -ne 1 ]; then
+    systemctl status dbdog-agent.service --no-pager >>"$config_out" 2>&1 || true
+    die "Agent 配置校验失败；详情留在 ${config_out}，本次安装会回滚"
+  fi
+
+  ready=0
+  : >"$health_out"
+  chmod 0600 "$health_out"
+  for ((i=1; i<=10; i++)); do
+    if timeout 5 "$AGENT_RUNTIME_DIR/bin/agent/agent" health \
       -c "$AGENT_CONFIG_DIR" >"$health_out" 2>&1 && \
       grep -Eq '^=== [1-9][0-9]* healthy components ===$' "$health_out"; then
       ready=1
       break
     fi
-    sleep 2
+    sleep 1
   done
-  [ "$ready" -eq 1 ] || die "Agent forwarder health 未在 60 秒内就绪"
+  if [ "$ready" -ne 1 ]; then
+    systemctl status dbdog-agent.service --no-pager >>"$health_out" 2>&1 || true
+    die "Agent forwarder health 未在 60 秒内就绪；详情留在 ${health_out}"
+  fi
 
   : >"$check_out"
   chmod 0600 "$check_out"
   timeout 180 "$AGENT_RUNTIME_DIR/bin/agent/agent" check gaussdb \
     -c "$AGENT_CONFIG_DIR" >"$check_out" 2>&1 || \
-    die "GaussDB check 未通过；详情留在 $check_out，本次安装会回滚"
+    die "GaussDB check 未通过；详情留在 ${check_out}，本次安装会回滚"
   for unit in "${AGENT_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" || die "验收时服务已退出: $unit"
   done
@@ -620,9 +1032,10 @@ main() {
   log "发现 GaussDB 端口: ${AGENT_GAUSS_PORTS[*]}"
   log "发现 GaussDB 日志: ${AGENT_GAUSS_LOG_GLOBS[*]}"
   fetch_server_bootstrap
-  bootstrap_gaussdb_monitoring
+  preflight_gaussdb_clients
   render_install_state
   cutover
+  bootstrap_gaussdb_monitoring
   start_and_verify
 
   INSTALL_SUCCEEDED=1

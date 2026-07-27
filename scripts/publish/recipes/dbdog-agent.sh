@@ -2,7 +2,7 @@
 # 配方：固定输入的 Kylin V10 AArch64 dbdog-agent Omnibus 运行时。
 # 输入 env（由 publish.sh 提供）：MODULE VERSION SHA CORE_SHA ARCH。
 #
-# 本配方消费已经持久化并校验过的 v7 manifest、v10 control overlay、固定
+# 本配方消费已经持久化并校验过的 v7 manifest、v11 control overlay、固定
 # patchelf 工具和 post-build dependency seal；不会重新解析版本或另建一次性
 # 依赖目录。当前 seal
 # 明确是 partial closure，不等于“任意新机器离线一键重放”。新构建机必须先迁移
@@ -44,22 +44,30 @@ done
 readonly MODULE VERSION SHA CORE_SHA ARCH
 
 readonly PINNED_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
-readonly PINNED_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
+readonly PINNED_OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
+readonly PINNED_INTEGRATION_CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
-readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build1
+readonly CORE_REPO="$CACHE_ROOT/git/dbdog-agent-core.git"
+readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
 readonly INSTALL_DIR=/opt/dbdog-agent
-readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build1/out
-readonly MANIFEST_REL="manifests/$PINNED_AGENT_SHA-$PINNED_CORE_SHA-aarch64-kylin10-v7"
+readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2/out
+readonly MANIFEST_REL="manifests/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7"
 readonly MANIFEST_DIR="$CACHE_ROOT/$MANIFEST_REL"
 readonly INPUTS_MANIFEST_SHA256=e050cda2067907527b5ff4d3991320d75a2cc8b1f68e078531c1b5fae502ef79
 readonly RUBY_CACHE_MANIFEST_SHA256=29539b716e760e178b3a11ce07256e39438dbb5f1008898590ce355eda823c45
-readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
+readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v11"
 readonly OVERLAY_DIR="$CACHE_ROOT/$OVERLAY_REL"
 readonly RUNNER="$OVERLAY_DIR/run-agent-omnibus.sh"
-readonly RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
+readonly RUNNER_SHA256=b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184
 readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly CONTROL_INFO_SHA256=6f9cbfd956792d68c2b512159d6cdb19df07a5d0433e682e06e6bf7e3c95264a
-readonly CONTROL_MANIFEST_SHA256=f1cefa64ce393e7025c1b8822899e3ea856a000bba5372ad1ffd0b910886e7ac
+readonly CONTROL_INFO_SHA256=3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647
+readonly CONTROL_MANIFEST_SHA256=5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81
+# dependency seal 是在 v10 构建依赖闭包上生成的；v11 只增加显式版本输入，
+# 不重写也不冒充旧 seal 的控制元数据。
+readonly SEAL_OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
+readonly SEAL_RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
+readonly SEAL_CONTROL_INFO_SHA256=6f9cbfd956792d68c2b512159d6cdb19df07a5d0433e682e06e6bf7e3c95264a
+readonly SEAL_CONTROL_MANIFEST_SHA256=f1cefa64ce393e7025c1b8822899e3ea856a000bba5372ad1ffd0b910886e7ac
 readonly PATCHELF_TOOL_REL=tools/patchelf/0.18.0-aarch64-kylin10-v2
 readonly PATCHELF_REL="$PATCHELF_TOOL_REL/bin/patchelf"
 readonly PATCHELF_TOOL_DIR="$CACHE_ROOT/$PATCHELF_TOOL_REL"
@@ -72,14 +80,19 @@ readonly PATCHELF_SUMS_SHA256=4d49826b6fcfdd770c1c5e36182d4f5dc103e333a420a71e8d
 readonly SEAL_DIR="$CACHE_ROOT/seals/${MANIFEST_REL##*/}/omnibus-cache-v2"
 # Documentation pointer for the tracked sealer; the published seal verifies
 # itself through its own metadata and does not claim this as provenance.
-# These hashes are frozen from the exact audited v10 controls.  The explicit
+# These hashes are frozen from the exact audited build controls.  The explicit
 # gate below keeps future edits fail-closed if a maintainer resets one to the
 # all-zero placeholder while preparing a new control generation.
 readonly TRACKED_SEAL_CONTROL_SHA256=ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3
 readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
-readonly FINALIZER_SHA256=237f20579fbb1e9155183211d07cc5b6bbf45908d912021b21a87a17d7c9f79d
+readonly FINALIZER_SHA256=5f0e666753426540c5767e96eeadd8b83c51db461fbb73dfa1c00867e4d2e400
 readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"
-readonly FINALIZER_WRAPPER_SHA256=b9f660d25db9c349f0affceb48c0274b23630e5c15174dd223b46bbe76ab8704
+readonly FINALIZER_WRAPPER_SHA256=2a59314b66e295e00bb13c7409b445f7c795c74f7d4eccab8bae3811424f58df
+readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
+readonly GAUSSDB_INTEGRATION_VERSION=1.0.0
+readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
+readonly GAUSSDB_WHEEL="$CACHE_ROOT/$GAUSSDB_WHEEL_REL"
+readonly GAUSSDB_WHEEL_SHA256=06fd5eea7acd51a0ebf519be58a2700f1ca4142a13b0668cb7f5e66ef022f7f6
 readonly BUILDER_IDENTITY=kylin-v10-tercel-native-aarch64-v7
 readonly ARCHIVE_RECIPE=gnu_tar_sorted_fixed_mtime_root_owner_gzip_n_two_pass_delete_second_before_extract
 
@@ -88,7 +101,7 @@ for frozen_sha_name in \
   TRACKED_SEAL_CONTROL_SHA256 FINALIZER_SHA256 FINALIZER_WRAPPER_SHA256; do
   frozen_sha=${!frozen_sha_name}
   [[ $frozen_sha =~ ^[0-9a-f]{64}$ && $frozen_sha != "$UNFROZEN_SHA256" ]] || \
-    die "$frozen_sha_name 尚未冻结为 v10 控制文件的真实 SHA-256"
+    die "$frozen_sha_name 尚未冻结为 v11 控制文件的真实 SHA-256"
 done
 unset frozen_sha_name frozen_sha
 
@@ -99,11 +112,11 @@ unset frozen_sha_name frozen_sha
 [[ $CORE_SHA =~ ^[0-9a-f]{40}$ ]] || die 'CORE_SHA 必须是完整的小写 40 位提交 SHA'
 [[ $SHA == "$PINNED_AGENT_SHA" ]] || \
   die "SHA 不属于当前 v7 seal；需为新提交生成新的 manifest/overlay/seal/配方"
-[[ $CORE_SHA == "$PINNED_CORE_SHA" ]] || \
-  die "CORE_SHA 不属于当前 v7 seal；需为新提交生成新的 manifest/overlay/seal/配方"
+[[ $CORE_SHA == "$PINNED_INTEGRATION_CORE_SHA" ]] || \
+  die "CORE_SHA 必须是固定的 GaussDB integration 源提交 $PINNED_INTEGRATION_CORE_SHA"
 [[ $ARCH == aarch64 ]] || die "ARCH 必须是 aarch64，实际为 $ARCH"
 
-for required_tool in awk bash chmod cmp cp find grep id mktemp readlink rm rmdir sha256sum sort stat tar uname; do
+for required_tool in awk bash chmod cmp cp find git grep id mktemp python3 readlink rm rmdir sha256sum sort stat tar uname; do
   command -v "$required_tool" >/dev/null 2>&1 || die "构建机缺少工具: $required_tool"
 done
 [[ $(id -un) == dbdog ]] || die 'Omnibus 配方必须由 dbdog 构建用户运行'
@@ -148,6 +161,13 @@ require_exact_field() {
   [[ $actual == "$expected" ]] || die "$file 的 $key 不匹配（实际 $actual）"
 }
 
+read_exact_field() {
+  local file=$1 key=$2 count
+  count=$(awk -F= -v key="$key" '$1 == key { count++ } END { print count + 0 }' "$file")
+  [[ $count == 1 ]] || die "$file 必须且只能包含一个 $key"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print }' "$file"
+}
+
 verify_persistent_controls() {
   local overlay_inventory expected_inventory
 
@@ -161,22 +181,22 @@ verify_persistent_controls() {
   (cd "$CACHE_ROOT" && sha256sum -c "$MANIFEST_REL/RUBY-BUNDLE-CACHE.sha256" >/dev/null) || \
     die 'v7 Ruby 持久化缓存校验失败'
 
-  require_root_readonly_dir 'v10 control overlay' "$OVERLAY_DIR"
+  require_root_readonly_dir 'v11 control overlay' "$OVERLAY_DIR"
   expected_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
   overlay_inventory=$(find "$OVERLAY_DIR" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v10 control overlay 文件集合不匹配'
+  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v11 control overlay 文件集合不匹配'
   printf '%s  %s\n' "$CONTROL_MANIFEST_SHA256" "$OVERLAY_DIR/CONTROL.sha256" | \
-    sha256sum -c - >/dev/null || die 'v10 CONTROL.sha256 自身不匹配'
+    sha256sum -c - >/dev/null || die 'v11 CONTROL.sha256 自身不匹配'
   cmp -s -- "$OVERLAY_DIR/CONTROL.sha256" <(
     printf '%s  %s\n' \
       "$RUNNER_SHA256" "$OVERLAY_REL/run-agent-omnibus.sh" \
       "$PLATFORM_PATCH_SHA256" "$OVERLAY_REL/agent-build-kylin-platform.patch" \
       "$CONTROL_INFO_SHA256" "$OVERLAY_REL/CONTROL-INFO" \
       "$PATCHELF_SHA256" "$PATCHELF_REL"
-  ) || die 'v10 CONTROL.sha256 必须精确包含固定顺序的四行清单'
+  ) || die 'v11 CONTROL.sha256 必须精确包含固定顺序的四行清单'
   (cd "$CACHE_ROOT" && sha256sum -c "$OVERLAY_REL/CONTROL.sha256" >/dev/null) || \
-    die 'v10 control overlay 或固定 patchelf 内容校验失败'
-  require_root_control 'v10 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
+    die 'v11 control overlay 或固定 patchelf 内容校验失败'
+  require_root_control 'v11 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
 }
 
 verify_patchelf_tool() (
@@ -284,13 +304,13 @@ verify_dependency_seal_metadata() {
   require_exact_field "$SEAL_DIR/SEAL-INFO" seal_format omnibus-cache-v2
   require_exact_field "$SEAL_DIR/SEAL-INFO" build_id "${MANIFEST_REL##*/}"
   require_exact_field "$SEAL_DIR/SEAL-INFO" manifest_rel "$MANIFEST_REL"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" control_overlay_rel "$OVERLAY_REL"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" control_overlay_runner_sha256 "$RUNNER_SHA256"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" control_overlay_rel "$SEAL_OVERLAY_REL"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" control_overlay_runner_sha256 "$SEAL_RUNNER_SHA256"
   require_exact_field "$SEAL_DIR/SEAL-INFO" platform_patch_sha256 "$PLATFORM_PATCH_SHA256"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" control_info_sha256 "$CONTROL_INFO_SHA256"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" control_manifest_sha256 "$CONTROL_MANIFEST_SHA256"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" control_info_sha256 "$SEAL_CONTROL_INFO_SHA256"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" control_manifest_sha256 "$SEAL_CONTROL_MANIFEST_SHA256"
   require_exact_field "$SEAL_DIR/SEAL-INFO" dbdog_agent_commit "$PINNED_AGENT_SHA"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" integrations_core_commit "$PINNED_CORE_SHA"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" integrations_core_commit "$PINNED_OMNIBUS_CORE_SHA"
   require_exact_field "$SEAL_DIR/SEAL-INFO" patchelf_version "$PATCHELF_VERSION"
   require_exact_field "$SEAL_DIR/SEAL-INFO" patchelf_rel "$PATCHELF_REL"
   require_exact_field "$SEAL_DIR/SEAL-INFO" patchelf_sha256 "$PATCHELF_SHA256"
@@ -315,7 +335,7 @@ write_expected_omnibus_marker() {
   printf '%s\n' \
     "manifest_rel=$MANIFEST_REL" \
     "agent_sha=$PINNED_AGENT_SHA" \
-    "core_sha=$PINNED_CORE_SHA" \
+    "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
     'omnibus_ruby_sha=5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749' \
     "control_overlay_rel=$OVERLAY_REL" \
     "control_overlay_runner_sha256=$RUNNER_SHA256" \
@@ -334,7 +354,7 @@ verify_live_omnibus_handoff() {
   write_expected_omnibus_marker "$expected"
   if ! cmp -s -- "$expected" "$BUILD_DIR/omnibus.success"; then
     rm -f -- "$expected"
-    die 'omnibus.success 与固定 v7/v10 handoff 不匹配'
+    die 'omnibus.success 与固定 v7/v11 handoff 不匹配'
   fi
   rm -f -- "$expected"
 }
@@ -346,7 +366,11 @@ require_archive_member() {
 }
 
 verify_canonical_artifact() (
-  local artifact=$1 sidecar=$2 artifact_name member duplicate actual_sha work list build_info marker expected_marker
+  local artifact=$1 sidecar=$2 artifact_name member duplicate actual_sha work list
+  local build_info marker expected_marker gaussdb_info agent_version_info manifest_text manifest_json
+  local agent_version_output agent_binary_sha version_output_sha manifest_text_sha manifest_json_sha
+  local actual_agent_binary_sha actual_version_output_sha actual_manifest_text_sha actual_manifest_json_sha
+  local manifest_header_version manifest_component_version manifest_json_version
   artifact_name=${artifact##*/}
   [[ -f $artifact && ! -L $artifact ]] || die "canonical 产物不是实际文件: $artifact"
   [[ -f $sidecar && ! -L $sidecar ]] || die "canonical 产物缺少实际 sidecar: $sidecar"
@@ -387,19 +411,33 @@ verify_canonical_artifact() (
   require_archive_member "$list" './provenance/runtime.sha256'
   require_archive_member "$list" './provenance/glibc-requirements.tsv'
   require_archive_member "$list" './provenance/agent-data-plane.txt'
+  require_archive_member "$list" './provenance/agent-version.txt'
   require_archive_member "$list" './provenance/gaussdb.txt'
+  require_archive_member "$list" './bin/agent/agent'
+  require_archive_member "$list" './version-manifest.txt'
+  require_archive_member "$list" './version-manifest.json'
 
   build_info=$work/build.txt
   marker=$work/omnibus.success
+  gaussdb_info=$work/gaussdb.txt
+  agent_version_info=$work/agent-version.txt
+  manifest_text=$work/version-manifest.txt
+  manifest_json=$work/version-manifest.json
   tar -xOzf "$artifact" ./provenance/build.txt >"$build_info" || die '无法读取产物 build provenance'
   tar -xOzf "$artifact" ./provenance/omnibus.success >"$marker" || die '无法读取产物 Omnibus provenance'
+  tar -xOzf "$artifact" ./provenance/gaussdb.txt >"$gaussdb_info" || die '无法读取 GaussDB integration provenance'
+  tar -xOzf "$artifact" ./provenance/agent-version.txt >"$agent_version_info" || die '无法读取 Agent version provenance'
+  tar -xOzf "$artifact" ./version-manifest.txt >"$manifest_text" || die '无法读取 Omnibus version-manifest.txt'
+  tar -xOzf "$artifact" ./version-manifest.json >"$manifest_json" || die '无法读取 Omnibus version-manifest.json'
   require_exact_field "$build_info" format_version 1
   require_exact_field "$build_info" product dbdog-agent
   require_exact_field "$build_info" version "$VERSION"
+  require_exact_field "$build_info" compiled_agent_version "$VERSION"
   require_exact_field "$build_info" architecture aarch64
   require_exact_field "$build_info" install_prefix "$INSTALL_DIR"
   require_exact_field "$build_info" agent_git_sha "$PINNED_AGENT_SHA"
-  require_exact_field "$build_info" integrations_core_git_sha "$PINNED_CORE_SHA"
+  require_exact_field "$build_info" omnibus_integrations_core_git_sha "$PINNED_OMNIBUS_CORE_SHA"
+  require_exact_field "$build_info" integrations_core_git_sha "$PINNED_INTEGRATION_CORE_SHA"
   require_exact_field "$build_info" manifest_rel "$MANIFEST_REL"
   require_exact_field "$build_info" control_overlay_rel "$OVERLAY_REL"
   require_exact_field "$build_info" control_overlay_runner_sha256 "$RUNNER_SHA256"
@@ -412,11 +450,96 @@ verify_canonical_artifact() (
   require_exact_field "$build_info" patchelf_info_sha256 "$PATCHELF_INFO_SHA256"
   require_exact_field "$build_info" patchelf_sums_sha256 "$PATCHELF_SUMS_SHA256"
   require_exact_field "$build_info" host_distribution rhel
+  require_exact_field "$build_info" integration_name "$GAUSSDB_INTEGRATION_NAME"
+  require_exact_field "$build_info" integration_version "$GAUSSDB_INTEGRATION_VERSION"
+  require_exact_field "$build_info" integration_wheel_rel "$GAUSSDB_WHEEL_REL"
+  require_exact_field "$build_info" integration_wheel_sha256 "$GAUSSDB_WHEEL_SHA256"
   require_exact_field "$build_info" builder_image_digest none
   require_exact_field "$build_info" builder_identity "$BUILDER_IDENTITY"
   require_exact_field "$build_info" finalizer_sha256 "$FINALIZER_SHA256"
   require_exact_field "$build_info" glibc_maximum 2.28
   require_exact_field "$build_info" archive_recipe "$ARCHIVE_RECIPE"
+
+  require_exact_field "$gaussdb_info" integration_name "$GAUSSDB_INTEGRATION_NAME"
+  require_exact_field "$gaussdb_info" integration_version "$GAUSSDB_INTEGRATION_VERSION"
+  require_exact_field "$gaussdb_info" integration_source_git_sha "$PINNED_INTEGRATION_CORE_SHA"
+  require_exact_field "$gaussdb_info" wheel_rel "$GAUSSDB_WHEEL_REL"
+  require_exact_field "$gaussdb_info" wheel_sha256 "$GAUSSDB_WHEEL_SHA256"
+  require_exact_field "$gaussdb_info" module_path \
+    ./embedded/lib/python3.13/site-packages/datadog_checks/gaussdb/__init__.py
+  require_exact_field "$gaussdb_info" distribution_path \
+    ./embedded/lib/python3.13/site-packages/datadog_gaussdb-1.0.0.dist-info
+  require_exact_field "$gaussdb_info" import_version "$GAUSSDB_INTEGRATION_VERSION"
+  require_exact_field "$gaussdb_info" distribution_version "$GAUSSDB_INTEGRATION_VERSION"
+
+  require_exact_field "$agent_version_info" compiled_version "$VERSION"
+  require_exact_field "$agent_version_info" manifest_header_version "$VERSION"
+  require_exact_field "$agent_version_info" manifest_component_version "$VERSION"
+  require_exact_field "$agent_version_info" manifest_json_version "$VERSION"
+  require_exact_field "$agent_version_info" binary_path ./bin/agent/agent
+  require_exact_field "$agent_version_info" version_manifest_text_path ./version-manifest.txt
+  require_exact_field "$agent_version_info" version_manifest_json_path ./version-manifest.json
+  agent_version_output=$(read_exact_field "$agent_version_info" version_output)
+  case "$agent_version_output" in
+    "Agent $VERSION - Meta: "*) ;;
+    *) die "产物 Agent version 输出没有绑定外层 VERSION: $agent_version_output" ;;
+  esac
+  agent_binary_sha=$(read_exact_field "$agent_version_info" binary_sha256)
+  version_output_sha=$(read_exact_field "$agent_version_info" version_output_sha256)
+  manifest_text_sha=$(read_exact_field "$agent_version_info" version_manifest_text_sha256)
+  manifest_json_sha=$(read_exact_field "$agent_version_info" version_manifest_json_sha256)
+  for actual_sha in "$agent_binary_sha" "$version_output_sha" "$manifest_text_sha" "$manifest_json_sha"; do
+    [[ $actual_sha =~ ^[0-9a-f]{64}$ ]] || die "Agent version provenance 含无效 SHA-256: $actual_sha"
+  done
+  actual_agent_binary_sha=$(tar -xOzf "$artifact" ./bin/agent/agent | sha256sum | awk '{ print $1 }')
+  actual_version_output_sha=$(printf '%s\n' "$agent_version_output" | sha256sum | awk '{ print $1 }')
+  actual_manifest_text_sha=$(sha256sum -- "$manifest_text" | awk '{ print $1 }')
+  actual_manifest_json_sha=$(sha256sum -- "$manifest_json" | awk '{ print $1 }')
+  [[ $actual_agent_binary_sha == "$agent_binary_sha" ]] || die 'Agent binary SHA-256 与 version provenance 不一致'
+  [[ $actual_version_output_sha == "$version_output_sha" ]] || die 'Agent version 输出 SHA-256 与 provenance 不一致'
+  [[ $actual_manifest_text_sha == "$manifest_text_sha" ]] || die 'version-manifest.txt SHA-256 与 provenance 不一致'
+  [[ $actual_manifest_json_sha == "$manifest_json_sha" ]] || die 'version-manifest.json SHA-256 与 provenance 不一致'
+  require_exact_field "$build_info" agent_binary_sha256 "$agent_binary_sha"
+  require_exact_field "$build_info" agent_version_output_sha256 "$version_output_sha"
+  require_exact_field "$build_info" agent_version_manifest_text_sha256 "$manifest_text_sha"
+  require_exact_field "$build_info" agent_version_manifest_json_sha256 "$manifest_json_sha"
+  manifest_header_version=$(
+    awk 'NR == 1 && NF == 2 && $1 == "agent" { print $2; found++ }
+      END { exit(found == 1 ? 0 : 1) }' "$manifest_text"
+  ) || die 'version-manifest.txt 缺少唯一 Agent header'
+  manifest_component_version=$(
+    awk '$1 == "datadog-agent" { if (NF < 2) exit 2; value=$2; found++ }
+      END { if (found == 1) print value; else exit 1 }' "$manifest_text"
+  ) || die 'version-manifest.txt 缺少唯一 datadog-agent component'
+  [[ $manifest_header_version == "$VERSION" && $manifest_component_version == "$VERSION" ]] ||
+    die "version-manifest.txt 未绑定外层 VERSION $VERSION"
+  manifest_json_version=$(
+    /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+      /usr/bin/python3 - "$manifest_json" <<'PYEOF'
+import json
+import sys
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    document = json.load(stream, object_pairs_hook=unique_object)
+value = document.get("build_version") if type(document) is dict else None
+if not isinstance(value, str):
+    raise SystemExit("version-manifest.json lacks a string build_version")
+print(value)
+PYEOF
+  ) || die '无法从 version-manifest.json 唯一读取 build_version'
+  [[ $manifest_json_version == "$VERSION" ]] ||
+    die "version-manifest.json build_version 未绑定外层 VERSION $VERSION"
+
   expected_marker=$work/expected-omnibus.success
   write_expected_omnibus_marker "$expected_marker"
   cmp -s -- "$expected_marker" "$marker" || die '产物内 Omnibus provenance 与固定 handoff 不匹配'
@@ -426,6 +549,13 @@ verify_persistent_controls
 verify_patchelf_tool
 verify_dependency_seal
 verify_dependency_seal_metadata
+require_root_control \
+  "pinned $GAUSSDB_INTEGRATION_NAME wheel" "$GAUSSDB_WHEEL" 444 "$GAUSSDB_WHEEL_SHA256"
+[[ -d $CORE_REPO && ! -L $CORE_REPO && $(readlink -e -- "$CORE_REPO") == "$CORE_REPO" ]] ||
+  die "GaussDB integration core mirror 不是 canonical 实际目录: $CORE_REPO"
+/usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/git -C "$CORE_REPO" cat-file -e "$PINNED_INTEGRATION_CORE_SHA^{commit}" ||
+  die "GaussDB integration core mirror 缺少固定提交 $PINNED_INTEGRATION_CORE_SHA"
 
 [[ -d $BUILD_DIR && ! -L $BUILD_DIR ]] || die "缺少固定 build attempt: $BUILD_DIR"
 [[ $(readlink -e -- "$BUILD_DIR") == "$BUILD_DIR" ]] || die '固定 build attempt 路径发生解析'
@@ -451,13 +581,13 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
         -e $BUILD_DIR/src/omnibus/pkg/post-health-resume.json || -L $BUILD_DIR/src/omnibus/pkg/post-health-resume.json || \
         -e $INSTALL_DIR/.debug || -L $INSTALL_DIR/.debug ]]; then
     runner_mode=(--adopt-post-health-v2)
-    log '未发现成功 handoff，但发现 post-health v2 完成态；调用固定 v10 adoption 入口'
+    log '未发现成功 handoff，但发现 post-health v2 完成态；调用固定 v11 adoption 入口'
   elif [[ -e $BUILD_DIR/omnibus-v9-retry6.log && -d /opt/.dbdog-agent-prestrip-post-health-v2-20260727 ]] && \
        find "$INSTALL_DIR" -mindepth 1 -print -quit | grep -q .; then
     runner_mode=(--resume-v9-retry6-post-health)
-    log '未发现成功 handoff；调用固定 v10 retry6 post-health resume 入口'
+    log '未发现成功 handoff；调用固定 v11 retry6 post-health resume 入口'
   else
-    log '未发现成功 handoff；调用固定 v10 fresh runner（依赖和 patchelf 从已验证的持久 cache 复用）'
+    log '未发现成功 handoff；调用固定 v11 fresh runner（依赖和 patchelf 从已验证的持久 cache 复用）'
   fi
   /usr/bin/env -i \
     HOME=/home/dbdog \
@@ -467,7 +597,8 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
     PATH=/usr/local/bin:/usr/bin:/bin \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    "$RUNNER" "${runner_mode[@]}" "$BUILD_DIR" >&2 || die '固定 v10 Omnibus runner 失败'
+    DBDOG_PACKAGE_VERSION="$VERSION" \
+    "$RUNNER" "${runner_mode[@]}" "$BUILD_DIR" >&2 || die '固定 v11 Omnibus runner 失败'
   runner_executed=1
 fi
 verify_live_omnibus_handoff

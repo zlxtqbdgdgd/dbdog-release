@@ -408,20 +408,28 @@ for requested in "$@"; do
 done
 
 ensure_layout
-oauth_requested=0
+stack_config_requested=0
+oauth_url_migration_requested=0
 if [ "$#" -eq 0 ]; then
   # 无参升级也负责收口已知的旧模板配置；即使模块产物未变，配置漂移仍是一项升级。
-  oauth_requested=1
+  stack_config_requested=1
+  oauth_url_migration_requested=1
 else
   for requested in "$@"; do
     case "$requested" in
-      dbdog-web | dbdog-mcp) oauth_requested=1 ;;
+      dbdog-server) stack_config_requested=1 ;;
+      dbdog-web | dbdog-mcp)
+        stack_config_requested=1
+        oauth_url_migration_requested=1
+        ;;
     esac
   done
 fi
-if [ "$oauth_requested" -eq 1 ]; then
+if [ "$oauth_url_migration_requested" -eq 1 ]; then
   migrate_legacy_web_public_urls "$ETC_DIR/dbdog-web.env"
   migrate_legacy_mcp_public_urls "$ETC_DIR/dbdog-mcp.env"
+fi
+if [ "$stack_config_requested" -eq 1 ]; then
   # 已有完整应用栈时，升级与首次安装共用同一套默认配置校准：缺失/空值/占位
   # 自动补齐，真实自定义地址和凭证保持不变。
   if [ -f "$ETC_DIR/dbdog-server.env" ] \
@@ -472,8 +480,12 @@ targets=("${ORDERED_UPGRADE_MODULES[@]}")
 # Web/MCP 升级在切包后执行 OAuth 专项验收；前面的配置校准只补默认值或迁移精确
 # 命中的旧模板，正常的内网域名、反代地址和任意自定义配置都不覆盖。
 oauth_upgrade=0
+# Web/MCP 显式升级也会执行全栈配置校准；若它顺带启用了 server RC，必须在
+# 自动重启 server 后做同一项专项验收，不能只看命令行 targets。
+remote_config_upgrade="$DBDOG_SERVER_CONFIG_CHANGED"
 for m in "${targets[@]}"; do
   case "$m" in
+    dbdog-server) remote_config_upgrade=1 ;;
     dbdog-web | dbdog-mcp) oauth_upgrade=1 ;;
   esac
 done
@@ -513,5 +525,9 @@ if [ "$mcp_was_running" -eq 1 ]; then
 fi
 if [ "$oauth_upgrade" -eq 1 ]; then
   "$SCRIPTS_DIR/verify.sh" --oauth
+fi
+if [ "$remote_config_upgrade" -eq 1 ] \
+  && "$DBDOGCTL" status dbdog-server | grep -q '运行中'; then
+  "$SCRIPTS_DIR/verify.sh" --remote-config
 fi
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"

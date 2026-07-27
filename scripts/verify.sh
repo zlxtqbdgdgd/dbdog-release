@@ -31,6 +31,7 @@ clear_probe_env() {
   unset PG_DSN DATABASE_URL CH_URL CH_DATABASE DBDOG_METRIC_URL DBDOG_PG_SCHEMA
   unset DBDOG_CH_ADDR DBDOG_CH_DATABASE DBDOG_CH_USERNAME CH_PASSWORD
   unset DBDOG_HTTP_ADDR DDSQL_ADDR PORT DBDOG_HTTP_PORT
+  unset DBDOG_RC_KEY_PATH
   unset DBDOG_INTERNAL_TOKEN DBDOG_OAUTH_JWT_SECRET DBDOG_SERVER_URL
   unset PUBLIC_APP_URL PUBLIC_INGEST_URL PUBLIC_MCP_URL
   unset DBDOG_BASE_URL DBDOG_OAUTH_ISSUER DBDOG_PUBLIC_MCP_URL DBDOG_APP_BASE_URL
@@ -227,6 +228,41 @@ probe_dbdog_server() (
   retry_http "http://127.0.0.1:$port/healthz"
 )
 
+probe_remote_config() (
+  clear_probe_env
+  load_env dbdog-server || return 1
+  local key_path="${DBDOG_RC_KEY_PATH:-}" addr="${DBDOG_HTTP_ADDR:-:8080}"
+  local internal_token="${DBDOG_INTERNAL_TOKEN:-}" port root node mode header_file
+  case "$key_path" in /*) ;; *) return 1 ;; esac
+  [ -f "$key_path" ] && [ ! -L "$key_path" ] || return 1
+  mode="$(stat -c '%a' "$key_path" 2>/dev/null || stat -f '%Lp' "$key_path" 2>/dev/null)" \
+    || return 1
+  [ "$mode" = 600 ] || return 1
+  valid_secret "$internal_token" || return 1
+  case "$internal_token" in *$'\n'* | *$'\r'*) return 1 ;; esac
+  header_file="$(mktemp "${TMPDIR:-/tmp}/dbdog-verify-rc-header.XXXXXX")" || return 1
+  trap 'rm -f -- "$header_file"' EXIT
+  printf 'Authorization: Bearer %s\n' "$internal_token" >"$header_file" || return 1
+  chmod 0600 "$header_file" || return 1
+  port="${addr##*:}"
+  root="$(retry_http "http://127.0.0.1:$port/api/v0.1/configuration-root" \
+    -H "@$header_file")" \
+    || return 1
+  node="$MODULES_DIR/node/current/bin/node"
+  [ -x "$node" ] || return 1
+  printf '%s' "$root" | "$node" --input-type=commonjs -e '
+    const fs = require("node:fs");
+    const root = JSON.parse(fs.readFileSync(0, "utf8"));
+    const signed = root?.signed;
+    const ok = signed?._type === "root"
+      && Number.isInteger(signed.version) && signed.version > 0
+      && signed.keys && typeof signed.keys === "object"
+      && signed.roles && typeof signed.roles === "object"
+      && Array.isArray(root.signatures) && root.signatures.length > 0;
+    if (!ok) process.exit(1);
+  '
+)
+
 probe_ddsql() (
   clear_probe_env
   load_env dbdog-server || return 1
@@ -353,6 +389,11 @@ oauth_main() {
   finish_checks "OAuth 自动认证链验收通过"
 }
 
+remote_config_main() {
+  check "server Remote Config seed 与 TUF root 可用" probe_remote_config
+  finish_checks "Remote Config 验收通过"
+}
+
 main() {
   case "${1:-}" in
     --oauth)
@@ -361,8 +402,14 @@ main() {
       oauth_main
       return
       ;;
+    --remote-config)
+      [ "$#" -eq 1 ] || die "用法: verify.sh [--oauth|--remote-config]"
+      ensure_layout
+      remote_config_main
+      return
+      ;;
     "") ;;
-    *) die "用法: verify.sh [--oauth]" ;;
+    *) die "用法: verify.sh [--oauth|--remote-config]" ;;
   esac
   ensure_layout
   echo "进程状态（仅供参考）："
@@ -385,6 +432,7 @@ main() {
   check "默认租户 PG 蓝图已推进且无错误" probe_tenant_pg_blueprint
   check "默认租户 ClickHouse 核心表已创建" probe_tenant_clickhouse_blueprint
   check "dbdog-server /healthz" probe_dbdog_server
+  check "server Remote Config seed 与 TUF root 可用" probe_remote_config
   check "ddsql-server /healthz（仅存活）" probe_ddsql
   check "DDSQL 可查询 dd.database_instances（允许 0 行）" probe_ddsql_database_instances
   check "dbdog-web /login（仅 HTTP smoke）" probe_web

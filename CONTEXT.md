@@ -48,9 +48,9 @@ _Avoid_: 升级（重建不是升级）
 ## Flagged ambiguities
 
 - "agent-core 是一个二进制" —— 否。agent-core 是 Python 库仓，产物是被 dbdog-agent omnibus 包吸收的 wheels，发布集内没有 agent-core 条目。
-- "Agent provenance 里的 gaussdb 23.9.1 是被监控数据库版本" —— 否。它是打进
-  dbdog-agent 的 GaussDB integration/wheel 版本；目标 GaussDB Kernel 版本在运行期通过
-  连接池查询并上报，安装器不按目标版本字符串做绑定。
+- "Agent provenance 里的 GaussDB integration_version 是被监控数据库版本" —— 否。
+  它是打进 dbdog-agent 的采集 integration/wheel 自身版本；目标 GaussDB Kernel
+  版本在运行期通过连接池查询并上报，安装器不按目标版本字符串做绑定。
 
 ## Example dialogue
 
