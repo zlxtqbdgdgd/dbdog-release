@@ -185,6 +185,27 @@ choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
   printf '%s\n' "$chosen"
 }
 
+choose_shared_url() { # choose_shared_url <说明> <默认值> <env 文件> <KEY>...
+  local label="$1" default_value="$2" chosen="" value file key; shift 2
+  [ $(( $# % 2 )) -eq 0 ] || die "$label 的 env/key 参数不成对"
+  while [ "$#" -gt 0 ]; do
+    file="$1"; key="$2"; shift 2
+    value="$(env_literal_value "$file" "$key")"
+    case "$value" in "" | change-me*) continue ;; esac
+    case "$value" in
+      http://* | https://*) ;;
+      *) die "$file 的 $key 不是合法 HTTP(S) URL，拒绝带病启动" ;;
+    esac
+    if [ -z "$chosen" ]; then
+      chosen="$value"
+    elif [ "${chosen%/}" != "${value%/}" ]; then
+      die "$label 在多个服务配置中不一致，拒绝猜测应覆盖哪一个"
+    fi
+  done
+  [ -n "$chosen" ] || chosen="$default_value"
+  printf '%s\n' "$chosen"
+}
+
 configure_ready_to_use_stack() {
   local server_env="$ETC_DIR/dbdog-server.env"
   local web_env="$ETC_DIR/dbdog-web.env"
@@ -203,9 +224,14 @@ configure_ready_to_use_stack() {
   internal_token="$(choose_shared_secret DBDOG_INTERNAL_TOKEN "$server_env" "$web_env" "$mcp_env")"
   oauth_secret="$(choose_shared_secret DBDOG_OAUTH_JWT_SECRET "$web_env" "$mcp_env")"
   advertise_host="$(detect_advertise_host)"
-  app_url="http://${advertise_host}:3000"
+  app_url="$(choose_shared_url 'Web/MCP OAuth 地址' "http://${advertise_host}:3000" \
+    "$web_env" PUBLIC_APP_URL \
+    "$mcp_env" DBDOG_OAUTH_ISSUER \
+    "$mcp_env" DBDOG_APP_BASE_URL)"
   ingest_url="http://${advertise_host}:8080"
-  mcp_url="http://${advertise_host}:8090/mcp"
+  mcp_url="$(choose_shared_url 'Web/MCP resource 地址' "http://${advertise_host}:8090/mcp" \
+    "$web_env" PUBLIC_MCP_URL \
+    "$mcp_env" DBDOG_PUBLIC_MCP_URL)"
 
   ensure_env_default "$server_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
   ensure_env_default "$server_env" DBDOG_HTTP_ADDR :8080 change-me

@@ -176,6 +176,38 @@ grep -Fqx 'DBDOG_PUBLIC_MCP_URL=https://mcp.internal.example/mcp' "$custom_mcp_e
 [ "$DBDOG_MCP_CONFIG_CHANGED" -eq 0 ] || fail "自定义 MCP 配置被误判为旧模板"
 pass "自定义 MCP 域名和反代地址保持不变"
 
+# Web 已有真实反代地址、MCP 对应字段缺失时，Web 是授权服务器和页面入口，必须把
+# 现有地址继承给 MCP，不能重新猜测部署机 IP。
+custom_stack="$TEST_ROOT/custom-stack"
+mkdir -p "$custom_stack"
+cat >"$custom_stack/dbdog-server.env" <<'EOF'
+PG_DSN=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+EOF
+cat >"$custom_stack/dbdog-web.env" <<'EOF'
+DATABASE_URL=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+DBDOG_OAUTH_JWT_SECRET=abcdef0123456789abcdef0123456789
+PUBLIC_APP_URL=https://console.internal.example
+PUBLIC_MCP_URL=https://mcp.internal.example/mcp
+EOF
+cat >"$custom_stack/dbdog-mcp.env" <<'EOF'
+DBDOG_BASE_URL=http://127.0.0.1:8080
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+DBDOG_OAUTH_JWT_SECRET=abcdef0123456789abcdef0123456789
+EOF
+(
+  ETC_DIR="$custom_stack"
+  DBDOG_ADVERTISE_HOST=should-not-win.internal configure_ready_to_use_stack >/dev/null
+) || fail "MCP 未能继承 Web 已有的自定义 OAuth 地址"
+grep -Fqx 'DBDOG_OAUTH_ISSUER=https://console.internal.example' \
+  "$custom_stack/dbdog-mcp.env" || fail "MCP issuer 没有继承 Web PUBLIC_APP_URL"
+grep -Fqx 'DBDOG_APP_BASE_URL=https://console.internal.example' \
+  "$custom_stack/dbdog-mcp.env" || fail "MCP app URL 没有继承 Web PUBLIC_APP_URL"
+grep -Fqx 'DBDOG_PUBLIC_MCP_URL=https://mcp.internal.example/mcp' \
+  "$custom_stack/dbdog-mcp.env" || fail "MCP resource 没有继承 Web PUBLIC_MCP_URL"
+pass "已有 Web 自定义域名作为权威配置自动同步给缺失的 MCP 字段"
+
 # 用本机 Node + 假 PG/HTTP 响应跑完整的 OAuth 专项验收，保证 JSON 字段、发现链和
 # WWW-Authenticate 解析不是只写了代码却从未执行。
 mkdir -p "$MODULES_DIR/node/current/bin" "$MODULES_DIR/postgresql/current/bin"
@@ -205,4 +237,4 @@ curl() {
 oauth_main >/dev/null || fail "OAuth 专项升级验收未通过完整执行"
 pass "OAuth 专项验收覆盖表结构、发现元数据与 401 challenge"
 
-printf 'ALL PASS: 10 release contract tests\n'
+printf 'ALL PASS: 11 release contract tests\n'
