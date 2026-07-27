@@ -190,7 +190,7 @@ a9a043a7975a7b4b1f43de46cdcaca292adc51799aa281cb9b47a276134871b7  patchelf-0.18.
 41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07  finalize-agent-runtime-v1.sh
 4abdafe78d8394f30f7f26abaeafc2a0f716b2e5f5494c9cafe909b8e7d7d905  run-finalize-agent-runtime-v1.sh
 ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3  seal-agent-build-dependencies-v1.sh
-885826b30f303dbe5e3619bf794340c3c5d4b3134d4813044e29768da1f1e7c5  ../recipes/dbdog-agent.sh
+0f63879423a69300797f254e9dc23796783fa59001937eef084b700dbbc1c106  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical overlays

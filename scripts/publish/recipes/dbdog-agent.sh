@@ -368,7 +368,8 @@ require_archive_member() {
 verify_canonical_artifact() (
   local artifact=$1 sidecar=$2 artifact_name member duplicate actual_sha work list
   local build_info marker expected_marker gaussdb_info agent_version_info manifest_text manifest_json
-  local agent_version_output agent_binary_sha version_output_sha manifest_text_sha manifest_json_sha
+  local agent_version_output expected_agent_version_prefix
+  local agent_binary_sha version_output_sha manifest_text_sha manifest_json_sha
   local actual_agent_binary_sha actual_version_output_sha actual_manifest_text_sha actual_manifest_json_sha
   local manifest_header_version manifest_component_version manifest_json_version
   artifact_name=${artifact##*/}
@@ -480,8 +481,9 @@ verify_canonical_artifact() (
   require_exact_field "$agent_version_info" version_manifest_text_path ./version-manifest.txt
   require_exact_field "$agent_version_info" version_manifest_json_path ./version-manifest.json
   agent_version_output=$(read_exact_field "$agent_version_info" version_output)
+  expected_agent_version_prefix="Agent $VERSION - Commit: ${PINNED_AGENT_SHA:0:10} - Serialization version: "
   case "$agent_version_output" in
-    "Agent $VERSION - Meta: "*) ;;
+    "$expected_agent_version_prefix"*' - Go version: go'*) ;;
     *) die "产物 Agent version 输出没有绑定外层 VERSION: $agent_version_output" ;;
   esac
   agent_binary_sha=$(read_exact_field "$agent_version_info" binary_sha256)
