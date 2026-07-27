@@ -116,6 +116,10 @@ cd ~/dbdog/release
 ./scripts/verify.sh
 ```
 
+首次 `--finish` 会在迁移后创建 `admin@dbdog.local` 管理员，并把随机密码输出一次；请当场
+保存并在登录后立即修改。后续升级会检测既有账号，不会重置密码。登录后的管理员可在
+Settings → 用户管理创建其他用户，因此 Web 不开放匿名注册。
+
 `verify.sh` 会检查配置占位值、实际执行 PG/CH 查询，并等待 server、ddsql、web、MCP
 HTTP 就绪；最后出现 `基础部署验收通过` 才可继续业务场景验证。它不证明 DDSQL 查询、
 鉴权或 agent 链路已经端到端通过。`dbdogctl status all` 只反映进程状态，不等于健康。

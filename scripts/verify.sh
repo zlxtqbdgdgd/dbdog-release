@@ -138,6 +138,15 @@ probe_web_postgresql() (
     -Atc "SELECT current_database(), 1" | grep -qx 'ctl|1'
 )
 
+probe_web_admin() (
+  clear_probe_env
+  load_env dbdog-web || return 1
+  [ -n "${DATABASE_URL:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+    -Atc "SELECT count(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL" \
+    | awk '$1 + 0 > 0 { found = 1 } END { exit !found }'
+)
+
 probe_clickhouse() (
   clear_probe_env
   load_env dbdog-server || return 1
@@ -194,6 +203,7 @@ main() {
   check "DDSQL 的 PG/CH/metric 配置完整" probe_ddsql_contract
   check "server PG_DSN 可查询 ctl" probe_postgresql
   check "web DATABASE_URL 可查询 ctl" probe_web_postgresql
+  check "web 至少有一个可登录管理员" probe_web_admin
   check "ClickHouse 可查询目标库" probe_clickhouse
   check "dbdog-server /healthz" probe_dbdog_server
   check "ddsql-server /healthz（仅存活）" probe_ddsql
