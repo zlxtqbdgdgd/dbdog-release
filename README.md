@@ -26,7 +26,9 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 
 - **全家桶机**：已在麒麟 V10 / 鲲鹏 920 完成首次基础部署验收，PostgreSQL、ClickHouse
   与四个应用服务均可启动；DDSQL 查询、鉴权和 agent 业务链路仍需继续验证。
-- **GaussDB 主机 agent**：aarch64 运行时已发布，但 root cutover、systemd 单元和配置落位流程尚未交付；当前只能下载校验，不能按本仓完成安装。
+- **GaussDB 主机 agent**：aarch64 运行时与正常首装/升级流程均已交付；安装器会完成
+  目标机发现、监控账号/兼容视图、全量默认功能配置、四个 systemd 服务、真实 GaussDB check
+  和失败回滚。首次进入内网目标机仍应先做一轮麒麟 V10 实机验收，再推广到其他数据库主机。
 
 ## 内网首次安装：全家桶机
 
@@ -156,14 +158,61 @@ cd ~/dbdog/release
 
 ## GaussDB 主机 agent
 
+前提：麒麟 V10 / aarch64、GaussDB 正在运行、dbdog-server 已可从该主机直连，并已从
+dbdog-web 的 Agent 接入页签发 ingest API key。不要覆盖同机官方
+`/opt/datadog-agent`；dbdog 私有运行时、配置和服务分别固定在 `/opt/dbdog-agent`、
+`/etc/dbdog-agent` 与 `dbdog-agent*`。
+
 ```bash
 cd ~/dbdog/release
-./scripts/agent-install.sh
+sudo ./scripts/upgrade.sh dbdog-agent
 ```
 
-该命令目前只下载并校验 manifest 中的 omnibus tarball，随后会明确报错退出；它不会安装
-agent。不要手工覆盖官方 `/opt/datadog-agent`。待版本化 cutover、systemd、配置与回滚验收
-流程一并交付后，再开放内网安装。
+首次运行只会在终端提示两个无法安全猜测的外部值：dbdog-server 地址和 Web 签发的 Agent
+API key。GaussDB `dbdog` 监控用户密码由安装器随机生成并写入 root `0600` 配置；升级自动
+保留，不需要人工知道或再次输入。输入只发生在这条正常安装命令里，不需要随后手改 YAML 或
+systemd。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入；确需接管既有监控
+密码时才设置 `DBDOG_GAUSSDB_MONITOR_PASSWORD`。不要把明文写进仓库、shell history 或命令参数。
+
+安装器自动完成以下工作：
+
+- 下载并校验 manifest 产物，确认它确实包含 GaussDB integration、编译后的
+  `psycopg_c`/私有 `libpq` 和五个核心二进制；
+- 从运行中的 `gaussdb` 进程、`/proc/<pid>/environ`、`postmaster.pid` 与配置发现实际端口、
+  `GAUSSHOME`、`PGDATA`、`GAUSSLOG`。只有进程环境缺值时才把目标用户 profile 当静态文本
+  读取字面量，绝不 `source .bashrc`；
+- 用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备：创建/刷新 `dbdog`
+  MONADMIN、`dbdog.statements`/`dbdog.activity`/explain 兼容对象，并为本机
+  `127.0.0.1` 监控连接落一条受管 HBA 规则。`gsql` 不参与日常采集；
+- 默认开启现网已验证的 GaussDB DBM（query metrics/samples、schema、settings、activity、
+  database size）、数据库日志、主机指标、Live Processes/Process Discovery、NPM/USM、
+  APM/OpenLineage、Remote Config 与 inventories/metadata；同时把全部 intake/EvP endpoint
+  指向本次输入的 dbdog-server；
+- 以 root 安装并启用 Core、Trace、Process、System Probe 四个私有服务；只有 API key
+  validate、Remote Config trust root、四服务 active、forwarder health 和真实
+  `agent check gaussdb` 全部通过才返回成功，否则恢复上一套 runtime/config/unit。
+
+Agent 包里的 `23.9.1` 是 **GaussDB integration 版本**，不是被监控 GaussDB 的服务端版本。
+日常采集由该 integration 通过 psycopg `ConnectionPool` 和包内 libpq 完成，服务端版本则在
+运行期执行 `SHOW SERVER_VERSION` / `SELECT version()` 识别。安装器不会因为目标 GaussDB
+版本字符串变化而拒装；若新版本真实改变了协议或系统视图，末尾 check 会 fail closed，此时应
+升级 integration，而不是换成 `gsql` 短连接采集或绑定目标机客户端库。Agent 产物也显式
+禁止夹带 `gsql`/`gaussdb` 服务端二进制，安装期需要时只使用目标机当前版本自己的 gsql。
+
+后续升级仍是同一条正常命令，不另设 cutover 流程；`upgrade.sh` 直接进入 Agent 自己的原子
+安装/升级事务，已落地的 server URL、API key 和数据库密码会自动保留，端口与日志路径会
+重新按目标机事实发现：
+
+```bash
+cd ~/dbdog/release
+git pull --ff-only
+sudo ./scripts/upgrade.sh dbdog-agent
+```
+
+显式设置 `DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、`DBDOG_GAUSSDB_DEPLOYMENT`、
+`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的特殊部署。正常集中式安装
+不需要这些覆盖。上一套 root/config 会保留在安装输出给出的 `.dbdog-agent-before-*` 目录，
+Agent 的数据库 check 诊断留在 `/var/log/dbdog-agent/install-gaussdb-check.log`（0600）。
 
 ## 公网：发布（维护者）
 

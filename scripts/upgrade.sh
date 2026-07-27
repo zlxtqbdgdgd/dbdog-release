@@ -3,10 +3,13 @@
 # 用法：
 #   upgrade.sh                 # 升级所有「已安装且版本/产物 SHA 与 manifest 不同」的 stack 模块
 #   upgrade.sh <模块>...       # 升级/安装指定模块（未装的也会装，但不负责初始化配置）
+#   upgrade.sh dbdog-agent     # DB 主机上的 Agent 首装/升级（含配置、数据库准备和验收）
 # 回滚：把 current 恢复为升级前 readlink 记录的目标后重启；旧身份目录不会自动删除。
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-DBDOGCTL="$(dirname "${BASH_SOURCE[0]}")/dbdogctl"
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/lib.sh"
+DBDOGCTL="$SCRIPTS_DIR/dbdogctl"
 
 ACTIVE_UPGRADE_STAGE=""
 ACTIVE_UPGRADE_STAGE_PARENT=""
@@ -264,7 +267,7 @@ upgrade_one() {
   target="$(manifest_get "$m" 3)"
 
   [ "$version" != "-" ] || { warn "$m 尚未发布，跳过"; return 0; }
-  [ "$target" = "stack" ] || { warn "$m 不装在本机（target=${target}），跳过；DB 主机用 agent-install.sh"; return 0; }
+  [ "$target" = "stack" ] || die "$m 属于 ${target} 目标，不应进入 stack 模块升级器"
   require_path_component "模块名" "$m"
   require_path_component "版本" "$version"
   require_path_component "产物名" "$artifact"
@@ -278,6 +281,18 @@ upgrade_one() {
   inst="$(installed_version "$m")"
   inst_sha256="$(installed_artifact_sha256 "$m")"
   if current_matches_artifact_identity "$m" "$version" "$sha256"; then
+    if [ "$m" = "dbdog-server" ] && [ -f "$ETC_DIR/ddsql-server.env" ]; then
+      local ddsql_before ddsql_after
+      ddsql_before="$(env_literal_value "$ETC_DIR/ddsql-server.env" DBDOG_PG_SCHEMA)|$(env_literal_value "$ETC_DIR/ddsql-server.env" CH_DATABASE)"
+      configure_default_tenant_ddsql "$ETC_DIR/ddsql-server.env"
+      ddsql_after="$(env_literal_value "$ETC_DIR/ddsql-server.env" DBDOG_PG_SCHEMA)|$(env_literal_value "$ETC_DIR/ddsql-server.env" CH_DATABASE)"
+      if [ "$ddsql_before" != "$ddsql_after" ]; then
+        log "已校准 DDSQL 默认租户配置: ${ddsql_before} → ${ddsql_after}"
+        if "$DBDOGCTL" status ddsql-server | grep -q 运行中; then
+          "$DBDOGCTL" restart ddsql-server
+        fi
+      fi
+    fi
     log "$m 已是 ${version}（artifact ${sha256:0:12}），跳过"
     return 0
   fi
@@ -385,6 +400,11 @@ upgrade_one() {
     done
   fi
 
+  # 修复旧发布遗留的 DDSQL public/obs 默认值。专用 env 中的自定义租户值保持不变。
+  if [ "$m" = "dbdog-server" ]; then
+    configure_default_tenant_ddsql "$ETC_DIR/ddsql-server.env"
+  fi
+
   # shellcheck disable=SC2086
   [ -n "$running" ] && "$DBDOGCTL" start $running
   UPGRADE_RECOVERY_ACTIVE=0
@@ -394,6 +414,15 @@ upgrade_one() {
   UPGRADE_RECOVERY_RUNNING=""
   log "$m: $inst → ${version}（artifact ${sha256:0:12}）完成"
 }
+
+# Agent 位于 DB 主机且拥有独立的 root/config/systemd 事务。统一入口在参数校验后
+# 直接 exec 同一份首装/升级实现，避免先创建 stack 布局，也避免维护第二套 cutover。
+for requested in "$@"; do
+  if [ "$requested" = dbdog-agent ]; then
+    [ "$#" -eq 1 ] || die "dbdog-agent 位于 DB 主机，不能与 stack 模块混合升级"
+    exec "$SCRIPTS_DIR/agent-install.sh"
+  fi
+done
 
 ensure_layout
 if [ $# -gt 0 ]; then

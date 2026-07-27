@@ -81,6 +81,22 @@ env_literal_value() { # env_literal_value <env 文件> <KEY>；只读简单 KEY=
   ' "$file"
 }
 
+configure_default_tenant_ddsql() { # configure_default_tenant_ddsql <ddsql-server.env>
+  local file="$1" pg_schema ch_database
+  [ -f "$file" ] && [ ! -L "$file" ] || die "ddsql env 文件不存在或不是普通文件: $file"
+
+  # storage v3 的 default org 物理落在 t_1 / obs_t_1。ddsql 目前仍是单租户进程级
+  # pin；专用 env 后加载，可覆盖 server 共享 env 中为 Go 服务保留的 public/obs 默认值。
+  pg_schema="$(env_literal_value "$file" DBDOG_PG_SCHEMA)"
+  case "$pg_schema" in
+    "" | public) ensure_env_default "$file" DBDOG_PG_SCHEMA t_1 "$pg_schema" ;;
+  esac
+  ch_database="$(env_literal_value "$file" CH_DATABASE)"
+  case "$ch_database" in
+    "" | obs) ensure_env_default "$file" CH_DATABASE obs_t_1 "$ch_database" ;;
+  esac
+}
+
 detect_advertise_host() {
   local host="${DBDOG_ADVERTISE_HOST:-}"
   if [ -z "$host" ] && command -v ip >/dev/null 2>&1; then
@@ -132,6 +148,20 @@ manifest_get() { # manifest_get <module> <列号>
 manifest_modules() { # manifest_modules [target 过滤]
   local t="${1:-}"
   manifest_rows | awk -F'\t' -v t="$t" 't=="" || $3==t {print $1}'
+}
+
+agent_marker_value() { # <Agent marker 路径> <runtime 根>；输出 -（未安装）或 ?（损坏）
+  local marker="$1" runtime_root="$2" value lines
+  if [ ! -e "$marker" ]; then
+    [ -d "$runtime_root" ] && printf '%s\n' '?' || printf '%s\n' -
+    return 0
+  fi
+  [ -f "$marker" ] && [ ! -L "$marker" ] && [ -r "$marker" ] || \
+    { printf '%s\n' '?'; return 0; }
+  lines="$(awk 'END { print NR }' "$marker")"
+  value="$(tr -d '\r\n' <"$marker")"
+  [ "$lines" -eq 1 ] && [ -n "$value" ] || { printf '%s\n' '?'; return 0; }
+  printf '%s\n' "$value"
 }
 
 canonicalize_upgrade_modules() { # canonicalize_upgrade_modules <模块>... → ORDERED_UPGRADE_MODULES

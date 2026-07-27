@@ -28,7 +28,7 @@ load_env() { # load_env <服务名>
 
 clear_probe_env() {
   # 验收的是持久化到 ~/dbdog/etc/*.env 的值，不能借用调用者临时 export 的配置。
-  unset PG_DSN DATABASE_URL CH_URL CH_DATABASE DBDOG_METRIC_URL
+  unset PG_DSN DATABASE_URL CH_URL CH_DATABASE DBDOG_METRIC_URL DBDOG_PG_SCHEMA
   unset DBDOG_CH_ADDR DBDOG_CH_DATABASE DBDOG_CH_USERNAME CH_PASSWORD
   unset DBDOG_HTTP_ADDR DDSQL_ADDR PORT DBDOG_HTTP_PORT
   unset DBDOG_INTERNAL_TOKEN DBDOG_OAUTH_JWT_SECRET DBDOG_SERVER_URL
@@ -112,7 +112,8 @@ probe_ddsql_contract() (
   clear_probe_env
   load_env dbdog-server || return 1
   load_env ddsql-server || return 1
-  [ -n "${PG_DSN:-}" ] && [ -n "${CH_URL:-}" ] && [ -n "${CH_DATABASE:-}" ] \
+  [ -n "${PG_DSN:-}" ] && [ -n "${CH_URL:-}" ] \
+    && [ "${DBDOG_PG_SCHEMA:-}" = t_1 ] && [ "${CH_DATABASE:-}" = obs_t_1 ] \
     && [ -n "${DBDOG_METRIC_URL:-}" ]
 )
 
@@ -222,6 +223,18 @@ probe_ddsql() (
   retry_http "http://127.0.0.1:$port/healthz"
 )
 
+probe_ddsql_database_instances() (
+  clear_probe_env
+  load_env dbdog-server || return 1
+  load_env ddsql-server || return 1
+  local addr="${DDSQL_ADDR:-127.0.0.1:8770}" port body
+  port="${addr##*:}"
+  body='{"sql":"SELECT name FROM dd.database_instances LIMIT 1","row_limit":1}'
+  retry_http "http://127.0.0.1:$port/api/v2/ddsql/query" \
+    -H 'Content-Type: application/json' -d "$body" \
+    | grep -Fq '"columns":["name"]'
+)
+
 probe_web() (
   clear_probe_env
   load_env dbdog-web || return 1
@@ -256,6 +269,7 @@ main() {
   check "默认租户 ClickHouse 核心表已创建" probe_tenant_clickhouse_blueprint
   check "dbdog-server /healthz" probe_dbdog_server
   check "ddsql-server /healthz（仅存活）" probe_ddsql
+  check "DDSQL 可查询 dd.database_instances（允许 0 行）" probe_ddsql_database_instances
   check "dbdog-web /login（仅 HTTP smoke）" probe_web
   check "dbdog-mcp /healthz（仅存活）" probe_mcp
 
@@ -263,7 +277,7 @@ main() {
   if [ "$failures" -gt 0 ]; then
     die "$failures 项基础验收失败；查看 $LOGS_DIR/ 下对应服务日志"
   fi
-  log "基础部署验收通过；DDSQL、鉴权和 agent 仍需业务场景验证"
+  log "基础部署验收通过；鉴权和 agent 仍需业务场景验证"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

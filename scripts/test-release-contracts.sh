@@ -77,6 +77,10 @@ PG_DSN=postgres://user:pass@127.0.0.1:5432/ctl
 DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
 DBDOG_PUBLIC_BASE_URL=
 EOF
+cat >"$ETC_DIR/ddsql-server.env" <<'EOF'
+DBDOG_PG_SCHEMA=public
+CH_DATABASE=obs
+EOF
 cat >"$ETC_DIR/dbdog-web.env" <<'EOF'
 DATABASE_URL=postgres://user:pass@127.0.0.1:5432/ctl
 DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
@@ -98,6 +102,10 @@ grep -Fqx 'PG_DSN=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' \
   "$ETC_DIR/dbdog-server.env" || fail "server 本机 DSN 未生成"
 grep -Fqx 'DATABASE_URL=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' \
   "$ETC_DIR/dbdog-web.env" || fail "web 本机 DSN 未生成"
+grep -Fqx 'DBDOG_PG_SCHEMA=t_1' "$ETC_DIR/ddsql-server.env" \
+  || fail "DDSQL 未钉住 default org PG schema"
+grep -Fqx 'CH_DATABASE=obs_t_1' "$ETC_DIR/ddsql-server.env" \
+  || fail "DDSQL 未钉住 default org CH database"
 grep -Fqx 'PUBLIC_APP_URL=http://dbdog.internal:3000' "$ETC_DIR/dbdog-web.env" \
   || fail "web 默认访问 URL 未生成"
 grep -Fqx 'DBDOG_PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$ETC_DIR/dbdog-mcp.env" \
