@@ -65,7 +65,8 @@ valid_url() {
 retry_http() { # retry_http <URL> [curl 其他参数...]
   local url="$1" i; shift
   for ((i=1; i<=30; i++)); do
-    curl -fsS "$@" "$url" && return 0
+    curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+      "$@" "$url" && return 0
     sleep 1
   done
   return 1

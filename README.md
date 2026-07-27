@@ -24,7 +24,8 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 
 ## 当前可用范围
 
-- **全家桶机**：产物与安装脚本已齐，等待今天在目标内网完成首次端到端验证。
+- **全家桶机**：已在麒麟 V10 / 鲲鹏 920 完成首次基础部署验收，PostgreSQL、ClickHouse
+  与四个应用服务均可启动；DDSQL 查询、鉴权和 agent 业务链路仍需继续验证。
 - **GaussDB 主机 agent**：aarch64 运行时已发布，但 root cutover、systemd 单元和配置落位流程尚未交付；当前只能下载校验，不能按本仓完成安装。
 
 ## 内网首次安装：全家桶机
@@ -34,19 +35,43 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。ClickHouse 首次探测会
 从约 154 MiB 自解压为约 708 MiB，模块目录应至少额外留出 1 GiB。
 
-若内网 HTTPS 代理使用自签根 CA，优先取得运维提供的 PEM CA 文件，让下载脚本继续严格
-校验证书和主机名：
+### 出网代理与 TLS
+
+curl 与 Git 会原生读取 `https_proxy`/`HTTPS_PROXY`、`all_proxy`/`ALL_PROXY` 和
+`no_proxy`/`NO_PROXY`，下载脚本不需要也不会另拼 `--proxy`。建议统一用小写；大小写同时
+存在时 curl 以小写为准。curl 不把大写 `HTTP_PROXY` 当作代理变量，访问本仓的 HTTPS
+地址应设置 `https_proxy`（或 `HTTPS_PROXY`）。若设置了代理，务必让本机服务绕过它：
 
 ```bash
-export CURL_CA_BUNDLE=/path/to/internal-proxy-ca.pem
-./scripts/install.sh
+export https_proxy=http://proxy.internal.example:3128
+export no_proxy=127.0.0.1,localhost,::1
 ```
+
+若代理重签目标站证书，优先取得运维提供的 PEM CA 文件，让 Git clone、后续 pull 和产物
+下载继续严格校验证书及主机名。Git 与下载脚本的 CA 配置是两条链路，需要分别设置：
+
+```bash
+ca=/path/to/internal-proxy-ca.pem
+git -c http.sslCAInfo="$ca" clone \
+  https://github.com/zlxtqbdgdgd/dbdog-release ~/dbdog/release
+git -C ~/dbdog/release config --local http.sslCAInfo "$ca"
+export CURL_CA_BUNDLE="$ca"
+```
+
+按上例完成 clone 后，从下一节的 `cd ~/dbdog/release` 继续，跳过重复的 `git clone`。
 
 仅在无法及时取得 CA、且已通过可信渠道确认下载地址时，才可单次使用
 `CURL_INSECURE=1 ./scripts/install.sh` 临时排障。只有精确值 `1` 会传给 curl 的
 `--insecure`；未设置或设为 `0` 均保持严格 TLS，其他值会直接报错。该模式会关闭证书和
 主机名校验，产物 SHA-256 只能发现内容变化，不能证明下载来源，因此不要写入 `.bashrc`
-或长期启用。
+或长期启用；它也不会影响 Git。不要使用 `GIT_SSL_NO_VERIFY` 或
+`git config http.sslVerify false`。
+
+当前 PostgreSQL `16.14-dbdog.1` 已内置 `libpq.so.5`、`libreadline.so.8` 等运行库，
+并使用相对 RUNPATH 从模块自己的 `lib/` 加载；安装脚本不需要设置 `LD_LIBRARY_PATH`。
+不要为 dbdog 把该变量写入 `.bashrc`。若目标机仍留有首次部署时的临时 workaround，
+移除后可用 `env -u LD_LIBRARY_PATH ~/dbdog/modules/postgresql/current/bin/psql --version`
+验证独立运行。
 
 ### 1. 拉取并安装到配置阶段
 

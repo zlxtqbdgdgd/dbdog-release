@@ -7,6 +7,17 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # 启动顺序即依赖顺序；stop 时倒序。
 SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
+STARTUP_ATTEMPTS="${DBDOG_STARTUP_ATTEMPTS:-30}"
+STARTUP_INTERVAL="${DBDOG_STARTUP_INTERVAL:-1}"
+STARTUP_STABLE_SUCCESSES="${DBDOG_STARTUP_STABLE_SUCCESSES:-2}"
+
+for startup_count in "$STARTUP_ATTEMPTS" "$STARTUP_STABLE_SUCCESSES"; do
+  case "$startup_count" in
+    '' | 0 | *[!0-9]*) die "启动探测次数必须是正整数: $startup_count" ;;
+  esac
+done
+[ "$STARTUP_STABLE_SUCCESSES" -le "$STARTUP_ATTEMPTS" ] \
+  || die "连续成功次数不能大于启动探测次数"
 
 pid_of() {
   local svc="$1" f pid=""
@@ -21,67 +32,270 @@ pid_of() {
   esac
   printf '%s\n' "$pid"
 }
-is_running() { local pid; pid="$(pid_of "$1")"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+process_alive() { # kill -0 对僵尸进程也成功；启动门禁必须把 Z 视为已退出
+  local pid="$1" stat state=""
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(<"/proc/$pid/stat")"
+    stat="${stat##*) }"
+    state="${stat%% *}"
+  elif command -v ps >/dev/null 2>&1; then
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  fi
+  case "$state" in Z*) return 1 ;; esac
+}
+
+is_running() {
+  local pid
+  pid="$(pid_of "$1")"
+  [ -n "$pid" ] && process_alive "$pid"
+}
+
+load_app_env() { # 在调用者作用域加载应用配置；调用者决定是否 set -a
+  local svc="$1" envf="$ETC_DIR/$1.env" shared_env=""
+  [ "$svc" = "ddsql-server" ] && shared_env="$ETC_DIR/dbdog-server.env"
+  if [ -n "$shared_env" ] && [ -f "$shared_env" ]; then
+    source "$shared_env" || return 1
+  fi
+  if [ -f "$envf" ]; then source "$envf" || return 1; fi
+  return 0
+}
+
+expected_process_executable() {
+  case "$1" in
+    dbdog-server) printf '%s\n' "$MODULES_DIR/dbdog-server/current/bin/dbdog-server" ;;
+    ddsql-server) printf '%s\n' "$MODULES_DIR/dbdog-server/current/bin/ddsql-server" ;;
+    dbdog-web | dbdog-mcp) printf '%s\n' "$MODULES_DIR/node/current/bin/node" ;;
+    *) return 1 ;;
+  esac
+}
+
+local_http_probe() {
+  curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+    -o /dev/null "$1"
+}
+
+process_exec_ready() { # Linux 上确认后台 wrapper 已 exec 成真正的服务命令
+  local svc="$1" pid="$2" expected expected_real actual_real magic arg
+  case "$svc" in
+    dbdog-server | ddsql-server | dbdog-web | dbdog-mcp) ;;
+    *) return 0 ;;
+  esac
+
+  # 生产目标是 Linux；macOS 没有 /proc，回归测试由下面的 HTTP probe 握手。
+  [ -e "/proc/$pid/exe" ] || return 0
+  expected="$(expected_process_executable "$svc")" || return 1
+  expected_real="$(readlink -f "$expected" 2>/dev/null)" || return 1
+
+  # 生产包入口是 ELF；同时兼容测试/排障时使用 shebang 脚本作为入口。
+  magic="$(head -c 2 "$expected_real" 2>/dev/null)" || return 1
+  if [ "$magic" = '#!' ]; then
+    while IFS= read -r -d '' arg; do
+      [ "$arg" = "$expected" ] || [ "$arg" = "$expected_real" ] || continue
+      return 0
+    done <"/proc/$pid/cmdline"
+    return 1
+  fi
+
+  actual_real="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+  [ "$actual_real" = "$expected_real" ]
+}
+
+service_probe() { # 进程存活之外的最小就绪检查
+  case "$1" in
+    postgresql)
+      "$MODULES_DIR/postgresql/current/bin/pg_isready" \
+        -h 127.0.0.1 -d postgres >/dev/null 2>&1
+      ;;
+    clickhouse)
+      "$MODULES_DIR/clickhouse/current/bin/clickhouse" client \
+        --host 127.0.0.1 --query "SELECT 1" >/dev/null 2>&1
+      ;;
+    dbdog-server) (
+      load_app_env dbdog-server
+      port="${DBDOG_HTTP_ADDR:-:8080}"; port="${port##*:}"
+      local_http_probe "http://127.0.0.1:$port/healthz"
+      ) >/dev/null 2>&1
+      ;;
+    ddsql-server) (
+      load_app_env ddsql-server
+      port="${DDSQL_ADDR:-127.0.0.1:8770}"; port="${port##*:}"
+      local_http_probe "http://127.0.0.1:$port/healthz"
+      ) >/dev/null 2>&1
+      ;;
+    dbdog-web) (
+      load_app_env dbdog-web
+      local_http_probe "http://127.0.0.1:${PORT:-3000}/login"
+      ) >/dev/null 2>&1
+      ;;
+    dbdog-mcp) (
+      load_app_env dbdog-mcp
+      local_http_probe "http://127.0.0.1:${DBDOG_HTTP_PORT:-8090}/healthz"
+      ) >/dev/null 2>&1
+      ;;
+  esac
+}
+
+wait_started() { # 要求同一 PID 连续存活且探测成功，避免 daemon 父进程的假成功
+  local svc="$1" i pid="" observed_pid="" successes=0
+  for ((i=1; i<=STARTUP_ATTEMPTS; i++)); do
+    pid="$(pid_of "$svc")"
+    if [ -n "$pid" ] && process_alive "$pid"; then
+      if [ "$pid" != "$observed_pid" ]; then
+        observed_pid="$pid"
+        successes=0
+      fi
+      if process_exec_ready "$svc" "$pid" && service_probe "$svc"; then
+        successes=$((successes + 1))
+        [ "$successes" -ge "$STARTUP_STABLE_SUCCESSES" ] && return 0
+      else
+        successes=0
+      fi
+    elif [ -n "$pid" ]; then
+      # 已写入 PID 的 daemon/后台进程已退出，不再把确定失败拖到超时。
+      return 1
+    else
+      observed_pid=""
+      successes=0
+    fi
+    [ "$i" -eq "$STARTUP_ATTEMPTS" ] || sleep "$STARTUP_INTERVAL"
+  done
+  return 1
+}
+
+service_log_path() {
+  case "$1" in
+    postgresql) printf '%s\n' "$LOGS_DIR/postgresql.log" ;;
+    clickhouse) printf '%s\n' "$LOGS_DIR/clickhouse.err.log" ;;
+    *) printf '%s\n' "$LOGS_DIR/$1.log" ;;
+  esac
+}
 
 # 通用应用服务：source 对应 env 文件后 nohup 拉起。
 start_app() { # start_app <服务名> <工作目录> <命令...>
-  local svc="$1" cwd="$2"; shift 2
-  local envf="$ETC_DIR/$svc.env" shared_env=""
-  [ "$svc" = "ddsql-server" ] && shared_env="$ETC_DIR/dbdog-server.env"
+  local svc="$1" cwd="$2" child_pid; shift 2
+  local envf="$ETC_DIR/$svc.env"
   [ -f "$envf" ] || warn "$svc: 缺少 ${envf}（将无配置启动）"
   (
     set -a
-    [ -n "$shared_env" ] && [ -f "$shared_env" ] && source "$shared_env"
-    [ -f "$envf" ] && source "$envf"
+    load_app_env "$svc"
     set +a
     cd "$cwd" || exit 1
-    nohup "$@" >>"$LOGS_DIR/$svc.log" 2>&1 &
-    echo $! >"$RUN_DIR/$svc.pid"
-  )
+    exec nohup "$@"
+  ) </dev/null >>"$LOGS_DIR/$svc.log" 2>&1 &
+  child_pid="$!"
+  if ! printf '%s\n' "$child_pid" >"$RUN_DIR/$svc.pid"; then
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    return 1
+  fi
 }
 
 start_one() {
   local svc="$1"
-  if is_running "$svc"; then log "$svc 已在运行 (pid $(pid_of "$svc"))"; return 0; fi
+  if is_running "$svc"; then
+    if wait_started "$svc"; then
+      log "$svc 已在运行且通过启动检查 (pid $(pid_of "$svc"))"
+      return 0
+    fi
+    warn "$svc 进程存在但未通过启动检查；查看 $(service_log_path "$svc")"
+    return 1
+  fi
   case "$svc" in
     postgresql)
-      "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" \
-        -l "$LOGS_DIR/postgresql.log" -w start ;;
+      if ! "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" \
+          -l "$LOGS_DIR/postgresql.log" -w start; then
+        warn "$svc 启动命令失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     clickhouse)
-      "$MODULES_DIR/clickhouse/current/bin/clickhouse" server \
-        --config-file="$ETC_DIR/clickhouse/config.xml" \
-        --pid-file="$RUN_DIR/clickhouse.pid" --daemon ;;
+      rm -f "$RUN_DIR/clickhouse.pid" || {
+        warn "无法清理旧 PID 文件: $RUN_DIR/clickhouse.pid"
+        return 1
+      }
+      if ! "$MODULES_DIR/clickhouse/current/bin/clickhouse" server \
+          --config-file="$ETC_DIR/clickhouse/config.xml" \
+          --pid-file="$RUN_DIR/clickhouse.pid" --daemon; then
+        warn "$svc daemon 启动命令失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     dbdog-server)
-      start_app dbdog-server "$MODULES_DIR/dbdog-server/current" \
-        "$MODULES_DIR/dbdog-server/current/bin/dbdog-server" ;;
+      rm -f "$RUN_DIR/dbdog-server.pid" || return 1
+      if ! start_app dbdog-server "$MODULES_DIR/dbdog-server/current" \
+          "$MODULES_DIR/dbdog-server/current/bin/dbdog-server"; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     ddsql-server)
-      start_app ddsql-server "$MODULES_DIR/dbdog-server/current" \
-        "$MODULES_DIR/dbdog-server/current/bin/ddsql-server" ;;
+      rm -f "$RUN_DIR/ddsql-server.pid" || return 1
+      if ! start_app ddsql-server "$MODULES_DIR/dbdog-server/current" \
+          "$MODULES_DIR/dbdog-server/current/bin/ddsql-server"; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     dbdog-web)
-      start_app dbdog-web "$MODULES_DIR/dbdog-web/current" \
-        "$MODULES_DIR/node/current/bin/node" server.js ;;
+      rm -f "$RUN_DIR/dbdog-web.pid" || return 1
+      if ! start_app dbdog-web "$MODULES_DIR/dbdog-web/current" \
+          "$MODULES_DIR/node/current/bin/node" server.js; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     dbdog-mcp)
-      start_app dbdog-mcp "$MODULES_DIR/dbdog-mcp/current" \
-        "$MODULES_DIR/node/current/bin/node" index.js ;;
+      rm -f "$RUN_DIR/dbdog-mcp.pid" || return 1
+      if ! start_app dbdog-mcp "$MODULES_DIR/dbdog-mcp/current" \
+          "$MODULES_DIR/node/current/bin/node" index.js; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
     *) die "未知服务: $svc" ;;
   esac
-  log "$svc 已启动"
+
+  if ! wait_started "$svc"; then
+    warn "$svc 启动命令已返回，但进程未稳定就绪；查看 $(service_log_path "$svc")"
+    if is_running "$svc"; then
+      stop_one "$svc" || warn "$svc 启动失败后的清理也失败，请人工检查"
+    elif [ "$svc" != "postgresql" ]; then
+      rm -f "$RUN_DIR/$svc.pid"
+    fi
+    return 1
+  fi
+  log "$svc 已启动并通过启动检查 (pid $(pid_of "$svc"))"
 }
 
 stop_one() {
-  local svc="$1"
+  local svc="$1" i
   case "$svc" in
     postgresql)
-      if [ -d "$DATA_DIR/pg" ]; then
-        "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" -m fast -w stop || true
-      fi ;;
+      if is_running "$svc"; then
+        if ! "$MODULES_DIR/postgresql/current/bin/pg_ctl" \
+            -D "$DATA_DIR/pg" -m fast -w stop; then
+          warn "$svc 停止失败；查看 $(service_log_path "$svc")"
+          return 1
+        fi
+      fi
+      ;;
     *)
       if is_running "$svc"; then
         kill "$(pid_of "$svc")" 2>/dev/null || true
-        for _ in $(seq 1 20); do is_running "$svc" || break; sleep 0.5; done
-        is_running "$svc" && { warn "$svc 未响应 TERM，发送 KILL"; kill -9 "$(pid_of "$svc")" || true; }
+        for ((i=1; i<=20; i++)); do is_running "$svc" || break; sleep 0.5; done
+        if is_running "$svc"; then
+          warn "$svc 未响应 TERM，发送 KILL"
+          kill -9 "$(pid_of "$svc")" 2>/dev/null || true
+          sleep 0.1
+        fi
+        if is_running "$svc"; then
+          warn "$svc 停止失败 (pid $(pid_of "$svc"))"
+          return 1
+        fi
       fi
-      rm -f "$RUN_DIR/$svc.pid" ;;
+      rm -f "$RUN_DIR/$svc.pid"
+      ;;
   esac
   log "$svc 已停止"
 }
@@ -100,19 +314,79 @@ status_one() {
   fi
 }
 
-expand() { # all → 全部服务
-  if [ "${1:-all}" = "all" ]; then printf '%s\n' "${SERVICES[@]}"; else printf '%s\n' "$@"; fi
+known_service() {
+  case "$1" in
+    postgresql | clickhouse | dbdog-server | ddsql-server | dbdog-web | dbdog-mcp) ;;
+    *) return 1 ;;
+  esac
 }
 
-reverse() { awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}'; }
+REQUESTED_SERVICES=()
+select_services() { # 无参数/all → 全部服务，并在执行前验证完整参数集
+  local svc
+  if [ "$#" -eq 0 ]; then
+    REQUESTED_SERVICES=("${SERVICES[@]}")
+  elif [ "$#" -eq 1 ] && [ "$1" = "all" ]; then
+    REQUESTED_SERVICES=("${SERVICES[@]}")
+  else
+    REQUESTED_SERVICES=("$@")
+  fi
+  for svc in "${REQUESTED_SERVICES[@]}"; do
+    [ "$svc" != "all" ] || die "all 不能与其他服务名同时使用"
+    known_service "$svc" || die "未知服务: $svc"
+  done
+}
+
+rollback_started() { # 只撤销本次调用新拉起的服务，不碰调用前就在运行的服务
+  local i
+  [ "$#" -gt 0 ] || return 0
+  warn "启动未全部成功，回滚本次已启动服务: $*"
+  for ((i=$#; i>=1; i--)); do
+    stop_one "${!i}" || warn "回滚失败: ${!i}"
+  done
+}
+
+start_many() {
+  local svc
+  local -a started=()
+  for svc in "$@"; do
+    if is_running "$svc"; then
+      if ! start_one "$svc"; then
+        if [ "${#started[@]}" -gt 0 ]; then rollback_started "${started[@]}"; fi
+        return 1
+      fi
+    elif start_one "$svc"; then
+      started+=("$svc")
+    else
+      if [ "${#started[@]}" -gt 0 ]; then rollback_started "${started[@]}"; fi
+      return 1
+    fi
+  done
+}
+
+stop_many() {
+  local i rc=0
+  for ((i=$#; i>=1; i--)); do
+    stop_one "${!i}" || rc=1
+  done
+  return "$rc"
+}
+
+status_many() {
+  local svc
+  for svc in "$@"; do status_one "$svc"; done
+}
 
 cmd="${1:-status}"; shift || true
 ensure_layout
+select_services "$@"
 case "$cmd" in
-  start)   expand "$@" | while read -r s; do start_one "$s"; done ;;
-  stop)    expand "$@" | reverse | while read -r s; do stop_one "$s"; done ;;
-  restart) expand "$@" | reverse | while read -r s; do stop_one "$s"; done
-           expand "$@" | while read -r s; do start_one "$s"; done ;;
-  status)  expand "$@" | while read -r s; do status_one "$s"; done ;;
+  start) start_many "${REQUESTED_SERVICES[@]}" ;;
+  stop) stop_many "${REQUESTED_SERVICES[@]}" ;;
+  restart)
+    stop_many "${REQUESTED_SERVICES[@]}"
+    start_many "${REQUESTED_SERVICES[@]}"
+    ;;
+  status) status_many "${REQUESTED_SERVICES[@]}" ;;
   *) die "用法: dbdogctl start|stop|restart|status [服务|all]" ;;
 esac

@@ -86,26 +86,9 @@ EOF
   log "已生成 ${cfg}（默认仅本机访问、default 用户空密码）"
 }
 
-wait_for_databases() {
-  local pgbin="$MODULES_DIR/postgresql/current/bin"
-  local chbin="$MODULES_DIR/clickhouse/current/bin/clickhouse"
-  local i
-
-  for ((i=1; i<=30; i++)); do
-    "$pgbin/pg_isready" -h 127.0.0.1 -d postgres >/dev/null 2>&1 && break
-    sleep 1
-  done
-  [ "$i" -le 30 ] || die "PostgreSQL 30 秒内未就绪，查看 $LOGS_DIR/postgresql.log"
-
-  for ((i=1; i<=30; i++)); do
-    "$chbin" client --host 127.0.0.1 --query "SELECT 1" >/dev/null 2>&1 && break
-    sleep 1
-  done
-  [ "$i" -le 30 ] || die "ClickHouse 30 秒内未就绪，查看 $LOGS_DIR/clickhouse.err.log"
-}
-
 init_databases() {
   local pgbin="$MODULES_DIR/postgresql/current/bin"
+  local ctl_exists
   [ -x "$pgbin/initdb" ] || die "postgresql 模块未安装（先 upgrade.sh postgresql）"
 
   if [ -d "$DATA_DIR/pg" ]; then
@@ -119,17 +102,29 @@ init_databases() {
   fi
   gen_clickhouse_config
 
-  "$DBDOGCTL" start postgresql clickhouse
-  wait_for_databases
-  if "$pgbin/psql" -h 127.0.0.1 -d postgres -Atqc \
-      "SELECT 1 FROM pg_database WHERE datname = 'ctl'" | grep -qx 1; then
-    log "PG 库 ctl 已存在"
-  else
-    "$pgbin/createdb" -h 127.0.0.1 ctl || die "创建 PG 库 ctl 失败"
-    log "已创建 PG 库 ctl"
+  # dbdogctl 对两项服务做稳定 PID + SQL 就绪检查，并在部分启动失败时只回滚
+  # 本次新拉起的服务。两库全部就绪前，不创建任何逻辑数据库。
+  "$DBDOGCTL" start postgresql clickhouse \
+    || die "数据库未全部启动就绪；未继续创建 ctl/obs，请查看 $LOGS_DIR 下数据库日志"
+
+  if ! ctl_exists="$("$pgbin/psql" -h 127.0.0.1 -d postgres -Atqc \
+      "SELECT 1 FROM pg_database WHERE datname = 'ctl'")"; then
+    die "查询 PG 数据库列表失败；未继续初始化逻辑数据库"
   fi
-  "$MODULES_DIR/clickhouse/current/bin/clickhouse" client --host 127.0.0.1 \
-    --query "CREATE DATABASE IF NOT EXISTS obs" && log "已确保 CH 库 obs"
+  case "$ctl_exists" in
+    1) log "PG 库 ctl 已存在" ;;
+    "")
+      "$pgbin/createdb" -h 127.0.0.1 ctl || die "创建 PG 库 ctl 失败"
+      log "已创建 PG 库 ctl"
+      ;;
+    *) die "PG 数据库列表返回了意外结果: $ctl_exists" ;;
+  esac
+
+  if ! "$MODULES_DIR/clickhouse/current/bin/clickhouse" client --host 127.0.0.1 \
+      --query "CREATE DATABASE IF NOT EXISTS obs"; then
+    die "创建 ClickHouse 数据库 obs 失败；可修复后安全重跑初始化"
+  fi
+  log "已确保 CH 库 obs"
 }
 
 run_migrations() {
@@ -145,10 +140,10 @@ case "${1:-}" in
     preflight_host; ensure_layout; init_databases ;;
   --finish)
     preflight_host; ensure_layout
-    "$DBDOGCTL" start postgresql clickhouse
-    wait_for_databases
+    "$DBDOGCTL" start postgresql clickhouse \
+      || die "数据库未全部启动就绪；未执行迁移或启动应用服务"
     run_migrations
-    "$DBDOGCTL" start all
+    "$DBDOGCTL" start all || die "服务未全部启动；本次新启动的服务已回滚"
     echo; "$DBDOGCTL" status all ;;
   "")
     preflight_host; ensure_layout

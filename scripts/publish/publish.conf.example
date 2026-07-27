@@ -15,6 +15,10 @@ TOOL_PATH="/home/z1/dbdog/dev/go/bin:/home/z1/.cargo/bin"
 # dbdog-agent 版本基线（上游 milestone；发布号形如 7.81.1-dbdog.N）
 AGENT_BASE_VERSION="7.81.1"
 
-# 三方件定位（留空则构建机上 command -v 自动探测）
+# PostgreSQL 留空时从构建机 PATH 自动探测 pg_config。
 #PG_PREFIX="/usr/local/pgsql"   # PostgreSQL 安装前缀（bin/lib/share 的父目录）
-#CH_BIN="/usr/local/bin/clickhouse"
+
+# ClickHouse 必须显式配置，不能从构建机 PATH 随机选择当前安装版本。
+# ClickHouse 必须指向已离线审计的原始 aarch64v80compat 自解压缓存；版本和 SHA 由
+# recipe 固定，普通 /usr/local/bin/clickhouse 或 master 更新后的文件会在执行前被拒绝。
+#CH_BIN="/home/z1/cache/clickhouse/clickhouse-26.8.1.184-aarch64v80compat.self-extracting"
