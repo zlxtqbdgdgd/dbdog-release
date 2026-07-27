@@ -221,7 +221,11 @@ if [ -f deploy/.env.example ]; then
 else
   printf '# [首跑校准] dbdog-server 环境变量（PG_DSN、CH_*、DBDOG_*）\n' >"$PKG/etc/dbdog-server.env.example"
 fi
-printf '# [首跑校准] ddsql-server 环境变量（如需）\n' >"$PKG/etc/ddsql-server.env.example"
+cat >"$PKG/etc/ddsql-server.env.example" <<'EOF'
+# storage v3 default org；ddsql 当前按进程 pin 单租户数据面。
+DBDOG_PG_SCHEMA=t_1
+CH_DATABASE=obs_t_1
+EOF
 
 mkdir -p "$PKG/hooks"
 # 最终产物内自带迁移文件清单。artifact SHA 保护下载过程；此清单额外防止安装目录
@@ -257,6 +261,38 @@ set -a; source "$ENVF"; set +a
 "$MODULES_DIR/goose/current/bin/goose" -dir "$HERE/migrations" postgres "$PG_DSN" up
 EOF
 chmod +x "$PKG/hooks/pre-switch.sh"
+cat >"$PKG/hooks/post-switch.sh" <<'EOF'
+#!/usr/bin/env bash
+# 把旧版 DDSQL 的共享面默认值迁移到 storage v3 default org；自定义租户值不覆盖。
+set -euo pipefail
+ENVF="$ETC_DIR/ddsql-server.env"
+[ -e "$ENVF" ] || exit 0
+[ -f "$ENVF" ] && [ ! -L "$ENVF" ] || {
+  echo "[hook] ddsql env 不是普通文件: $ENVF" >&2
+  exit 1
+}
+
+set_exact_default() { # <KEY> <旧默认> <新默认>
+  local key="$1" old="$2" new="$3" value count tmp
+  count="$(awk -v p="$key=" 'index($0,p)==1 {n++} END {print n+0}' "$ENVF")"
+  [ "$count" -le 1 ] || { echo "[hook] $ENVF 含重复键 $key" >&2; exit 1; }
+  value="$(awk -v p="$key=" 'index($0,p)==1 {v=substr($0,length(p)+1); sub(/[[:space:]]+#.*$/, "", v); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v}' "$ENVF")"
+  case "$value" in "" | "$old") ;; *) return 0 ;; esac
+  tmp="$(mktemp "${ENVF}.tmp.XXXXXX")"
+  awk -v p="$key=" -v n="$new" '
+    index($0,p)==1 {print p n; found=1; next}
+    {print}
+    END {if (!found) print p n}
+  ' "$ENVF" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -- "$tmp" "$ENVF"
+}
+
+set_exact_default DBDOG_PG_SCHEMA public t_1
+set_exact_default CH_DATABASE obs obs_t_1
+echo "[hook] DDSQL default org 配置已确保为 t_1 / obs_t_1"
+EOF
+chmod +x "$PKG/hooks/post-switch.sh"
 echo "$VERSION" >"$PKG/VERSION"
 
 ART="$MODULE-$VERSION-$ARCH.tar.gz"

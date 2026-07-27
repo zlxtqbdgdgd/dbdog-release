@@ -281,18 +281,6 @@ upgrade_one() {
   inst="$(installed_version "$m")"
   inst_sha256="$(installed_artifact_sha256 "$m")"
   if current_matches_artifact_identity "$m" "$version" "$sha256"; then
-    if [ "$m" = "dbdog-server" ] && [ -f "$ETC_DIR/ddsql-server.env" ]; then
-      local ddsql_before ddsql_after
-      ddsql_before="$(env_literal_value "$ETC_DIR/ddsql-server.env" DBDOG_PG_SCHEMA)|$(env_literal_value "$ETC_DIR/ddsql-server.env" CH_DATABASE)"
-      configure_default_tenant_ddsql "$ETC_DIR/ddsql-server.env"
-      ddsql_after="$(env_literal_value "$ETC_DIR/ddsql-server.env" DBDOG_PG_SCHEMA)|$(env_literal_value "$ETC_DIR/ddsql-server.env" CH_DATABASE)"
-      if [ "$ddsql_before" != "$ddsql_after" ]; then
-        log "已校准 DDSQL 默认租户配置: ${ddsql_before} → ${ddsql_after}"
-        if "$DBDOGCTL" status ddsql-server | grep -q 运行中; then
-          "$DBDOGCTL" restart ddsql-server
-        fi
-      fi
-    fi
     log "$m 已是 ${version}（artifact ${sha256:0:12}），跳过"
     return 0
   fi
@@ -398,11 +386,6 @@ upgrade_one() {
         warn "已生成配置 ${dst}（mode 0600）—— 请检查并填写"
       fi
     done
-  fi
-
-  # 修复旧发布遗留的 DDSQL public/obs 默认值。专用 env 中的自定义租户值保持不变。
-  if [ "$m" = "dbdog-server" ]; then
-    configure_default_tenant_ddsql "$ETC_DIR/ddsql-server.env"
   fi
 
   # shellcheck disable=SC2086

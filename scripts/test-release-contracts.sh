@@ -78,8 +78,8 @@ DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
 DBDOG_PUBLIC_BASE_URL=
 EOF
 cat >"$ETC_DIR/ddsql-server.env" <<'EOF'
-DBDOG_PG_SCHEMA=public
-CH_DATABASE=obs
+DBDOG_PG_SCHEMA=t_1
+CH_DATABASE=obs_t_1
 EOF
 cat >"$ETC_DIR/dbdog-web.env" <<'EOF'
 DATABASE_URL=postgres://user:pass@127.0.0.1:5432/ctl

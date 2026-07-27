@@ -60,13 +60,11 @@ choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
 
 configure_ready_to_use_stack() {
   local server_env="$ETC_DIR/dbdog-server.env"
-  local ddsql_env="$ETC_DIR/ddsql-server.env"
   local web_env="$ETC_DIR/dbdog-web.env"
   local mcp_env="$ETC_DIR/dbdog-mcp.env"
   local internal_token oauth_secret advertise_host app_url ingest_url mcp_url
 
   configure_local_database_clients
-  configure_default_tenant_ddsql "$ddsql_env"
   internal_token="$(choose_shared_secret DBDOG_INTERNAL_TOKEN "$server_env" "$web_env" "$mcp_env")"
   oauth_secret="$(choose_shared_secret DBDOG_OAUTH_JWT_SECRET "$web_env" "$mcp_env")"
   advertise_host="$(detect_advertise_host)"
@@ -97,7 +95,7 @@ configure_ready_to_use_stack() {
   ensure_env_default "$mcp_env" DBDOG_PUBLIC_MCP_URL "$mcp_url" change-me
   ensure_env_default "$mcp_env" DBDOG_APP_BASE_URL "$app_url" change-me
 
-  log "已生成可直接使用的本机配置（访问地址: ${app_url}；DDSQL 默认租户: t_1/obs_t_1；已有真实配置保持不变）"
+  log "已生成可直接使用的本机配置（访问地址: ${app_url}；已有真实配置保持不变）"
 }
 
 finish_installation() {
