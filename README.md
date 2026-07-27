@@ -8,14 +8,14 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-07-27 06:19（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-07-27 06:51（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 |
 | --- | --- | --- | --- | --- |
 | dbdog-server | first-party | 全家桶机 | 0.1.3 | dbdog-server-0.1.3-aarch64.tar.gz |
 | dbdog-web | first-party | 全家桶机 | 0.1.4 | dbdog-web-0.1.4-aarch64.tar.gz |
 | dbdog-mcp | first-party | 全家桶机 | 0.1.1 | dbdog-mcp-0.1.1-noarch.tar.gz |
-| dbdog-agent | first-party | DB 主机 | 7.81.1-dbdog.1 | dbdog-agent-7.81.1-dbdog.1-aarch64.tar.gz |
+| dbdog-agent | first-party | DB 主机 | 7.81.1-dbdog.2 | dbdog-agent-7.81.1-dbdog.2-aarch64.tar.gz |
 | postgresql | third-party | 全家桶机 | 16.14-dbdog.1 | postgresql-16.14-dbdog.1-aarch64.tar.gz |
 | clickhouse | third-party | 全家桶机 | 26.8.1.184 | clickhouse-26.8.1.184-aarch64.tar.gz |
 | node | third-party | 全家桶机 | 20.18.1 | node-20.18.1-aarch64.tar.gz |
