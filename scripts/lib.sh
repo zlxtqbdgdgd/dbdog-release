@@ -24,6 +24,8 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 ensure_layout() {
   mkdir -p "$MODULES_DIR" "$ETC_DIR" "$DATA_DIR" "$LOGS_DIR" "$RUN_DIR" "$CACHE_DIR"
+  chmod 700 "$ETC_DIR"
+  find "$ETC_DIR" -type f -name '*.env' -exec chmod 600 {} +
 }
 
 # ---- manifest 访问 ----
@@ -61,9 +63,16 @@ download_artifact() { # download_artifact <artifact> <sha256> → stdout 本地�
     log "缓存命中: $artifact" >&2
   else
     log "下载: $BUCKET_URL/$artifact" >&2
-    curl -fL --retry 3 -o "$dest.part" "$BUCKET_URL/$artifact" || die "下载失败: ${artifact}（内网需放行 objects.githubusercontent.com）"
+    rm -f "$dest.part"
+    if ! curl -fL --retry 3 -o "$dest.part" "$BUCKET_URL/$artifact"; then
+      rm -f "$dest.part"
+      die "下载失败: ${artifact}（内网需放行 github.com 与 release-assets.githubusercontent.com）"
+    fi
+    if ! sha256_verify "$dest.part" "$sha"; then
+      rm -f "$dest.part"
+      die "sha256 校验失败: $artifact"
+    fi
     mv "$dest.part" "$dest"
-    sha256_verify "$dest" "$sha" || die "sha256 校验失败: $artifact"
   fi
   printf '%s\n' "$dest"
 }

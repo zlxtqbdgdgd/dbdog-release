@@ -8,16 +8,32 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # 启动顺序即依赖顺序；stop 时倒序。
 SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
 
-pid_of() { local f="$RUN_DIR/$1.pid"; [ -f "$f" ] && cat "$f" 2>/dev/null || true; }
+pid_of() {
+  local svc="$1" f pid=""
+  case "$svc" in
+    postgresql) f="$DATA_DIR/pg/postmaster.pid" ;;
+    *) f="$RUN_DIR/$svc.pid" ;;
+  esac
+  [ -f "$f" ] || return 0
+  IFS= read -r pid <"$f" || true
+  case "$pid" in
+    '' | 0 | *[!0-9]*) return 0 ;;
+  esac
+  printf '%s\n' "$pid"
+}
 is_running() { local pid; pid="$(pid_of "$1")"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
 
 # 通用应用服务：source 对应 env 文件后 nohup 拉起。
 start_app() { # start_app <服务名> <工作目录> <命令...>
   local svc="$1" cwd="$2"; shift 2
-  local envf="$ETC_DIR/$svc.env"
+  local envf="$ETC_DIR/$svc.env" shared_env=""
+  [ "$svc" = "ddsql-server" ] && shared_env="$ETC_DIR/dbdog-server.env"
   [ -f "$envf" ] || warn "$svc: 缺少 ${envf}（将无配置启动）"
   (
-    set -a; [ -f "$envf" ] && source "$envf"; set +a
+    set -a
+    [ -n "$shared_env" ] && [ -f "$shared_env" ] && source "$shared_env"
+    [ -f "$envf" ] && source "$envf"
+    set +a
     cd "$cwd" || exit 1
     nohup "$@" >>"$LOGS_DIR/$svc.log" 2>&1 &
     echo $! >"$RUN_DIR/$svc.pid"

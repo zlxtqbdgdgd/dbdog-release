@@ -22,83 +22,102 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 | goose | third-party | 全家桶机 | 3.27.3 | goose-3.27.3-aarch64.tar.gz |
 <!-- VERSION-TABLE:END -->
 
-内网判断是否要升级：`git pull` 后看上表（或跑 `scripts/check-upgrade.sh`），
-版本号比本机装的新就升。各模块版本独立，只升有变化的。
+## 当前可用范围
 
-## 内网：首次安装（全家桶机）
+- **全家桶机**：产物与安装脚本已齐，等待今天在目标内网完成首次端到端验证。
+- **GaussDB 主机 agent**：aarch64 运行时已发布，但 root cutover、systemd 单元和配置落位流程尚未交付；当前只能下载校验，不能按本仓完成安装。
 
-前提：专用 `dbdog` 账户（无需 root）；能 `git clone` 本仓；
-能下载 `objects.githubusercontent.com`（GitHub 资产下载会 302 到该域名，需代理放行）。
+## 内网首次安装：全家桶机
+
+前提：麒麟 V10 / aarch64、专用 `dbdog` 账户、出网 HTTPS 可达 `github.com` 和
+`release-assets.githubusercontent.com`。当前 stack 压缩产物合计约 280 MiB，此外还需
+模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。
+
+### 1. 拉取并安装到配置阶段
+
+第一阶段会直接用 PG `5432`、CH `8123/9000` 启动本机数据库，当前不支持在初始化前
+改这三个端口；执行前必须确认它们未被占用。server、ddsql、web、MCP 端口可在
+`--finish` 前通过 env 调整。
 
 ```bash
-mkdir -p ~/dbdog && cd ~/dbdog
-git clone https://github.com/zlxtqbdgdgd/dbdog-release release
-cd release
-./scripts/install.sh          # 装基础件+初始化库+装应用件
-vi ~/dbdog/etc/*.env          # 按提示填连接串等配置
-./scripts/install.sh --finish # 跑数据库迁移 + 启动全部服务
-./scripts/dbdogctl status all
+uname -m                             # 必须输出 aarch64
+mkdir -p ~/dbdog
+git clone https://github.com/zlxtqbdgdgd/dbdog-release ~/dbdog/release
+cd ~/dbdog/release
+./scripts/install.sh                 # 下载校验、初始化 PG/CH、生成应用配置
+ls -l ~/dbdog/etc/{dbdog-server,ddsql-server,dbdog-web,dbdog-mcp}.env
 ```
 
-目录布局（`~/dbdog/`）：`release/` 本仓 clone；`modules/<模块>/<版本>/` + `current` 软链；
-`etc/` 配置（升级永不覆盖）；`data/` PG/CH 数据（升级永不碰）；`logs/`、`run/`、`cache/`。
+应用默认端口：server `8080`、ddsql `8770`、web `3000`、MCP `8090`。
 
-## 内网：日常升级
+### 2. 填配置
+
+真实配置在 `~/dbdog/etc/`，模板只用于起步；升级不会覆盖。至少逐项确认：
+
+`install.sh` 以 `dbdog` 用户初始化 PG；首次本机验证可让 server 的 `PG_DSN` 与 web 的
+`DATABASE_URL` 都使用 `postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable`。
+
+- `dbdog-server.env`：`PG_DSN`、ClickHouse 地址/库名、`DBDOG_INTERNAL_TOKEN`。
+- `dbdog-web.env`：`DATABASE_URL`、`DBDOG_SERVER_URL`、与 server 相同的内部 token、
+  `DBDOG_OAUTH_JWT_SECRET`、三个 `PUBLIC_*_URL`；需要改 web 端口时追加 `PORT`。
+- `dbdog-mcp.env`：`DBDOG_BASE_URL`、与 web/server 相同的内部 token、与 web 相同的
+  OAuth JWT，以及实际的 `DBDOG_OAUTH_ISSUER`、`DBDOG_PUBLIC_MCP_URL`、
+  `DBDOG_APP_BASE_URL`；端口变量是 `DBDOG_HTTP_PORT`。
+- `ddsql-server.env`：默认继承 `dbdog-server.env` 中的 PG/CH/metric 配置；这里只写覆盖项。
+
+内部 token/JWT 至少 16 字符；不要保留 `user:pass`、`change-me` 或公网测试机 URL。
+真实 PUBLIC/OAuth URL 取决于内网入口，本仓不能代填。`.env` 会自动收为 `0600`。
+
+### 3. 迁移、启动、验收
 
 ```bash
 cd ~/dbdog/release
-./scripts/check-upgrade.sh --pull   # 拉最新 manifest，看差异（退出码 10=有可升级）
-./scripts/upgrade.sh                # 升级全部有新版的模块（或点名：upgrade.sh dbdog-web）
+./scripts/install.sh --finish
+./scripts/verify.sh
+```
+
+`verify.sh` 会检查配置占位值、实际执行 PG/CH 查询，并等待 server、ddsql、web、MCP
+HTTP 就绪；最后出现 `基础部署验收通过` 才可继续业务场景验证。它不证明 DDSQL 查询、
+鉴权或 agent 链路已经端到端通过。`dbdogctl status all` 只反映进程状态，不等于健康。
+
+失败时先看：
+
+```bash
 ./scripts/dbdogctl status all
+ls -1 ~/dbdog/logs
+tail -n 100 ~/dbdog/logs/dbdog-server.log   # 按失败项换成对应日志
+./scripts/fingerprint.sh --oneline
 ```
 
-升级动作 = 下载校验 → 停服务 → 数据库增量迁移（goose/drizzle 钩子，CH 租户表由
-server 启动时自动推进）→ 切 `current` 软链 → 起服务。
+本仓公开；反馈问题时不要提交内网 IP、主机名、密钥或原始日志。
 
-- **回滚**：`ln -sfn ~/dbdog/modules/<模块>/<模块>-<旧版> ~/dbdog/modules/<模块>/current`
-  后 `dbdogctl restart <服务>`（旧版本目录都保留着）。
-- **逃生门**：升级损坏且无法增量修复时 `./scripts/reset.sh --yes-i-mean-it`
-  ——删库重建，丢失租户/API key/全部监控数据，最后手段。
-
-## 内网：GaussDB 主机装 agent
-
-该主机同样 clone 本仓，然后：
+## 内网日常升级
 
 ```bash
-./scripts/agent-install.sh        # 下载校验运行时 tarball，打印切换步骤（需 DBA 执行）
+cd ~/dbdog/release
+./scripts/check-upgrade.sh --pull   # 0=无已装模块需升级，10=存在版本不同的已装模块
+./scripts/upgrade.sh                # 只升级已安装且版本与 manifest 不同的模块
+./scripts/verify.sh
 ```
 
-agent 产物是 omnibus 运行时 tarball（非 rpm，自制 rpm 与官方包冲突被 fork 明确禁止），
-用 cutover 脚本原子切换到 /opt/dbdog-agent。切换涉及 systemd，是全流程唯一需要 root 的环节。
+缺失模块不会被无参数升级自动安装；需要显式执行，例如
+`./scripts/upgrade.sh dbdog-web`。升级保留有效下载缓存与旧模块目录，但数据库迁移只向前；
+不要把切软链当成完整数据库回滚。破坏性 `./scripts/reset.sh --yes-i-mean-it` 会删掉 PG/CH 全部数据，
+只能作为最后手段。
 
-## 服务管理（无 root，纯脚本）
+服务管理：`./scripts/dbdogctl start|stop|restart|status [服务|all]`。机器重启后当前仍需
+手动执行 `./scripts/dbdogctl start all`。
+
+## GaussDB 主机 agent
 
 ```bash
-./scripts/dbdogctl start|stop|restart|status [服务|all]
-# 服务：postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp
+cd ~/dbdog/release
+./scripts/agent-install.sh
 ```
 
-机器重启后需手动 `dbdogctl start all`（可自行加 crontab `@reboot`）。
-
-## Skill（可选，配合 agent CLI）
-
-内外网通用：在本仓目录里启动 Claude Code（或兼容 agent CLI），
-`.claude/skills/` 下的 skill 自动可用，无需安装：
-
-| skill | 用在哪 | 说什么触发 |
-| --- | --- | --- |
-| `publish` | 公网开发机 | "发布"、"发个版" |
-| `upgrade` | 内网全家桶机 | "升级"、"检查更新" |
-| `issue-card` | 内网 | "记个问题"、"生成问题卡片" |
-
-skill 只是薄壳，核心永远是 `scripts/` 里的纯 bash——没有模型也照跑。
-
-## 问题反馈
-
-内网发现问题 → 用 `issue-card` skill（或手动照模板）生成一页式问题卡片 →
-拍照带出 → 在本仓建 issue 贴上。
-**本仓公开**：卡片/issue 不得包含内网 IP、主机名、账号、密钥、原始日志。
-环境指纹用 `./scripts/fingerprint.sh --oneline` 生成。
+该命令目前只下载并校验 manifest 中的 omnibus tarball，随后会明确报错退出；它不会安装
+agent。不要手工覆盖官方 `/opt/datadog-agent`。待版本化 cutover、systemd、配置与回滚验收
+流程一并交付后，再开放内网安装。
 
 ## 公网：发布（维护者）
 
@@ -110,19 +129,8 @@ cp scripts/publish/publish.conf.example scripts/publish/publish.conf  # 首次�
 ./scripts/publish/publish.sh prune               # 核对非 manifest 当前产物（--yes 执行清理）
 ```
 
-构建在专职 arm 编译机上进行（麒麟 V10 / 鲲鹏 aarch64，与内网同构，ssh 驱动），
-产物只出 aarch64（纯 JS 模块为 noarch）。三方件（postgresql/clickhouse/node/goose）
-在编译机环境变化后点名发布一次即可。
+构建在麒麟 V10 / aarch64 专职机完成。开发阶段每模块只保留 manifest 当前产物；发布脚本
+先推 main，再删除该模块旧资产。发布必须串行，清理会校验远端 HEAD、文件名与 SHA-256。
 
-开发阶段每个模块只在产物桶保留 manifest 当前引用的版本。发布脚本先提交并推送
-manifest/README，再自动删除该模块的旧资产；部署端比较 manifest 版本，变化时只重新
-下载并部署对应模块。
-发布操作必须串行；清理前脚本会确认本地 manifest 已提交且 origin/main 未发生变化。
-
-## 待验证清单（内网 ready 后逐项打钩）
-
-- [ ] 内网可下载 `objects.githubusercontent.com`（产物桶资产直链）
-- [ ] agent 的 omnibus aarch64 运行时构建：需临时将编译机扩容到 ≥8c/16GB/50G 盘跑一次
-      （当前 2GB 机不可行），随后 `scripts/publish/recipes/dbdog-agent.sh` 转正（结论已写在该文件头）
-- [ ] dbdog-server 的 `migrations/clickhouse*/` 是否有 blueprint 覆盖不到、需手动执行的 CH DDL
-- [ ] 各 `.env` 模板在内网首装时逐个校准（配方里标了 [首跑校准]）
+设计说明见 [ADR 0001](docs/adr/0001-single-bucket-release-via-main.md)，术语见
+[CONTEXT.md](CONTEXT.md)。
