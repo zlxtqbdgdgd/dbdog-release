@@ -34,6 +34,20 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。ClickHouse 首次探测会
 从约 154 MiB 自解压为约 708 MiB，模块目录应至少额外留出 1 GiB。
 
+若内网 HTTPS 代理使用自签根 CA，优先取得运维提供的 PEM CA 文件，让下载脚本继续严格
+校验证书和主机名：
+
+```bash
+export CURL_CA_BUNDLE=/path/to/internal-proxy-ca.pem
+./scripts/install.sh
+```
+
+仅在无法及时取得 CA、且已通过可信渠道确认下载地址时，才可单次使用
+`CURL_INSECURE=1 ./scripts/install.sh` 临时排障。只有精确值 `1` 会传给 curl 的
+`--insecure`；未设置或设为 `0` 均保持严格 TLS，其他值会直接报错。该模式会关闭证书和
+主机名校验，产物 SHA-256 只能发现内容变化，不能证明下载来源，因此不要写入 `.bashrc`
+或长期启用。
+
 ### 1. 拉取并安装到配置阶段
 
 第一阶段会直接用 PG `5432`、CH `8123/9000` 启动本机数据库，当前不支持在初始化前

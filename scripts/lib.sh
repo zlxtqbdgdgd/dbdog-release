@@ -133,13 +133,30 @@ sha256_verify() { # sha256_verify <文件> <期望值>（mac 无 sha256sum，用
 
 download_artifact() { # download_artifact <artifact> <sha256> → stdout 本地路径
   local artifact="$1" sha="$2" dest="$CACHE_DIR/$1"
+  local curl_insecure="${CURL_INSECURE:-0}"
+  # 数组保持非空，兼容 macOS Bash 3.2 在 set -u 下展开空数组会报错的行为。
+  local -a curl_args=(-fL --retry 3)
+  case "$curl_insecure" in
+    "" | 0) ;;
+    1) ;;
+    *) die "CURL_INSECURE 只能为 0 或 1，当前值: $curl_insecure" ;;
+  esac
   mkdir -p "$CACHE_DIR"
   if [ -f "$dest" ] && sha256_verify "$dest" "$sha"; then
     log "缓存命中: $artifact" >&2
   else
+    if [ -n "${CURL_CA_BUNDLE:-}" ]; then
+      [ -f "$CURL_CA_BUNDLE" ] && [ -r "$CURL_CA_BUNDLE" ] \
+        || die "CURL_CA_BUNDLE 不是可读文件: $CURL_CA_BUNDLE"
+      curl_args+=(--cacert "$CURL_CA_BUNDLE")
+    fi
+    if [ "$curl_insecure" = 1 ]; then
+      warn "危险：CURL_INSECURE=1，HTTPS 证书与主机名校验已关闭；仅限临时排障，SHA-256 不能验证下载来源"
+      curl_args+=(--insecure)
+    fi
     log "下载: $BUCKET_URL/$artifact" >&2
     rm -f "$dest.part"
-    if ! curl -fL --retry 3 -o "$dest.part" "$BUCKET_URL/$artifact"; then
+    if ! curl "${curl_args[@]}" -o "$dest.part" "$BUCKET_URL/$artifact"; then
       rm -f "$dest.part"
       die "下载失败: ${artifact}（内网需放行 github.com 与 release-assets.githubusercontent.com）"
     fi

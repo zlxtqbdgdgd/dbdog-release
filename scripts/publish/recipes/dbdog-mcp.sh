@@ -25,6 +25,17 @@ npx --yes esbuild src/index.ts --bundle --minify --platform=node --format=esm \
   "--banner:js=import{createRequire}from'node:module';const require=createRequire(import.meta.url);" \
   --outfile="$PKG/index.js" >&2
 
+# index.js 是 ESM；Node 20 对没有 package scope 的 .js 默认按 CommonJS 加载。
+# 只发布运行所需的最小元数据，避免把源码仓的构建脚本/依赖清单一并带入产物。
+cat >"$PKG/package.json" <<EOF
+{
+  "name": "dbdog-mcp",
+  "version": "$VERSION",
+  "private": true,
+  "type": "module"
+}
+EOF
+
 mkdir -p "$PKG/etc"
 cat >"$PKG/etc/dbdog-mcp.env.example" <<'EOF'
 # [首跑校准] dbdog-mcp 环境变量（对照源仓 README 补齐）
@@ -34,6 +45,43 @@ echo "$VERSION" >"$PKG/VERSION"
 
 # 纯 JS 单文件 bundle，不含原生模块——产物不分架构
 ART="$MODULE-$VERSION-noarch.tar.gz"
-tar -czf "$WORK/out/$ART" -C "$WORK/pkg" "$MODULE-$VERSION"
-log "打包完成 $ART ($(du -h "$WORK/out/$ART" | cut -f1))"
-printf '%s\t%s\n' "$VERSION" "$WORK/out/$ART"
+ART_PATH="$WORK/out/$ART"
+tar -czf "$ART_PATH" -C "$WORK/pkg" "$MODULE-$VERSION"
+
+# 校验最终 tar（而非只校验打包前目录）：元数据必须把 index.js 明确定义为 ESM，
+# 且实际入口必须能启动。用随机端口避免和构建机上已有服务冲突。
+VERIFY_DIR="$WORK/verify"
+rm -rf "$VERIFY_DIR"
+mkdir -p "$VERIFY_DIR"
+tar -xzf "$ART_PATH" -C "$VERIFY_DIR"
+VERIFY_PKG="$VERIFY_DIR/$MODULE-$VERSION"
+node --input-type=commonjs -e '
+  const fs = require("node:fs");
+  const [path, version] = process.argv.slice(1);
+  const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+  if (pkg.name !== "dbdog-mcp" || pkg.version !== version || pkg.type !== "module") process.exit(1);
+' "$VERIFY_PKG/package.json" "$VERSION" \
+  || die "产物 package.json 缺少正确的 dbdog-mcp ESM 元数据"
+
+SMOKE_LOG="$WORK/mcp-smoke.log"
+env DBDOG_HTTP_HOST=127.0.0.1 DBDOG_HTTP_PORT=0 \
+  node "$VERIFY_PKG/index.js" >"$SMOKE_LOG" 2>&1 &
+SMOKE_PID=$!
+SMOKE_STARTED=0
+for _ in {1..50}; do
+  if grep -Fq '[dbdog-mcp] streamable-http' "$SMOKE_LOG"; then
+    SMOKE_STARTED=1
+    break
+  fi
+  kill -0 "$SMOKE_PID" 2>/dev/null || break
+  sleep 0.1
+done
+kill "$SMOKE_PID" 2>/dev/null || true
+wait "$SMOKE_PID" 2>/dev/null || true
+if [ "$SMOKE_STARTED" -ne 1 ]; then
+  cat "$SMOKE_LOG" >&2
+  die "产物 ESM 入口启动校验失败"
+fi
+
+log "打包完成 $ART ($(du -h "$ART_PATH" | cut -f1))"
+printf '%s\t%s\n' "$VERSION" "$ART_PATH"
