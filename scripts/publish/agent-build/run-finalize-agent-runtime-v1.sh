@@ -15,7 +15,7 @@ unset BASH_ENV CDPATH ENV GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
 
 readonly EXPECTED_SELF=/home/dbdog/cache/dbdog-agent/controls/run-finalize-agent-runtime-v1.sh
 readonly FINALIZER=/home/dbdog/cache/dbdog-agent/controls/finalize-agent-runtime-v1.sh
-readonly FINALIZER_SHA256=5f0e666753426540c5767e96eeadd8b83c51db461fbb73dfa1c00867e4d2e400
+readonly FINALIZER_SHA256=41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07
 readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
 readonly INSTALL_DIR=/opt/dbdog-agent
 readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2/out

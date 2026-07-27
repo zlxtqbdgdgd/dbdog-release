@@ -899,7 +899,8 @@ collect_agent_version_evidence() {
   local agent_binary="$root/bin/agent/agent"
   local manifest_text="$root/version-manifest.txt"
   local manifest_json="$root/version-manifest.json"
-  local version_output compiled_version manifest_header_version manifest_component_version manifest_json_version
+  local version_output compiled_version expected_version_prefix
+  local manifest_header_version manifest_component_version manifest_json_version
   local binary_sha256 version_output_sha256 manifest_text_sha256 manifest_json_sha256
 
   [[ -f $agent_binary && ! -L $agent_binary && -x $agent_binary ]] ||
@@ -933,8 +934,9 @@ collect_agent_version_evidence() {
   compiled_version=${compiled_version%% *}
   [[ $compiled_version == "$expected" ]] ||
     die "compiled Agent version is $compiled_version, expected release VERSION $expected"
+  expected_version_prefix="Agent $expected - Commit: ${agent_sha:0:10} - Serialization version: "
   case "$version_output" in
-    "Agent $expected - Meta: "*) ;;
+    "$expected_version_prefix"*' - Go version: go'*) ;;
     *) die "compiled Agent version output does not bind the exact release VERSION: $version_output" ;;
   esac
 

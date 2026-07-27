@@ -55,6 +55,10 @@ pass "post-Omnibus wheel replacement is offline, exact, and pure Python"
 
 grep -Fq 'compiled Agent version is $compiled_version, expected release VERSION $expected' "$FINALIZER" ||
   fail "finalizer lacks the compiled Agent VERSION fail-closed gate"
+grep -Fq 'expected_version_prefix="Agent $expected - Commit: ${agent_sha:0:10} - Serialization version: "' \
+  "$FINALIZER" || fail "finalizer does not match the real Agent version output and pinned source commit"
+grep -Fq '"$expected_version_prefix"*'"' - Go version: go'"'*' "$FINALIZER" ||
+  fail "finalizer does not require the complete compiled Agent version output shape"
 grep -Fq 'version-manifest.txt agent header is $manifest_header_version, expected $expected' "$FINALIZER" ||
   fail "finalizer lacks the version-manifest header gate"
 grep -Fq 'version-manifest.txt datadog-agent component is $manifest_component_version, expected $expected' \

@@ -187,10 +187,10 @@ a9a043a7975a7b4b1f43de46cdcaca292adc51799aa281cb9b47a276134871b7  patchelf-0.18.
 4d49826b6fcfdd770c1c5e36182d4f5dc103e333a420a71e8d6d04ea867147d7  patchelf-0.18.0-aarch64-kylin10-v2/SHA256SUMS
 01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf  external tools/patchelf/0.18.0-aarch64-kylin10-v2/bin/patchelf
 06fd5eea7acd51a0ebf519be58a2700f1ca4142a13b0668cb7f5e66ef022f7f6  external sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
-5f0e666753426540c5767e96eeadd8b83c51db461fbb73dfa1c00867e4d2e400  finalize-agent-runtime-v1.sh
-2a59314b66e295e00bb13c7409b445f7c795c74f7d4eccab8bae3811424f58df  run-finalize-agent-runtime-v1.sh
+41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07  finalize-agent-runtime-v1.sh
+4abdafe78d8394f30f7f26abaeafc2a0f716b2e5f5494c9cafe909b8e7d7d905  run-finalize-agent-runtime-v1.sh
 ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3  seal-agent-build-dependencies-v1.sh
-94440a6382cc629897f87cf957d4928fa9916ea1e0bfd5ed787bb62c34c48860  ../recipes/dbdog-agent.sh
+885826b30f303dbe5e3619bf794340c3c5d4b3134d4813044e29768da1f1e7c5  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical overlays

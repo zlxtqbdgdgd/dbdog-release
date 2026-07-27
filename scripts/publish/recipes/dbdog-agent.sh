@@ -85,9 +85,9 @@ readonly SEAL_DIR="$CACHE_ROOT/seals/${MANIFEST_REL##*/}/omnibus-cache-v2"
 # all-zero placeholder while preparing a new control generation.
 readonly TRACKED_SEAL_CONTROL_SHA256=ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3
 readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
-readonly FINALIZER_SHA256=5f0e666753426540c5767e96eeadd8b83c51db461fbb73dfa1c00867e4d2e400
+readonly FINALIZER_SHA256=41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07
 readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"
-readonly FINALIZER_WRAPPER_SHA256=2a59314b66e295e00bb13c7409b445f7c795c74f7d4eccab8bae3811424f58df
+readonly FINALIZER_WRAPPER_SHA256=4abdafe78d8394f30f7f26abaeafc2a0f716b2e5f5494c9cafe909b8e7d7d905
 readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
 readonly GAUSSDB_INTEGRATION_VERSION=1.0.0
 readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
