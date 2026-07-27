@@ -24,11 +24,12 @@ dbdog-release 作为唯一分发通道；内网问题以 issue 回流公网修�
 ## 决策
 
 1. **单产物桶**：dbdog-release 上只建一个固定 GitHub Release（tag `artifacts`），
-   充当纯文件桶。所有模块所有版本的产物都上传到它，文件名自带模块名、版本、
+   充当纯文件桶。每个模块只保留 manifest 当前版本的产物，文件名自带模块名、版本、
    架构（如 `dbdog-web-0.4.2-aarch64.tar.gz`）。不按发布打 tag。
 2. **main 即发布**：一次发布 = 构建变更模块 → 产物入桶 → 向 main 提交一次
-   manifest.tsv + README 版本表更新。发布历史即 manifest 的 git log；回滚 =
-   按历史 manifest 安装旧版（旧文件仍在桶里）。
+   manifest.tsv + README 版本表更新。发布历史即 manifest 的 git log；main push
+   成功后，发布脚本删除该模块不再被 manifest 引用的旧产物。需要回退时按历史提交
+   重新构建并发布，而不是长期保留旧二进制。
 3. **生产同构机构建**：所有 aarch64 产物在与内网同构的专职编译机
    （麒麟 V10 / aarch64）上构建（ssh 驱动），不用 GitHub Actions。三方件
    （Node/goose/PG/CH）也在这台机器上安装/编译并验证"实际能跑"后打包，
@@ -42,8 +43,8 @@ dbdog-release 作为唯一分发通道；内网问题以 issue 回流公网修�
 
 - 内网升级只需 `git pull` +（按 manifest）curl 下载若干文件，无需理解 tag/Release 语义。
 - 变更检测 = 各源仓 HEAD 对比 manifest 记录的 source_sha，源仓零侵入。
-- 产物桶会累积历史版本，发布脚本提供 prune（每模块保留最近 3 版，且永不删
-  当前 manifest 引用的文件）。
+- 开发阶段产物桶每模块只保留 manifest 当前引用；部署端发现版本变化时只重新拉取
+  对应模块。发布后会自动清理，也可用 prune 先试运行再手工清理孤儿资产。
 - Releases 页面没有"发布时间线"可看——接受，人和脚本都只看 manifest/README。
 - 构建可重现性弱于 CI（依赖那台机器的环境）——现阶段接受，构建配方全部
   脚本化在 scripts/publish/recipes/，迁移到任何同构机只需装同样工具链。

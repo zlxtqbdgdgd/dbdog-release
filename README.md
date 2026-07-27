@@ -103,16 +103,21 @@ skill 只是薄壳，核心永远是 `scripts/` 里的纯 bash——没有模型
 ## 公网：发布（维护者）
 
 ```bash
-cd scripts/publish && cp publish.conf.example publish.conf  # 首次：填 BUILD_HOST 等
+cp scripts/publish/publish.conf.example scripts/publish/publish.conf  # 首次：填 BUILD_HOST 等
 ./scripts/publish/publish.sh plan                # 看哪些模块有变更
 ./scripts/publish/publish.sh publish             # 发布全部变更模块（patch）
 ./scripts/publish/publish.sh publish dbdog-web --bump minor   # 点名+指定级别
-./scripts/publish/publish.sh prune --keep 3      # 清理桶内旧产物（试运行，--yes 执行）
+./scripts/publish/publish.sh prune               # 核对非 manifest 当前产物（--yes 执行清理）
 ```
 
 构建在专职 arm 编译机上进行（麒麟 V10 / 鲲鹏 aarch64，与内网同构，ssh 驱动），
 产物只出 aarch64（纯 JS 模块为 noarch）。三方件（postgresql/clickhouse/node/goose）
 在编译机环境变化后点名发布一次即可。
+
+开发阶段每个模块只在产物桶保留 manifest 当前引用的版本。发布脚本先提交并推送
+manifest/README，再自动删除该模块的旧资产；部署端比较 manifest 版本，变化时只重新
+下载并部署对应模块。
+发布操作必须串行；清理前脚本会确认本地 manifest 已提交且 origin/main 未发生变化。
 
 ## 待验证清单（内网 ready 后逐项打钩）
 

@@ -4,7 +4,7 @@
 #   publish.sh publish [模块...] [--bump patch|minor|major] [--yes]
 #                                        # 默认发布所有有变更的一方模块；三方件需点名
 #   publish.sh regen-readme              # 按 manifest 重新生成 README 版本表
-#   publish.sh prune [--keep 3] [--yes]  # 清理桶内旧版产物（永不删 manifest 当前引用）
+#   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
 
@@ -159,6 +159,84 @@ cmd_plan() {
   echo "发布: publish.sh publish [模块...] [--bump patch|minor|major]"
 }
 
+assert_manifest_is_origin_main() {
+  local local_head remote_head
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv \
+    || die "manifest.tsv 有未提交变更，拒绝删除产物"
+  local_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  remote_head="$(git -C "$RELEASE_DIR" ls-remote origin refs/heads/main | awk 'NR==1 {print $1}')" \
+    || die "读取 origin/main 失败，拒绝删除产物"
+  [ -n "$remote_head" ] && [ "$remote_head" = "$local_head" ] \
+    || die "origin/main 已变化或不可确认，拒绝按本地 manifest 删除产物"
+}
+
+prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，再删非当前资产
+  local execute="$1"; shift
+  local asset_rows assets protected m current expected remote_digest f
+  local modules=("$@") victims=""
+
+  if [ ${#modules[@]} -eq 0 ]; then
+    while IFS= read -r m; do modules+=("$m"); done < <(manifest_modules)
+  fi
+
+  [ "$execute" -eq 1 ] && assert_manifest_is_origin_main
+
+  asset_rows="$(gh release view "$BUCKET_TAG" -R "$REPO" --json assets \
+    --jq '.assets[] | [.name, (.digest // "")] | @tsv')" \
+    || die "读取产物桶失败"
+  assets="$(printf '%s\n' "$asset_rows" | cut -f1)"
+  protected="$(manifest_rows | cut -f6)"
+
+  # 删除任何文件前，先保证当前资产的模块归属、存在性和内容都正确。
+  for m in "${modules[@]}"; do
+    current="$(manifest_get "$m" 6)"
+    case "$current" in
+      "$m"-[0-9]*) ;;
+      *) die "[$m] manifest 当前资产名不属于该模块，拒绝清理: $current" ;;
+    esac
+    printf '%s\n' "$assets" | grep -Fqx -- "$current" \
+      || die "[$m] manifest 当前资产不在产物桶，拒绝清理: $current"
+    expected="$(manifest_get "$m" 7)"
+    remote_digest="$(printf '%s\n' "$asset_rows" | awk -F'\t' -v a="$current" \
+      '$1==a { sub(/^sha256:/, "", $2); print $2; exit }')"
+    [ -n "$remote_digest" ] && [ "$remote_digest" = "$expected" ] \
+      || die "[$m] 产物桶 SHA-256 与 manifest 不一致，拒绝清理: $current"
+  done
+
+  for m in "${modules[@]}"; do
+    current="$(manifest_get "$m" 6)"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      case "$f" in
+        "$m"-[0-9]*)
+          [ "$f" = "$current" ] && continue
+          # 即使未来模块名前缀发生重叠，也绝不删除任一 manifest 当前引用。
+          printf '%s\n' "$protected" | grep -Fqx -- "$f" && continue
+          if [ -n "$victims" ] && printf '%s\n' "$victims" | grep -Fqx -- "$f"; then
+            continue
+          fi
+          victims="${victims}${victims:+$'\n'}$f"
+          ;;
+      esac
+    done < <(printf '%s\n' "$assets")
+  done
+
+  [ -n "$victims" ] || { log "无可清理产物（每模块仅保留 manifest 当前引用）"; return 0; }
+  echo "将删除（manifest 未引用）:"
+  while IFS= read -r f; do echo "  $f"; done <<<"$victims"
+  if [ "$execute" -eq 1 ]; then
+    while IFS= read -r f; do
+      # 缩小并发发布窗口；检测到 main 漂移时宁可留下旧文件。
+      assert_manifest_is_origin_main
+      gh release delete-asset "$BUCKET_TAG" "$f" -y -R "$REPO" \
+        || die "删除旧产物失败: $f"
+    done <<<"$victims"
+    log "清理完成"
+  else
+    log "试运行结束（加 --yes 执行删除）"
+  fi
+}
+
 cmd_publish() {
   local bump="patch" yes=0 mods=()
   while [ $# -gt 0 ]; do
@@ -204,38 +282,20 @@ cmd_publish() {
   git -C "$RELEASE_DIR" add manifest.tsv README.md
   git -C "$RELEASE_DIR" commit -m "publish:$summary"
   git -C "$RELEASE_DIR" push origin main
+  # main/manifest 成为权威后再清理；push 失败时绝不提前删除旧资产。
+  prune_modules_to_manifest 1 "${mods[@]}"
   log "发布完成:$summary"
 }
 
 cmd_prune() {
-  local keep=3 yes=0
+  local yes=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --keep) keep="$2"; shift 2 ;;
       --yes) yes=1; shift ;;
       *) die "prune 不认识参数: $1" ;;
     esac
   done
-  local assets protected
-  assets="$(gh release view "$BUCKET_TAG" -R "$REPO" --json assets --jq '.assets[].name')" || die "读取产物桶失败"
-  protected="$(manifest_rows | cut -f6)"
-  local victims=""
-  for m in $(manifest_modules); do
-    local old
-    old="$(printf '%s\n' "$assets" | grep "^$m-" | sort -V | head -n -"$keep" || true)"
-    for f in $old; do
-      printf '%s\n' "$protected" | grep -qx "$f" && continue  # manifest 引用的永不删
-      victims="$victims $f"
-    done
-  done
-  [ -n "$victims" ] || { log "无可清理产物（每模块保留 $keep 版）"; return 0; }
-  echo "将删除:"; for f in $victims; do echo "  $f"; done
-  if [ "$yes" -eq 1 ]; then
-    for f in $victims; do gh release delete-asset "$BUCKET_TAG" "$f" -y -R "$REPO"; done
-    log "清理完成"
-  else
-    log "试运行结束（加 --yes 执行删除）"
-  fi
+  prune_modules_to_manifest "$yes"
 }
 
 case "${1:-plan}" in

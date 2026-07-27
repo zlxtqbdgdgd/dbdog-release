@@ -23,7 +23,7 @@ _Avoid_: 依赖（易与代码库依赖混淆）
 _Avoid_: 部署、上线
 
 **产物桶（Artifact bucket）**：
-dbdog-release 上唯一固定的 GitHub Release，存放所有模块所有版本的产物文件；文件名自带模块名、版本与架构。不承载版本语义——版本语义只在 manifest。
+dbdog-release 上唯一固定的 GitHub Release，每个模块只保留 manifest 当前版本的产物文件；文件名自带模块名、版本与架构。不承载版本语义——版本语义只在 manifest。
 
 **升级（Upgrade）**：
 内网侧动作：逐模块对比 manifest 版本与本地已装版本，只安装有新版本的模块。
