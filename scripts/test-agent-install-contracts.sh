@@ -139,10 +139,15 @@ grep -Fq 'CREATE OR REPLACE VIEW dbdog.statements' \
   "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB query metrics 兼容视图"
 grep -Fq 'CREATE OR REPLACE VIEW dbdog.activity' \
   "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB activity 兼容视图"
-if [ -f "$RELEASE_DIR/scratch/dbdog-agent-7.81.1-dbdog.1-aarch64.tar.gz" ]; then
-  tar -tzf "$RELEASE_DIR/scratch/dbdog-agent-7.81.1-dbdog.1-aarch64.tar.gz" \
+CURRENT_AGENT_ARTIFACT="$(manifest_get dbdog-agent 6)"
+CURRENT_AGENT_VERSION="$(manifest_get dbdog-agent 5)"
+if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then
+  tar -tzf "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" \
     | grep -Eq '^\./(embedded/)?bin/(gsql|gaussdb)$' && \
     fail "Agent 产物错误打包了目标 GaussDB 的 gsql/gaussdb"
+  tar -xOf "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ./provenance/build.txt \
+    | grep -Fqx "version=$CURRENT_AGENT_VERSION" || \
+    fail "Agent 当前产物 provenance 版本与 manifest 不一致"
 fi
 pass "安装器要求预编译 GaussDB integration + psycopg/libpq，运行期不走 gsql 短连接"
 
