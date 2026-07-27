@@ -64,6 +64,8 @@ for p in drizzle-orm postgres; do
   [ -d "node_modules/$p" ] || die "缺 node_modules/$p"
   rm -rf "$PKG/node_modules/$p"; cp -a "node_modules/$p" "$PKG/node_modules/$p"
 done
+[ -f "$PKG/node_modules/@node-rs/argon2/index.js" ] \
+  || die "standalone 输出缺 @node-rs/argon2，无法初始化管理员"
 # 删 map 必须放在 node_modules 补齐之后（否则三方包又把 map 带回来）
 find "$PKG" -name '*.map' -delete
 
@@ -92,6 +94,57 @@ await migrate(drizzle(client), { migrationsFolder: new URL("../drizzle", import.
 await client.end();
 console.log("[hook] drizzle 迁移完成");
 EOF
+cat >"$PKG/hooks/bootstrap-admin.mjs" <<'EOF'
+// 仅在指定邮箱尚不存在时创建首个管理员；升级重跑不会改密码或提权既有用户。
+import { randomBytes } from "node:crypto";
+import { hash } from "@node-rs/argon2";
+import postgres from "postgres";
+
+const url = process.env.DATABASE_URL;
+if (!url) throw new Error("DATABASE_URL 未设置");
+const email = (process.env.SEED_EMAIL || "admin@dbdog.local").trim().toLowerCase();
+const password = `${randomBytes(18).toString("base64url")}aA1!`;
+const passwordHash = await hash(password, {
+  memoryCost: 65536,
+  timeCost: 3,
+  parallelism: 4,
+});
+const sql = postgres(url, { max: 1 });
+try {
+  const result = await sql.begin(async (tx) => {
+    const [org] = await tx`SELECT id FROM orgs WHERE public_id = 'default' LIMIT 1`;
+    if (!org) throw new Error("default org 不存在；drizzle 迁移可能未完成");
+    let [user] = await tx`SELECT id, role FROM users WHERE lower(email) = ${email} LIMIT 1`;
+    let created = false;
+    if (!user) {
+      [user] = await tx`
+        INSERT INTO users (email, name, role, password_hash)
+        VALUES (${email}, 'Admin', 'admin', ${passwordHash})
+        ON CONFLICT (email) DO NOTHING
+        RETURNING id, role
+      `;
+      if (!user) [user] = await tx`SELECT id, role FROM users WHERE lower(email) = ${email} LIMIT 1`;
+      else created = true;
+    }
+    if (!user) throw new Error(`无法读取或创建管理员 ${email}`);
+    await tx`
+      INSERT INTO org_members (org_id, user_id, role)
+      VALUES (${org.id}, ${user.id}, ${user.role === "admin" ? "admin" : "member"})
+      ON CONFLICT (org_id, user_id) DO NOTHING
+    `;
+    return created;
+  });
+  if (result) {
+    console.log("[hook] 首个管理员已创建（请立即保存；密码只显示本次）：");
+    console.log(`[hook]   邮箱: ${email}`);
+    console.log(`[hook]   密码: ${password}`);
+  } else {
+    console.log(`[hook] 管理员初始化已存在: ${email}（未修改密码）`);
+  }
+} finally {
+  await sql.end();
+}
+EOF
 cat >"$PKG/hooks/pre-switch.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -99,7 +152,9 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENVF="$ETC_DIR/dbdog-web.env"
 [ -f "$ENVF" ] || { echo "[hook] 无 ${ENVF}，跳过 drizzle 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
 set -a; source "$ENVF"; set +a
-cd "$HERE" && "$MODULES_DIR/node/current/bin/node" hooks/migrate.mjs
+cd "$HERE"
+"$MODULES_DIR/node/current/bin/node" hooks/migrate.mjs
+"$MODULES_DIR/node/current/bin/node" hooks/bootstrap-admin.mjs
 EOF
 chmod +x "$PKG/hooks/pre-switch.sh"
 echo "$VERSION" >"$PKG/VERSION"
