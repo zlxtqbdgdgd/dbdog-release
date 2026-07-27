@@ -58,20 +58,6 @@ choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
   printf '%s\n' "$chosen"
 }
 
-detect_advertise_host() {
-  local host="${DBDOG_ADVERTISE_HOST:-}"
-  if [ -z "$host" ] && command -v ip >/dev/null 2>&1; then
-    host="$(ip -4 route get 1.1.1.1 2>/dev/null \
-      | awk '{ for (i=1; i<=NF; i++) if ($i=="src") { print $(i+1); exit } }')"
-  fi
-  if [ -z "$host" ] && command -v hostname >/dev/null 2>&1; then
-    host="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
-  fi
-  [ -n "$host" ] || host="127.0.0.1"
-  case "$host" in *[!A-Za-z0-9._-]* | "") die "无法把 DBDOG_ADVERTISE_HOST 用作 URL host: $host" ;; esac
-  printf '%s\n' "$host"
-}
-
 configure_ready_to_use_stack() {
   local server_env="$ETC_DIR/dbdog-server.env"
   local web_env="$ETC_DIR/dbdog-web.env"

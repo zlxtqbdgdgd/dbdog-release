@@ -110,4 +110,19 @@ grep -Fqx 'DBDOG_PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$ETC_DIR/dbdog-
   || fail "web/MCP OAuth secret 不一致"
 pass "一键安装自动生成一致的 server/web/MCP 可用配置"
 
-printf 'ALL PASS: 6 release contract tests\n'
+legacy_web_env="$TEST_ROOT/legacy-web.env"
+cat >"$legacy_web_env" <<'EOF'
+PUBLIC_APP_URL=http://legacy.example:25629
+PUBLIC_INGEST_URL=http://legacy.example:21753
+PUBLIC_MCP_URL=http://legacy.example:24267/mcp
+EOF
+DBDOG_ADVERTISE_HOST=dbdog.internal migrate_legacy_web_public_urls "$legacy_web_env" >/dev/null
+grep -Fqx 'PUBLIC_APP_URL=http://dbdog.internal:3000' "$legacy_web_env" \
+  || fail "旧 Web PUBLIC_APP_URL 未自动迁移"
+grep -Fqx 'PUBLIC_INGEST_URL=http://dbdog.internal:8080' "$legacy_web_env" \
+  || fail "旧 Web PUBLIC_INGEST_URL 未自动迁移"
+grep -Fqx 'PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$legacy_web_env" \
+  || fail "旧 Web PUBLIC_MCP_URL 未自动迁移"
+pass "正常 Web 升级自动迁移旧验收模板 URL，且无需记录旧域名"
+
+printf 'ALL PASS: 7 release contract tests\n'

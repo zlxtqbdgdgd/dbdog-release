@@ -81,6 +81,44 @@ env_literal_value() { # env_literal_value <env 文件> <KEY>；只读简单 KEY=
   ' "$file"
 }
 
+detect_advertise_host() {
+  local host="${DBDOG_ADVERTISE_HOST:-}"
+  if [ -z "$host" ] && command -v ip >/dev/null 2>&1; then
+    host="$(ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{ for (i=1; i<=NF; i++) if ($i=="src") { print $(i+1); exit } }')"
+  fi
+  if [ -z "$host" ] && command -v hostname >/dev/null 2>&1; then
+    host="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
+  fi
+  [ -n "$host" ] || host="127.0.0.1"
+  case "$host" in *[!A-Za-z0-9._-]* | "") die "无法把 DBDOG_ADVERTISE_HOST 用作 URL host: $host" ;; esac
+  printf '%s\n' "$host"
+}
+
+migrate_legacy_web_public_urls() { # <dbdog-web.env>；只迁移旧公网验收模板的三联 URL
+  local file="$1" app ingest mcp legacy_host advertise_host
+  [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  app="$(env_literal_value "$file" PUBLIC_APP_URL)"
+  ingest="$(env_literal_value "$file" PUBLIC_INGEST_URL)"
+  mcp="$(env_literal_value "$file" PUBLIC_MCP_URL)"
+  case "$app" in http://*:25629) ;; *) return 0 ;; esac
+  legacy_host="${app#http://}"; legacy_host="${legacy_host%:25629}"
+  [ -n "$legacy_host" ] || return 0
+  [ "$app" = "http://${legacy_host}:25629" ] \
+    && [ "$ingest" = "http://${legacy_host}:21753" ] \
+    && [ "$mcp" = "http://${legacy_host}:24267/mcp" ] \
+    || return 0
+
+  advertise_host="$(detect_advertise_host)"
+  ensure_env_default "$file" PUBLIC_APP_URL \
+    "http://${advertise_host}:3000" "$app"
+  ensure_env_default "$file" PUBLIC_INGEST_URL \
+    "http://${advertise_host}:8080" "$ingest"
+  ensure_env_default "$file" PUBLIC_MCP_URL \
+    "http://${advertise_host}:8090/mcp" "$mcp"
+  log "已把旧验收模板的 PUBLIC_* URL 迁移为本机地址（${advertise_host}）"
+}
+
 # ---- manifest 访问 ----
 # 列：1 module, 2 kind, 3 target, 4 service, 5 version, 6 artifact, 7 sha256, 8 source_sha
 manifest_rows() { grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST"; }

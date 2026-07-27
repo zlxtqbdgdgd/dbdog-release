@@ -412,6 +412,14 @@ fi
 
 canonicalize_upgrade_modules "${targets[@]}"
 targets=("${ORDERED_UPGRADE_MODULES[@]}")
+# 0.1.3 及更早的 Web 发布模板曾带一组三联公网验收端口。只在三个 URL 同时精确
+# 命中该模板形状时自动迁移；正常的内网域名、反代地址和任意自定义配置都不覆盖。
+for m in "${targets[@]}"; do
+  if [ "$m" = "dbdog-web" ]; then
+    migrate_legacy_web_public_urls "$ETC_DIR/dbdog-web.env"
+    break
+  fi
+done
 log "升级计划: ${targets[*]}"
 for m in "${targets[@]}"; do upgrade_one "$m"; done
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"
