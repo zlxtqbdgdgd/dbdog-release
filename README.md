@@ -73,56 +73,38 @@ export CURL_CA_BUNDLE="$ca"
 移除后可用 `env -u LD_LIBRARY_PATH ~/dbdog/modules/postgresql/current/bin/psql --version`
 验证独立运行。
 
-### 1. 拉取并安装到配置阶段
+### 拉取并一键安装
 
-第一阶段会直接用 PG `5432`、CH `8123/9000` 启动本机数据库，当前不支持在初始化前
-改这三个端口；执行前必须确认它们未被占用。server、ddsql、web、MCP 端口可在
-`--finish` 前通过 env 调整。
+安装会直接使用 PG `5432`、CH `8123/9000`、server `8080`、ddsql `8770`、web
+`3000`、MCP `8090`；执行前必须确认这些端口未被占用。脚本完成模块安装、数据库初始化、
+配置生成、迁移、管理员创建、服务启动和基础验收后才返回成功。
 
 ```bash
 uname -m                             # 必须输出 aarch64
 mkdir -p ~/dbdog
 git clone https://github.com/zlxtqbdgdgd/dbdog-release ~/dbdog/release
 cd ~/dbdog/release
-./scripts/install.sh                 # 下载校验、初始化 PG/CH、生成应用配置
-ls -l ~/dbdog/etc/{dbdog-server,ddsql-server,dbdog-web,dbdog-mcp}.env
+./scripts/install.sh
 ```
 
-应用默认端口：server `8080`、ddsql `8770`、web `3000`、MCP `8090`。
+默认访问地址根据默认路由的本机 IPv4 自动生成；需要指定 DNS 名或固定 IP 时，可在首次
+安装命令前设置 `DBDOG_ADVERTISE_HOST`，例如
+`DBDOG_ADVERTISE_HOST=dbdog.internal ./scripts/install.sh`。该值只用于生成访问 URL，服务仍
+监听默认端口。反向代理和 HTTPS 可在安装成功后作为可选运维配置，不阻塞默认安装。
 
-### 2. 填配置
-
-真实配置在 `~/dbdog/etc/`，模板只用于起步；升级不会覆盖。至少逐项确认：
-
-`install.sh` 以 `dbdog` 用户初始化 PG；首次本机验证可让 server 的 `PG_DSN` 与 web 的
-`DATABASE_URL` 都使用 `postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable`。
-
-- `dbdog-server.env`：`PG_DSN`、ClickHouse 地址/库名、`DBDOG_INTERNAL_TOKEN`。
-- `dbdog-web.env`：`DATABASE_URL`、`DBDOG_SERVER_URL`、与 server 相同的内部 token、
-  `DBDOG_OAUTH_JWT_SECRET`、三个 `PUBLIC_*_URL`；需要改 web 端口时追加 `PORT`。
-- `dbdog-mcp.env`：`DBDOG_BASE_URL`、与 web/server 相同的内部 token、与 web 相同的
-  OAuth JWT，以及实际的 `DBDOG_OAUTH_ISSUER`、`DBDOG_PUBLIC_MCP_URL`、
-  `DBDOG_APP_BASE_URL`；端口变量是 `DBDOG_HTTP_PORT`。
-- `ddsql-server.env`：默认继承 `dbdog-server.env` 中的 PG/CH/metric 配置；这里只写覆盖项。
-
-内部 token/JWT 至少 16 字符；不要保留 `user:pass`、`change-me` 或公网测试机 URL。
-真实 PUBLIC/OAuth URL 取决于内网入口，本仓不能代填。`.env` 会自动收为 `0600`。
-
-### 3. 迁移、启动、验收
-
-```bash
-cd ~/dbdog/release
-./scripts/install.sh --finish
-./scripts/verify.sh
-```
-
-首次 `--finish` 会在迁移后创建 `admin@dbdog.local` 管理员，并把随机密码输出一次；请当场
-保存并在登录后立即修改。后续升级会检测既有账号，不会重置密码。登录后的管理员可在
+安装会生成随机内部 Token/OAuth JWT，并同步写入 server、web、MCP 的 `0600` env 文件；
+PG/CH 使用只监听本机的默认连接。已有真实配置不会被覆盖。首次迁移会创建
+`admin@dbdog.local` 管理员并把随机密码输出一次；请当场保存并在登录后立即修改。后续
+升级不会重置密码。登录后的管理员可在
 Settings → 用户管理创建其他用户，因此 Web 不开放匿名注册。
 
-`verify.sh` 会检查配置占位值、实际执行 PG/CH 查询，并等待 server、ddsql、web、MCP
+安装末尾自动调用的 `verify.sh` 会检查配置占位值、实际执行 PG/CH 查询，并等待
+server、ddsql、web、MCP
 HTTP 就绪；最后出现 `基础部署验收通过` 才可继续业务场景验证。它不证明 DDSQL 查询、
 鉴权或 agent 链路已经端到端通过。`dbdogctl status all` 只反映进程状态，不等于健康。
+
+旧版本若曾停在“已落包、未迁移”的中间状态，更新 release 仓后可执行一次
+`./scripts/install.sh --finish` 恢复；这不是新安装的正常步骤。
 
 失败时先看：
 

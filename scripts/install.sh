@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # 内网：全家桶机器首次安装（dbdog 账户执行，无 root）。
 # 用法：
-#   install.sh                # 完整引导：装基础件+初始化库+装应用件，最后提示填配置
-#   install.sh --finish       # 配置填好后：跑数据库迁移 + 启动全部服务
+#   install.sh                # 一键安装、配置、迁移、启动并验收
+#   install.sh --finish       # 兼容旧版未完成安装：补配置、迁移、启动并验收
 #   install.sh --init-db-only # 只做数据目录初始化（reset.sh 复用）
-#
-# 注：本脚本按设计一次写成，内网首跑大概率要校准（标 [首跑校准] 处）。
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +26,101 @@ preflight_host() {
 
 install_modules() {
   for m in "$@"; do "$SCRIPTS_DIR/upgrade.sh" "$m"; done
+}
+
+configure_local_database_clients() {
+  local server_env="$ETC_DIR/dbdog-server.env" web_env="$ETC_DIR/dbdog-web.env"
+  local pg_dsn="postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable"
+  # 只接管缺失值和随产物发布的 user:pass 占位；已有真实 DSN 永不覆盖。
+  ensure_env_default "$server_env" PG_DSN "$pg_dsn" user:pass
+  ensure_env_default "$web_env" DATABASE_URL "$pg_dsn" user:pass
+  log "已校准 server/web 的本机 ctl 数据库连接（已有真实 DSN 保持不变）"
+}
+
+generate_secret() {
+  "$MODULES_DIR/node/current/bin/node" -e \
+    'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
+}
+
+choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
+  local key="$1" chosen="" value file; shift
+  for file in "$@"; do
+    value="$(env_literal_value "$file" "$key")"
+    case "$value" in "" | change-me*) continue ;; esac
+    [ "${#value}" -ge 16 ] || die "$file 的 $key 少于 16 字符，拒绝启动"
+    if [ -z "$chosen" ]; then
+      chosen="$value"
+    elif [ "$chosen" != "$value" ]; then
+      die "$key 在多个服务配置中不一致，拒绝猜测应覆盖哪一个"
+    fi
+  done
+  [ -n "$chosen" ] || chosen="$(generate_secret)"
+  printf '%s\n' "$chosen"
+}
+
+detect_advertise_host() {
+  local host="${DBDOG_ADVERTISE_HOST:-}"
+  if [ -z "$host" ] && command -v ip >/dev/null 2>&1; then
+    host="$(ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{ for (i=1; i<=NF; i++) if ($i=="src") { print $(i+1); exit } }')"
+  fi
+  if [ -z "$host" ] && command -v hostname >/dev/null 2>&1; then
+    host="$(hostname -I 2>/dev/null | awk '{ print $1 }')"
+  fi
+  [ -n "$host" ] || host="127.0.0.1"
+  case "$host" in *[!A-Za-z0-9._-]* | "") die "无法把 DBDOG_ADVERTISE_HOST 用作 URL host: $host" ;; esac
+  printf '%s\n' "$host"
+}
+
+configure_ready_to_use_stack() {
+  local server_env="$ETC_DIR/dbdog-server.env"
+  local web_env="$ETC_DIR/dbdog-web.env"
+  local mcp_env="$ETC_DIR/dbdog-mcp.env"
+  local internal_token oauth_secret advertise_host app_url ingest_url mcp_url
+
+  configure_local_database_clients
+  internal_token="$(choose_shared_secret DBDOG_INTERNAL_TOKEN "$server_env" "$web_env" "$mcp_env")"
+  oauth_secret="$(choose_shared_secret DBDOG_OAUTH_JWT_SECRET "$web_env" "$mcp_env")"
+  advertise_host="$(detect_advertise_host)"
+  app_url="http://${advertise_host}:3000"
+  ingest_url="http://${advertise_host}:8080"
+  mcp_url="http://${advertise_host}:8090/mcp"
+
+  ensure_env_default "$server_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$server_env" DBDOG_HTTP_ADDR :8080 change-me
+  ensure_env_default "$server_env" DBDOG_PUBLIC_BASE_URL "$app_url" change-me
+
+  ensure_env_default "$web_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$web_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me
+  ensure_env_default "$web_env" DBDOG_SERVER_URL http://127.0.0.1:8080 change-me
+  ensure_env_default "$web_env" PORT 3000 change-me
+  ensure_env_default "$web_env" HOSTNAME 0.0.0.0 change-me
+  ensure_env_default "$web_env" COOKIE_SECURE 0 change-me
+  ensure_env_default "$web_env" PUBLIC_APP_URL "$app_url" change-me
+  ensure_env_default "$web_env" PUBLIC_INGEST_URL "$ingest_url" change-me
+  ensure_env_default "$web_env" PUBLIC_MCP_URL "$mcp_url" change-me
+
+  ensure_env_default "$mcp_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
+  ensure_env_default "$mcp_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me
+  ensure_env_default "$mcp_env" DBDOG_BASE_URL http://127.0.0.1:8080 change-me
+  ensure_env_default "$mcp_env" DBDOG_HTTP_HOST 0.0.0.0 change-me
+  ensure_env_default "$mcp_env" DBDOG_HTTP_PORT 8090 change-me
+  ensure_env_default "$mcp_env" DBDOG_OAUTH_ISSUER "$app_url" change-me
+  ensure_env_default "$mcp_env" DBDOG_PUBLIC_MCP_URL "$mcp_url" change-me
+  ensure_env_default "$mcp_env" DBDOG_APP_BASE_URL "$app_url" change-me
+
+  log "已生成可直接使用的本机配置（访问地址: ${app_url}；已有真实配置保持不变）"
+}
+
+finish_installation() {
+  configure_ready_to_use_stack
+  "$DBDOGCTL" start postgresql clickhouse \
+    || die "数据库未全部启动就绪；未执行迁移或启动应用服务"
+  run_migrations
+  "$DBDOGCTL" start all || die "服务未全部启动；本次新启动的服务已回滚"
+  "$SCRIPTS_DIR/verify.sh"
+  echo
+  "$DBDOGCTL" status all
 }
 
 gen_clickhouse_config() {
@@ -136,28 +229,29 @@ run_migrations() {
   done
 }
 
+main() {
 case "${1:-}" in
   --init-db-only)
     preflight_host; ensure_layout; init_databases ;;
   --finish)
     preflight_host; ensure_layout
-    "$DBDOGCTL" start postgresql clickhouse \
-      || die "数据库未全部启动就绪；未执行迁移或启动应用服务"
-    run_migrations
-    "$DBDOGCTL" start all || die "服务未全部启动；本次新启动的服务已回滚"
-    echo; "$DBDOGCTL" status all ;;
+    finish_installation ;;
   "")
     preflight_host; ensure_layout
-    log "== 1/4 安装基础件: ${BASE_MODULES[*]}"
+    log "== 1/5 安装基础件: ${BASE_MODULES[*]}"
     install_modules "${BASE_MODULES[@]}"
-    log "== 2/4 初始化数据库"
+    log "== 2/5 初始化数据库"
     init_databases
-    log "== 3/4 安装应用件: ${APP_MODULES[*]}"
+    log "== 3/5 安装应用件: ${APP_MODULES[*]}"
     install_modules "${APP_MODULES[@]}"
-    log "== 4/4 剩下的事"
-    echo
-    echo "请编辑 $ETC_DIR/ 下各 .env（连接串、密钥等），然后执行："
-    echo "    $SCRIPTS_DIR/install.sh --finish"
+    log "== 4/5 自动配置、迁移并启动"
+    finish_installation
+    log "== 5/5 安装完成"
     ;;
   *) die "用法: install.sh [--finish|--init-db-only]" ;;
 esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

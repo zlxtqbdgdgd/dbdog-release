@@ -242,7 +242,7 @@ ENVF="$ETC_DIR/dbdog-server.env"
 REQUIRED="${DBDOG_MIGRATION_REQUIRED:-0}"
 case "$REQUIRED" in 0 | 1) ;; *) echo "[hook] 非法 DBDOG_MIGRATION_REQUIRED=$REQUIRED" >&2; exit 1 ;; esac
 if [ ! -f "$ENVF" ]; then
-  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh --finish 自动补跑）"; exit 0; }
+  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh 收尾阶段自动补跑）"; exit 0; }
   echo "[hook] 缺少 ${ENVF}，拒绝在未迁移数据库时升级 dbdog-server" >&2
   exit 1
 fi

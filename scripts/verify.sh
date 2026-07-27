@@ -57,9 +57,7 @@ valid_url() {
     http://* | https://*) ;;
     *) return 1 ;;
   esac
-  case "$value" in
-    *epyc-256c.e6.luyouxia.net* | *change-me*) return 1 ;;
-  esac
+  case "$value" in *change-me*) return 1 ;; esac
 }
 
 retry_http() { # retry_http <URL> [curl 其他参数...]
@@ -163,6 +161,24 @@ probe_web_pg_migrations() (
     -Atc "SELECT to_regclass('drizzle.__drizzle_migrations') IS NOT NULL" | grep -qx 't'
 )
 
+probe_tenant_pg_blueprint() (
+  clear_probe_env
+  load_env dbdog-server || return 1
+  [ -n "${PG_DSN:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$PG_DSN" -v ON_ERROR_STOP=1 -Atc "
+    SELECT
+      to_regclass('t_1.dbm_instances') IS NOT NULL
+      AND (
+        SELECT count(*) = 2
+        FROM public.org_blueprint_state
+        WHERE org_id = 1
+          AND engine IN ('pg', 'ch')
+          AND version > 0
+          AND COALESCE(last_error, '') = ''
+      )
+  " | grep -qx 't'
+)
+
 probe_clickhouse() (
   clear_probe_env
   load_env dbdog-server || return 1
@@ -174,6 +190,19 @@ probe_clickhouse() (
     --user "${DBDOG_CH_USERNAME:-default}" --password "${CH_PASSWORD:-}" \
     --database "$database" --query "SELECT currentDatabase(), 1 FORMAT TSV" \
     | grep -qx "$database"$'\t''1'
+)
+
+probe_tenant_clickhouse_blueprint() (
+  clear_probe_env
+  load_env dbdog-server || return 1
+  local clickhouse="$MODULES_DIR/clickhouse/current/bin/clickhouse"
+  local addr="${DBDOG_CH_ADDR:-127.0.0.1:9000}" host port
+  addr="${addr%%,*}"
+  host="${addr%:*}"; port="${addr##*:}"
+  "$clickhouse" client --host "$host" --port "$port" \
+    --user "${DBDOG_CH_USERNAME:-default}" --password "${CH_PASSWORD:-}" \
+    --query "SELECT count() FROM system.tables WHERE database = 'obs_t_1' AND name IN ('metric_points', 'logs', 'dbm_activity')" \
+    | grep -qx '3'
 )
 
 probe_dbdog_server() (
@@ -223,6 +252,8 @@ main() {
   check "web Drizzle 迁移记录已落库" probe_web_pg_migrations
   check "web 至少有一个可登录管理员" probe_web_admin
   check "ClickHouse 可查询目标库" probe_clickhouse
+  check "默认租户 PG 蓝图已推进且无错误" probe_tenant_pg_blueprint
+  check "默认租户 ClickHouse 核心表已创建" probe_tenant_clickhouse_blueprint
   check "dbdog-server /healthz" probe_dbdog_server
   check "ddsql-server /healthz（仅存活）" probe_ddsql
   check "dbdog-web /login（仅 HTTP smoke）" probe_web

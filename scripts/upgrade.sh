@@ -356,7 +356,7 @@ upgrade_one() {
   [ -n "$running" ] && "$DBDOGCTL" stop $running
 
   # 已安装模块升级时，迁移配置缺失必须硬失败；首次落包允许先生成配置，随后由
-  # install.sh --finish 以 required=1 统一补跑。迁移失败发生在切 current 之前。
+  # install.sh 的收尾阶段以 required=1 统一补跑。迁移失败发生在切 current 之前。
   DBDOG_MIGRATION_REQUIRED="$UPGRADE_RECOVERY_OLD_PRESENT" \
     run_hook "$newdir" pre-switch   # 数据库增量迁移在这里（goose up / drizzle）
   validate_artifact_identity "$newdir" "$version" "$sha256"

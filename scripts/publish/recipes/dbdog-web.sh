@@ -82,6 +82,19 @@ HOSTNAME=127.0.0.1
 DATABASE_URL=postgres://127.0.0.1:5432/ctl
 EOF
 fi
+# 源仓模板可能带外网验收机 URL；发布物不能把某台公网机器当内网默认配置。
+# DATABASE_URL 使用 release 首次安装的本机 PG 约定，PUBLIC_* 由 install.sh 根据
+# DBDOG_ADVERTISE_HOST/默认路由生成。
+sed -i \
+  -e 's|^DATABASE_URL=.*|DATABASE_URL=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable|' \
+  -e 's|^PUBLIC_APP_URL=.*|PUBLIC_APP_URL=change-me|' \
+  -e 's|^PUBLIC_INGEST_URL=.*|PUBLIC_INGEST_URL=change-me|' \
+  -e 's|^PUBLIC_MCP_URL=.*|PUBLIC_MCP_URL=change-me|' \
+  "$PKG/etc/dbdog-web.env.example"
+for public_key in PUBLIC_APP_URL PUBLIC_INGEST_URL PUBLIC_MCP_URL; do
+  grep -Fqx "$public_key=change-me" "$PKG/etc/dbdog-web.env.example" \
+    || die "发布 env 模板的 $public_key 未净化为 change-me"
+done
 
 mkdir -p "$PKG/hooks"
 (
@@ -162,7 +175,7 @@ ENVF="$ETC_DIR/dbdog-web.env"
 REQUIRED="${DBDOG_MIGRATION_REQUIRED:-0}"
 case "$REQUIRED" in 0 | 1) ;; *) echo "[hook] 非法 DBDOG_MIGRATION_REQUIRED=$REQUIRED" >&2; exit 1 ;; esac
 if [ ! -f "$ENVF" ]; then
-  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh --finish 自动补跑）"; exit 0; }
+  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh 收尾阶段自动补跑）"; exit 0; }
   echo "[hook] 缺少 ${ENVF}，拒绝在未迁移数据库时升级 dbdog-web" >&2
   exit 1
 fi

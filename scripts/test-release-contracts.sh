@@ -41,4 +41,73 @@ chmod 0755 "$hook_root/hooks/pre-switch.sh"
 DBDOG_MIGRATION_REQUIRED=1 run_hook "$hook_root" pre-switch >/dev/null
 pass "升级编排把 required=1 传入模块迁移钩子"
 
-printf 'ALL PASS: 3 release contract tests\n'
+env_file="$TEST_ROOT/service.env"
+cat >"$env_file" <<'EOF'
+PG_DSN=postgres://user:pass@127.0.0.1:5432/ctl
+DATABASE_URL=postgres://custom@db.internal:5432/ctl
+EOF
+ensure_env_default "$env_file" PG_DSN \
+  'postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' user:pass
+ensure_env_default "$env_file" DATABASE_URL \
+  'postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' user:pass
+ensure_env_default "$env_file" CH_DATABASE obs user:pass
+grep -Fqx 'PG_DSN=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' "$env_file" \
+  || fail "PG 占位 DSN 未校准"
+grep -Fqx 'DATABASE_URL=postgres://custom@db.internal:5432/ctl' "$env_file" \
+  || fail "已有真实 DSN 被覆盖"
+grep -Fqx 'CH_DATABASE=obs' "$env_file" || fail "缺失 env 默认值未追加"
+[ "$(stat -f '%Lp' "$env_file" 2>/dev/null || stat -c '%a' "$env_file")" = 600 ] \
+  || fail "env 更新后权限不是 0600"
+pass "首次安装校准占位 DSN，但保留已有真实配置"
+
+cat >>"$env_file" <<'EOF'
+EMPTY_WITH_COMMENT=                            # placeholder
+EOF
+ensure_env_default "$env_file" EMPTY_WITH_COMMENT generated change-me
+grep -Fqx 'EMPTY_WITH_COMMENT=generated' "$env_file" \
+  || fail "带注释的空 env 值未被识别为占位"
+[ "$(env_literal_value "$env_file" DATABASE_URL)" = \
+    'postgres://custom@db.internal:5432/ctl' ] \
+  || fail "env literal 读取错误"
+pass "env 默认值更新不执行配置文件，且能识别行尾注释"
+
+mkdir -p "$ETC_DIR"
+cat >"$ETC_DIR/dbdog-server.env" <<'EOF'
+PG_DSN=postgres://user:pass@127.0.0.1:5432/ctl
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+DBDOG_PUBLIC_BASE_URL=
+EOF
+cat >"$ETC_DIR/dbdog-web.env" <<'EOF'
+DATABASE_URL=postgres://user:pass@127.0.0.1:5432/ctl
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+DBDOG_OAUTH_JWT_SECRET=abcdef0123456789abcdef0123456789
+PUBLIC_APP_URL=change-me
+PUBLIC_INGEST_URL=change-me
+PUBLIC_MCP_URL=change-me
+EOF
+cat >"$ETC_DIR/dbdog-mcp.env" <<'EOF'
+DBDOG_BASE_URL=http://127.0.0.1:8080
+DBDOG_INTERNAL_TOKEN=0123456789abcdef0123456789abcdef
+DBDOG_OAUTH_JWT_SECRET=abcdef0123456789abcdef0123456789
+EOF
+# source 只加载函数；main guard 保证测试不会执行安装。
+source "$SCRIPTS_DIR/install.sh"
+DBDOG_ADVERTISE_HOST=dbdog.internal configure_ready_to_use_stack >/dev/null \
+  || fail "一键默认配置生成失败"
+grep -Fqx 'PG_DSN=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' \
+  "$ETC_DIR/dbdog-server.env" || fail "server 本机 DSN 未生成"
+grep -Fqx 'DATABASE_URL=postgres://dbdog@127.0.0.1:5432/ctl?sslmode=disable' \
+  "$ETC_DIR/dbdog-web.env" || fail "web 本机 DSN 未生成"
+grep -Fqx 'PUBLIC_APP_URL=http://dbdog.internal:3000' "$ETC_DIR/dbdog-web.env" \
+  || fail "web 默认访问 URL 未生成"
+grep -Fqx 'DBDOG_PUBLIC_MCP_URL=http://dbdog.internal:8090/mcp' "$ETC_DIR/dbdog-mcp.env" \
+  || fail "MCP 默认访问 URL 未生成"
+[ "$(env_literal_value "$ETC_DIR/dbdog-server.env" DBDOG_INTERNAL_TOKEN)" = \
+  "$(env_literal_value "$ETC_DIR/dbdog-web.env" DBDOG_INTERNAL_TOKEN)" ] \
+  || fail "server/web 内部 token 不一致"
+[ "$(env_literal_value "$ETC_DIR/dbdog-web.env" DBDOG_OAUTH_JWT_SECRET)" = \
+  "$(env_literal_value "$ETC_DIR/dbdog-mcp.env" DBDOG_OAUTH_JWT_SECRET)" ] \
+  || fail "web/MCP OAuth secret 不一致"
+pass "一键安装自动生成一致的 server/web/MCP 可用配置"
+
+printf 'ALL PASS: 6 release contract tests\n'

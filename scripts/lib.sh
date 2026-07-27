@@ -33,6 +33,54 @@ ensure_layout() {
   find "$ETC_DIR" -type f -name '*.env' -exec chmod 600 {} +
 }
 
+ensure_env_default() { # ensure_env_default <env 文件> <KEY> <默认值> <占位片段>
+  local file="$1" key="$2" value="$3" placeholder="$4" count tmp
+  case "$key" in "" | *[!A-Z0-9_]*) die "非法 env key: $key" ;; esac
+  [ -f "$file" ] && [ ! -L "$file" ] || die "env 文件不存在或不是普通文件: $file"
+  count="$(awk -v prefix="$key=" 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$file")"
+  [ "$count" -le 1 ] || die "env 文件含重复键，拒绝猜测生效值: $file: $key"
+  tmp="$(mktemp "${file}.tmp.XXXXXX")"
+  if ! awk -v key="$key" -v value="$value" -v placeholder="$placeholder" '
+      BEGIN { prefix = key "="; found = 0 }
+      index($0, prefix) == 1 {
+        found = 1
+        current = substr($0, length(prefix) + 1)
+        semantic = current
+        sub(/[[:space:]]+#.*$/, "", semantic)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", semantic)
+        if (semantic == "" || (placeholder != "" && index(semantic, placeholder) > 0)) {
+          print prefix value
+        } else {
+          print
+        }
+        next
+      }
+      { print }
+      END { if (!found) print prefix value }
+    ' "$file" >"$tmp"; then
+    rm -f -- "$tmp"
+    die "更新 env 默认值失败: $file: $key"
+  fi
+  chmod 0600 "$tmp"
+  mv -- "$tmp" "$file"
+}
+
+env_literal_value() { # env_literal_value <env 文件> <KEY>；只读简单 KEY=value，不执行文件
+  local file="$1" key="$2" count
+  [ -f "$file" ] && [ ! -L "$file" ] || die "env 文件不存在或不是普通文件: $file"
+  count="$(awk -v prefix="$key=" 'index($0, prefix) == 1 { n++ } END { print n + 0 }' "$file")"
+  [ "$count" -le 1 ] || die "env 文件含重复键，拒绝猜测生效值: $file: $key"
+  awk -v prefix="$key=" '
+    index($0, prefix) == 1 {
+      value = substr($0, length(prefix) + 1)
+      sub(/[[:space:]]+#.*$/, "", value)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
 # ---- manifest 访问 ----
 # 列：1 module, 2 kind, 3 target, 4 service, 5 version, 6 artifact, 7 sha256, 8 source_sha
 manifest_rows() { grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST"; }
