@@ -10,7 +10,7 @@
 #   - dbdog-agent 产物是 omnibus 运行时 tarball（非 rpm；自制 rpm 被 fork 明确禁止），
 #     DB 主机通过 scripts/upgrade.sh dbdog-agent 完成下载、root cutover、配置与真实采集验收。
 #   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 运行时。
-dbdog-server	first-party	stack	yes	0.1.3	dbdog-server-0.1.3-aarch64.tar.gz	4383371ac41dd15f6e00406a5c6010d6c681fd9090e954dbae9fdeaf40573ce9	9fb8294
+dbdog-server	first-party	stack	yes	0.1.4	dbdog-server-0.1.4-aarch64.tar.gz	24826c3906bbf17738d30cb342e8e807eabf4fff59e0f0d8259802743041bf04	3c89a96
 dbdog-web	first-party	stack	yes	0.1.4	dbdog-web-0.1.4-aarch64.tar.gz	8d13e738e6d8edbd5a879f767dd4f42a8e766c2ea92a0647ea00ea9dd46a4c1d	5052411
 dbdog-mcp	first-party	stack	yes	0.1.1	dbdog-mcp-0.1.1-noarch.tar.gz	69cc34e5f3da17e916864f41151f13987e5af99ca7e5b89b21f3bba964e70b75	c84bc18
 dbdog-agent	first-party	dbhost	no	7.81.1-dbdog.2	dbdog-agent-7.81.1-dbdog.2-aarch64.tar.gz	faf270407e719a1a6a841e33b97dc111f16674c0caac88f0d8999a5845d38530	agent:4c39489,core:7a42475
