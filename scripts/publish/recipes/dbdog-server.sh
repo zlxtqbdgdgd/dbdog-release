@@ -16,11 +16,12 @@ git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在
 cd "$WORK/src"
 
 log "Go 构建（CGO_CFLAGS=-DHAVE_STRCHRNUL，见源仓 Makefile 注释）"
+# -p 限低并行：编译机内存小（2GB+swap），防 OOM
 CGO_ENABLED=1 CGO_CFLAGS="-DHAVE_STRCHRNUL" \
-  go build -trimpath -ldflags "-s -w" -o "$PKG/bin/dbdog-server" ./cmd/dbdog-server
+  go build -p "${GO_JOBS:-2}" -trimpath -ldflags "-s -w" -o "$PKG/bin/dbdog-server" ./cmd/dbdog-server
 
 log "Rust 构建 ddsql-server（release）"
-(cd ddsql && cargo build --release)
+(cd ddsql && cargo build --release -j "${CARGO_JOBS:-2}")
 install -m 755 ddsql/target/release/ddsql-server "$PKG/bin/ddsql-server"
 
 cp -a migrations "$PKG/migrations"
