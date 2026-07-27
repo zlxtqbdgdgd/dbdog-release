@@ -212,6 +212,8 @@ patch_ddsql_runpaths
 verify_ddsql_packaged_resolution
 
 cp -a migrations "$PKG/migrations"
+[ -z "$(find "$PKG/migrations" -type l -print -quit)" ] \
+  || die "migrations 不允许包含软链"
 
 mkdir -p "$PKG/etc"
 if [ -f deploy/.env.example ]; then
@@ -222,15 +224,36 @@ fi
 printf '# [首跑校准] ddsql-server 环境变量（如需）\n' >"$PKG/etc/ddsql-server.env.example"
 
 mkdir -p "$PKG/hooks"
+# 最终产物内自带迁移文件清单。artifact SHA 保护下载过程；此清单额外防止安装目录
+# 在真正执行迁移前被局部修改。
+(
+  cd "$PKG"
+  find migrations -type f -print | LC_ALL=C sort | while IFS= read -r migration; do
+    sha256sum "$migration"
+  done
+) >"$PKG/hooks/postgres-migrations.sha256"
+[ -s "$PKG/hooks/postgres-migrations.sha256" ] || die "PG migrations 校验清单为空"
 cat >"$PKG/hooks/pre-switch.sh" <<'EOF'
 #!/usr/bin/env bash
 # PG ctl 库增量迁移（goose up）。CH 租户表由 dbdog-server 启动时 blueprint 自动推进。
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENVF="$ETC_DIR/dbdog-server.env"
-[ -f "$ENVF" ] || { echo "[hook] 无 ${ENVF}，跳过 goose 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
+REQUIRED="${DBDOG_MIGRATION_REQUIRED:-0}"
+case "$REQUIRED" in 0 | 1) ;; *) echo "[hook] 非法 DBDOG_MIGRATION_REQUIRED=$REQUIRED" >&2; exit 1 ;; esac
+if [ ! -f "$ENVF" ]; then
+  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh --finish 自动补跑）"; exit 0; }
+  echo "[hook] 缺少 ${ENVF}，拒绝在未迁移数据库时升级 dbdog-server" >&2
+  exit 1
+fi
 set -a; source "$ENVF"; set +a
-[ -n "${PG_DSN:-}" ] || { echo "[hook] PG_DSN 未设置，跳过 goose 迁移"; exit 0; }
+[ -n "${PG_DSN:-}" ] || {
+  [ "$REQUIRED" = 0 ] && { echo "[hook] PG_DSN 未设置，首次落包暂不迁移"; exit 0; }
+  echo "[hook] PG_DSN 未设置，拒绝在未迁移数据库时升级 dbdog-server" >&2
+  exit 1
+}
+(cd "$HERE" && sha256sum -c hooks/postgres-migrations.sha256 >/dev/null) \
+  || { echo "[hook] dbdog-server 迁移文件完整性校验失败" >&2; exit 1; }
 "$MODULES_DIR/goose/current/bin/goose" -dir "$HERE/migrations" postgres "$PG_DSN" up
 EOF
 chmod +x "$PKG/hooks/pre-switch.sh"

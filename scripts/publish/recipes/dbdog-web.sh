@@ -59,6 +59,8 @@ fi
 # drizzle 迁移物料；standalone 的 node_modules 是按引用裁剪的，migrator 子路径
 # 可能没被带上——整包补齐 drizzle-orm 与 postgres 兜底。
 cp -a drizzle "$PKG/drizzle"
+[ -z "$(find "$PKG/drizzle" -type l -print -quit)" ] \
+  || die "drizzle migrations 不允许包含软链"
 mkdir -p "$PKG/node_modules"
 for p in drizzle-orm postgres; do
   [ -d "node_modules/$p" ] || die "缺 node_modules/$p"
@@ -82,13 +84,20 @@ EOF
 fi
 
 mkdir -p "$PKG/hooks"
+(
+  cd "$PKG"
+  find drizzle -type f -print | LC_ALL=C sort | while IFS= read -r migration; do
+    sha256sum "$migration"
+  done
+) >"$PKG/hooks/postgres-migrations.sha256"
+[ -s "$PKG/hooks/postgres-migrations.sha256" ] || die "Drizzle migrations 校验清单为空"
 cat >"$PKG/hooks/migrate.mjs" <<'EOF'
 // drizzle 增量迁移（web 表）。用包内 node_modules 的 drizzle-orm/postgres 执行。
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 const url = process.env.DATABASE_URL;
-if (!url) { console.log("[hook] DATABASE_URL 未设置，跳过 drizzle 迁移"); process.exit(0); }
+if (!url) throw new Error("DATABASE_URL 未设置");
 const client = postgres(url, { max: 1 });
 await migrate(drizzle(client), { migrationsFolder: new URL("../drizzle", import.meta.url).pathname });
 await client.end();
@@ -150,9 +159,22 @@ cat >"$PKG/hooks/pre-switch.sh" <<'EOF'
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENVF="$ETC_DIR/dbdog-web.env"
-[ -f "$ENVF" ] || { echo "[hook] 无 ${ENVF}，跳过 drizzle 迁移（配置后 install.sh --finish 补跑）"; exit 0; }
+REQUIRED="${DBDOG_MIGRATION_REQUIRED:-0}"
+case "$REQUIRED" in 0 | 1) ;; *) echo "[hook] 非法 DBDOG_MIGRATION_REQUIRED=$REQUIRED" >&2; exit 1 ;; esac
+if [ ! -f "$ENVF" ]; then
+  [ "$REQUIRED" = 0 ] && { echo "[hook] 无 ${ENVF}，首次落包暂不迁移（install.sh --finish 自动补跑）"; exit 0; }
+  echo "[hook] 缺少 ${ENVF}，拒绝在未迁移数据库时升级 dbdog-web" >&2
+  exit 1
+fi
 set -a; source "$ENVF"; set +a
+[ -n "${DATABASE_URL:-}" ] || {
+  [ "$REQUIRED" = 0 ] && { echo "[hook] DATABASE_URL 未设置，首次落包暂不迁移"; exit 0; }
+  echo "[hook] DATABASE_URL 未设置，拒绝在未迁移数据库时升级 dbdog-web" >&2
+  exit 1
+}
 cd "$HERE"
+sha256sum -c hooks/postgres-migrations.sha256 >/dev/null \
+  || { echo "[hook] dbdog-web 迁移文件完整性校验失败" >&2; exit 1; }
 "$MODULES_DIR/node/current/bin/node" hooks/migrate.mjs
 "$MODULES_DIR/node/current/bin/node" hooks/bootstrap-admin.mjs
 EOF

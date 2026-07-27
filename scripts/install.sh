@@ -131,7 +131,8 @@ run_migrations() {
   # 重跑各应用模块 current 的 pre-switch 钩子（内部即 goose up / drizzle 迁移，幂等）
   for m in dbdog-server dbdog-web; do
     local cur="$MODULES_DIR/$m/current"
-    [ -L "$cur" ] && run_hook "$cur" pre-switch
+    [ -L "$cur" ] || die "缺少应用模块 current，无法执行迁移: $m"
+    DBDOG_MIGRATION_REQUIRED=1 run_hook "$cur" pre-switch
   done
 }
 

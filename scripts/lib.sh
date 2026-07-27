@@ -19,6 +19,9 @@ RUN_DIR="$DBDOG_HOME/run"
 CACHE_DIR="$DBDOG_HOME/cache"
 MODULE_VERSION_MARKER=".dbdog-manifest-version"
 MODULE_ARTIFACT_SHA256_MARKER=".dbdog-artifact-sha256"
+# 基础运行时必须先于应用；应用按当前依赖图先 server、再 web、最后 MCP。
+# 表结构的跨模块兼容不能依赖这个顺序，必须使用 expand/contract 迁移。
+UPGRADE_MODULE_ORDER=(node goose postgresql clickhouse dbdog-server dbdog-web dbdog-mcp)
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -43,6 +46,43 @@ manifest_get() { # manifest_get <module> <列号>
 manifest_modules() { # manifest_modules [target 过滤]
   local t="${1:-}"
   manifest_rows | awk -F'\t' -v t="$t" 't=="" || $3==t {print $1}'
+}
+
+canonicalize_upgrade_modules() { # canonicalize_upgrade_modules <模块>... → ORDERED_UPGRADE_MODULES
+  local requested=("$@") candidate known seen
+  local -a validated=()
+  ORDERED_UPGRADE_MODULES=()
+
+  for candidate in "${requested[@]}"; do
+    case "$candidate" in
+      "" | "." | ".." | */* | *$'\n'* | *$'\r'*)
+        die "模块名不是安全的单层路径名: $candidate"
+        ;;
+    esac
+    manifest_get "$candidate" 1 >/dev/null
+    # `${array[@]+...}` 兼容 macOS Bash 3.2 在 set -u 下展开空数组。
+    for seen in ${validated[@]+"${validated[@]}"}; do
+      [ "$seen" != "$candidate" ] || die "升级模块重复: $candidate"
+    done
+    validated+=("$candidate")
+  done
+
+  # 已知依赖按固定顺序；未来新增且尚未写入顺序表的模块保留用户/manifest 顺序。
+  for known in "${UPGRADE_MODULE_ORDER[@]}"; do
+    for candidate in "${validated[@]}"; do
+      if [ "$candidate" = "$known" ]; then
+        ORDERED_UPGRADE_MODULES+=("$candidate")
+        break
+      fi
+    done
+  done
+  for candidate in "${validated[@]}"; do
+    known=0
+    for seen in ${ORDERED_UPGRADE_MODULES[@]+"${ORDERED_UPGRADE_MODULES[@]}"}; do
+      if [ "$seen" = "$candidate" ]; then known=1; break; fi
+    done
+    [ "$known" -eq 1 ] || ORDERED_UPGRADE_MODULES+=("$candidate")
+  done
 }
 
 installed_module_dir() { # installed_module_dir <模块>；仅返回模块目录内的 current 实体
@@ -189,5 +229,6 @@ run_hook() { # run_hook <模块新版本目录> <pre-switch|post-switch>
   [ -f "$script" ] || return 0
   log "执行钩子: $(basename "$dir")/hooks/$2.sh"
   DBDOG_HOME="$DBDOG_HOME" ETC_DIR="$ETC_DIR" MODULES_DIR="$MODULES_DIR" \
+    DBDOG_MIGRATION_REQUIRED="${DBDOG_MIGRATION_REQUIRED:-0}" \
     bash "$script" || die "钩子失败: ${script}（修复后可手动重跑）"
 }

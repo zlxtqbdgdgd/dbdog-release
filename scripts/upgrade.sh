@@ -355,7 +355,10 @@ upgrade_one() {
   # shellcheck disable=SC2086
   [ -n "$running" ] && "$DBDOGCTL" stop $running
 
-  run_hook "$newdir" pre-switch     # 数据库增量迁移在这里（goose up / drizzle）
+  # 已安装模块升级时，迁移配置缺失必须硬失败；首次落包允许先生成配置，随后由
+  # install.sh --finish 以 required=1 统一补跑。迁移失败发生在切 current 之前。
+  DBDOG_MIGRATION_REQUIRED="$UPGRADE_RECOVERY_OLD_PRESENT" \
+    run_hook "$newdir" pre-switch   # 数据库增量迁移在这里（goose up / drizzle）
   validate_artifact_identity "$newdir" "$version" "$sha256"
   if [ "$UPGRADE_RECOVERY_OLD_PRESENT" -eq 1 ]; then
     [ -L "$current" ] && \
@@ -407,6 +410,8 @@ else
   [ ${#targets[@]} -gt 0 ] || { log "没有可升级的模块（check-upgrade.sh 可查看详情）"; exit 0; }
 fi
 
+canonicalize_upgrade_modules "${targets[@]}"
+targets=("${ORDERED_UPGRADE_MODULES[@]}")
 log "升级计划: ${targets[*]}"
 for m in "${targets[@]}"; do upgrade_one "$m"; done
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"

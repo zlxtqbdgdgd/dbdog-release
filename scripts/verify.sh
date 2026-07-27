@@ -147,6 +147,22 @@ probe_web_admin() (
     | awk '$1 + 0 > 0 { found = 1 } END { exit !found }'
 )
 
+probe_server_pg_migrations() (
+  clear_probe_env
+  load_env dbdog-server || return 1
+  [ -n "${PG_DSN:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$PG_DSN" -v ON_ERROR_STOP=1 \
+    -Atc "SELECT to_regclass('public.goose_db_version') IS NOT NULL" | grep -qx 't'
+)
+
+probe_web_pg_migrations() (
+  clear_probe_env
+  load_env dbdog-web || return 1
+  [ -n "${DATABASE_URL:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+    -Atc "SELECT to_regclass('drizzle.__drizzle_migrations') IS NOT NULL" | grep -qx 't'
+)
+
 probe_clickhouse() (
   clear_probe_env
   load_env dbdog-server || return 1
@@ -203,6 +219,8 @@ main() {
   check "DDSQL 的 PG/CH/metric 配置完整" probe_ddsql_contract
   check "server PG_DSN 可查询 ctl" probe_postgresql
   check "web DATABASE_URL 可查询 ctl" probe_web_postgresql
+  check "server Goose 迁移记录已落库" probe_server_pg_migrations
+  check "web Drizzle 迁移记录已落库" probe_web_pg_migrations
   check "web 至少有一个可登录管理员" probe_web_admin
   check "ClickHouse 可查询目标库" probe_clickhouse
   check "dbdog-server /healthz" probe_dbdog_server

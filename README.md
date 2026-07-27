@@ -157,6 +157,12 @@ cd ~/dbdog/release
 ./scripts/verify.sh
 ```
 
+数据库结构升级已经包含在上述正常流程中，不需要另跑迁移命令。`upgrade.sh` 会先按依赖
+顺序处理基础运行时，再升级 server、web 和 MCP；server 的 Goose 与 web 的 Drizzle
+迁移都在各自模块切换前自动执行，失败即停止升级。迁移文件随模块产物发布并校验完整性。
+表结构的唯一所有者和跨模块兼容规则见
+[数据库结构所有权与发布契约](docs/schema-ownership.md)。
+
 缺失模块不会被无参数升级自动安装；需要显式执行，例如
 `./scripts/upgrade.sh dbdog-web`。旧版目录首次会因没有 SHA marker 做一次身份校准；之后即使
 版本号相同，只要 manifest SHA 改变也会安装新产物。升级保留有效缓存与旧身份目录，但数据库
