@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 配方：dbdog-web。构建时向临时检出注入 output:"standalone"（不侵入源仓），
-# 只发编译产物（无 src/、无 sourcemap），附 drizzle 迁移与钩子。
+# 配方：dbdog-web。构建时向临时检出注入 standalone 和禁用图片优化
+# （不侵入源仓），只发编译产物（无 src/、无 sourcemap），附 drizzle 迁移与钩子。
 # 输入 env：MODULE VERSION SHA ARCH REPO_ROOT BUILD_WORK TOOL_PATH
 set -euo pipefail
 log() { echo "[recipe:$MODULE] $*" >&2; }
@@ -16,9 +16,21 @@ git clone -q --shared "$REPO_ROOT/dbdog-web" "$WORK/src"
 git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
-log "注入 standalone 输出"
-sed -i 's|const nextConfig: NextConfig = {|const nextConfig: NextConfig = {\n  output: "standalone",|' next.config.ts
-grep -q '"standalone"' next.config.ts || die "next.config.ts 注入失败（源文件结构变了，更新本配方的 sed）"
+# 当前应用不使用 next/image 或 sharp。关闭 Next 图片优化后，运行时不需要 sharp；
+# 不把 npm 的 @img/sharp-libvips-linux-arm64 可选预编译库带进产物，既减小体积，也减少
+# 不必要的原生 CPU/运行库兼容面。未来若源码开始使用图片优化，此门禁会要求先明确
+# 选择兼容的 libvips 方案，不能静默改变图片行为。
+if git grep -n -E "(['\"]next/(legacy/)?image['\"]|['\"]sharp['\"])" -- \
+    '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx'; then
+  die "源码开始使用 next/image 或 sharp；须先提供通用 ARMv8 libvips，不能继续无图片优化打包"
+fi
+
+log "注入 standalone 输出并禁用图片优化"
+sed -i 's|const nextConfig: NextConfig = {|const nextConfig: NextConfig = {\n  output: "standalone",\n  images: { unoptimized: true },|' next.config.ts
+if ! grep -q 'output: "standalone"' next.config.ts \
+    || ! grep -q 'images: { unoptimized: true }' next.config.ts; then
+  die "next.config.ts 注入失败（源文件结构变了，更新本配方的 sed）"
+fi
 
 log "npm ci + next build"
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"   # 小内存编译机防 OOM
@@ -30,6 +42,19 @@ mkdir -p "$PKG/.next"
 cp -a .next/static "$PKG/.next/static"
 [ -d public ] && cp -a public "$PKG/public"
 [ -f "$PKG/server.js" ] || die "standalone 输出缺 server.js"
+
+# Next 的文件追踪会把 optional sharp 全家桶带入 standalone，即使应用没有使用。
+# 精确删除这些未使用原生包，并确保最终包不再携带 sharp/libvips 机器码。
+find "$PKG" -type d \( \
+    -path '*/node_modules/sharp' -o \
+    -path '*/node_modules/@img/sharp-*' -o \
+    -path '*/node_modules/@img/sharp-libvips-*' -o \
+    -path '*/node_modules/@img/colour' \
+  \) -prune -exec rm -rf -- {} +
+if find "$PKG" -type f \( -name 'sharp*.node' -o -name 'libvips*.so*' \) \
+    -print -quit | grep -q .; then
+  die "standalone 清理后仍含 sharp/libvips 原生文件"
+fi
 
 # drizzle 迁移物料；standalone 的 node_modules 是按引用裁剪的，migrator 子路径
 # 可能没被带上——整包补齐 drizzle-orm 与 postgres 兜底。

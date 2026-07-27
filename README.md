@@ -30,7 +30,7 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 ## 内网首次安装：全家桶机
 
 前提：麒麟 V10 / aarch64、专用 `dbdog` 账户、出网 HTTPS 可达 `github.com` 和
-`release-assets.githubusercontent.com`。当前 stack 压缩产物合计约 280 MiB，此外还需
+`release-assets.githubusercontent.com`。当前 stack 压缩产物合计约 300 MiB，此外还需
 模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。
 
 ### 1. 拉取并安装到配置阶段
@@ -89,20 +89,34 @@ tail -n 100 ~/dbdog/logs/dbdog-server.log   # 按失败项换成对应日志
 ./scripts/fingerprint.sh --oneline
 ```
 
+判断架构以 `file <二进制>` 为准；当前发布物中的 Linux 用户态机器码均为 AArch64。
+ClickHouse 24.8.5.115 是官方 arm64 构建，要求现代 ARMv8.2 CPU 特性，但**不要求 SVE**。
+若 `clickhouse --version` 报 `Illegal instruction`，请保留下面各项原始输出，不要换用 amd64
+文件，也不要用 `OPENSSL_no_sve` 绕过：
+
+```bash
+uname -m
+grep -m1 '^Features' /proc/cpuinfo
+file ~/dbdog/modules/clickhouse/current/bin/clickhouse
+~/dbdog/modules/clickhouse/current/bin/clickhouse --version; echo "rc=$?"
+tail -n 80 ~/dbdog/logs/clickhouse.err.log
+```
+
 本仓公开；反馈问题时不要提交内网 IP、主机名、密钥或原始日志。
 
 ## 内网日常升级
 
 ```bash
 cd ~/dbdog/release
-./scripts/check-upgrade.sh --pull   # 0=无已装模块需升级，10=存在版本不同的已装模块
-./scripts/upgrade.sh                # 只升级已安装且版本与 manifest 不同的模块
+./scripts/check-upgrade.sh --pull   # 0=已装模块版本+SHA一致，10=需要升级/身份校准
+./scripts/upgrade.sh                # 升级已安装且版本或产物 SHA 不同的模块
 ./scripts/verify.sh
 ```
 
 缺失模块不会被无参数升级自动安装；需要显式执行，例如
-`./scripts/upgrade.sh dbdog-web`。升级保留有效下载缓存与旧模块目录，但数据库迁移只向前；
-不要把切软链当成完整数据库回滚。破坏性 `./scripts/reset.sh --yes-i-mean-it` 会删掉 PG/CH 全部数据，
+`./scripts/upgrade.sh dbdog-web`。旧版目录首次会因没有 SHA marker 做一次身份校准；之后即使
+版本号相同，只要 manifest SHA 改变也会安装新产物。升级保留有效缓存与旧身份目录，但数据库
+迁移只向前；不要把切软链当成完整数据库回滚。破坏性 `./scripts/reset.sh --yes-i-mean-it` 会删掉 PG/CH 全部数据，
 只能作为最后手段。
 
 服务管理：`./scripts/dbdogctl start|stop|restart|status [服务|all]`。机器重启后当前仍需

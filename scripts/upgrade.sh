@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 内网：按 manifest 升级模块。下载 → 校验 → 解包 → 停服务 → 迁移钩子 → 切软链 → 起服务。
 # 用法：
-#   upgrade.sh                 # 升级所有「已安装且版本与 manifest 不同」的 stack 模块
+#   upgrade.sh                 # 升级所有「已安装且版本/产物 SHA 与 manifest 不同」的 stack 模块
 #   upgrade.sh <模块>...       # 升级/安装指定模块（未装的也会装，但不负责初始化配置）
-# 回滚：ln -sfn $DBDOG_HOME/modules/<模块>/<旧版目录> $DBDOG_HOME/modules/<模块>/current 后重启。
+# 回滚：把 current 恢复为升级前 readlink 记录的目标后重启；旧身份目录不会自动删除。
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 DBDOGCTL="$(dirname "${BASH_SOURCE[0]}")/dbdogctl"
@@ -121,7 +121,7 @@ require_path_component() {
 
 validate_staged_module() {
   local stage="$1" expected_name="$2" expected="$1/$2"
-  local entry count=0
+  local entry marker count=0
 
   [ -d "$expected" ] && [ ! -L "$expected" ] || \
     die "包内目录不符合约定（应为 $expected_name/）"
@@ -134,11 +134,130 @@ validate_staged_module() {
       die "包内含约定目录之外的顶层路径: $(basename "$entry")"
   done
   [ "$count" -eq 1 ] || die "包内顶层目录数量异常（应仅有 $expected_name/）"
+
+  # 产物不能自称已安装；身份 marker 只能由 upgrade 在运行时校验通过后写入。
+  for marker in "$MODULE_VERSION_MARKER" "$MODULE_ARTIFACT_SHA256_MARKER"; do
+    [ ! -e "$expected/$marker" ] && [ ! -L "$expected/$marker" ] || \
+      die "包内含保留的产物身份 marker: $marker"
+  done
+}
+
+artifact_arch_from_name() {
+  case "$1" in
+    *-aarch64.tar.gz) echo "aarch64" ;;
+    *-noarch.tar.gz) echo "noarch" ;;
+    *) die "产物名没有受支持的架构后缀: $1" ;;
+  esac
+}
+
+validate_artifact_identity() { # <版本目录> <manifest 版本> <artifact sha256>
+  local dir="$1" version="$2" sha256="$3" actual_version actual_sha256
+  actual_version="$(module_marker_value "$dir" "$MODULE_VERSION_MARKER" 2>/dev/null || true)"
+  actual_sha256="$(module_marker_value "$dir" "$MODULE_ARTIFACT_SHA256_MARKER" 2>/dev/null || true)"
+  [ "$actual_version" = "$version" ] || \
+    die "版本目录的 manifest 版本 marker 缺失或不匹配: $dir"
+  [ "$actual_sha256" = "$sha256" ] || \
+    die "版本目录的 artifact SHA marker 缺失或不匹配: $dir"
+}
+
+write_artifact_identity() { # <已通过 runtime 校验的 staging 版本目录> <版本> <sha256>
+  local dir="$1" version="$2" sha256="$3" version_tmp sha_tmp
+  [ ! -e "$dir/$MODULE_VERSION_MARKER" ] && [ ! -L "$dir/$MODULE_VERSION_MARKER" ] || \
+    die "拒绝覆盖已有版本 marker: $dir/$MODULE_VERSION_MARKER"
+  [ ! -e "$dir/$MODULE_ARTIFACT_SHA256_MARKER" ] && \
+    [ ! -L "$dir/$MODULE_ARTIFACT_SHA256_MARKER" ] || \
+    die "拒绝覆盖已有 SHA marker: $dir/$MODULE_ARTIFACT_SHA256_MARKER"
+
+  version_tmp="$(mktemp "$dir/.dbdog-version-marker.tmp.XXXXXX")"
+  sha_tmp="$(mktemp "$dir/.dbdog-sha-marker.tmp.XXXXXX")"
+  printf '%s\n' "$version" >"$version_tmp"
+  printf '%s\n' "$sha256" >"$sha_tmp"
+  chmod 0444 "$version_tmp" "$sha_tmp"
+  mv -- "$version_tmp" "$dir/$MODULE_VERSION_MARKER"
+  mv -- "$sha_tmp" "$dir/$MODULE_ARTIFACT_SHA256_MARKER"
+  validate_artifact_identity "$dir" "$version" "$sha256"
+}
+
+current_matches_artifact_identity() { # <模块> <manifest 版本> <artifact sha256>
+  local module="$1" version="$2" sha256="$3" dir actual_version actual_sha256
+  dir="$(installed_module_dir "$module")" || return 1
+  actual_version="$(module_marker_value "$dir" "$MODULE_VERSION_MARKER" 2>/dev/null)" || return 1
+  actual_sha256="$(module_marker_value "$dir" "$MODULE_ARTIFACT_SHA256_MARKER" 2>/dev/null)" || return 1
+  [ "$actual_version" = "$version" ] && [ "$actual_sha256" = "$sha256" ]
+}
+
+validate_module_runtime() { # <模块> <版本目录> <aarch64|noarch>
+  local module="$1" dir="$2" expected_arch="$3" candidate info deps rc
+  local machine_count=0
+  command -v file >/dev/null 2>&1 || die "缺少运行时检查命令: file"
+  command -v ldd >/dev/null 2>&1 || die "缺少运行时检查命令: ldd"
+  case "$expected_arch" in
+    aarch64 | noarch) ;;
+    *) die "未知的模块目标架构: $expected_arch" ;;
+  esac
+
+  while IFS= read -r -d '' candidate; do
+    info="$(LC_ALL=C file -b "$candidate")"
+    case "$info" in
+      *Mach-O* | *PE32*)
+        die "模块混入非 Linux 机器码: $candidate ($info)"
+        ;;
+      *ELF*)
+        machine_count=$((machine_count + 1))
+        [ "$expected_arch" = "aarch64" ] || \
+          die "noarch 模块含 ELF 机器码: $candidate ($info)"
+        case "$info" in
+          *ELF*64-bit*LSB*ARM\ aarch64*) ;;
+          *) die "模块 ELF 不是 Linux AArch64: $candidate ($info)" ;;
+        esac
+        case "$info" in
+          *"dynamically linked"* | *"shared object"*)
+            deps="$(env -u LD_LIBRARY_PATH LC_ALL=C ldd "$candidate" 2>&1)" \
+              || die "无法检查运行库: $candidate ($deps)"
+            if grep -F 'not found' <<<"$deps" >/dev/null; then
+              printf '%s\n' "$deps" >&2
+              die "模块含目标机无法解析的运行库: $candidate"
+            fi
+            ;;
+        esac
+        ;;
+      *ar\ archive*) : ;; # 静态库不在生产机执行；成员架构由发布端 verifier 负责。
+    esac
+  done < <(find "$dir" -type f -print0)
+
+  if [ "$expected_arch" = "aarch64" ] && [ "$machine_count" -eq 0 ]; then
+    die "aarch64 模块内没有发现任何 ELF 机器码: $dir"
+  fi
+
+  # 这些命令会触发动态装载和进程初始化，可在切 current 前发现 SIGILL/缺库。
+  case "$module" in
+    node) "$dir/bin/node" --version >/dev/null ;;
+    goose) "$dir/bin/goose" -version >/dev/null ;;
+    postgresql)
+      "$dir/bin/postgres" --version >/dev/null
+      "$dir/bin/initdb" --version >/dev/null
+      "$dir/bin/psql" --version >/dev/null
+      ;;
+    clickhouse)
+      if "$dir/bin/clickhouse" --version >/dev/null; then
+        :
+      else
+        rc=$?
+        if [ "$rc" -eq 132 ]; then
+          die "ClickHouse 是 AArch64，但目标 CPU 不支持该官方构建所需指令（SIGILL/rc=132）；已在切换 current 前停止"
+        fi
+        die "ClickHouse 入口冒烟失败（rc=$rc）；已在切换 current 前停止"
+      fi
+      ;;
+    # dbdog-server/ddsql-server 没有安全的 version 子命令，直接执行会连接后端并监听端口；
+    # 它们只做上面的全文件架构与动态库门禁。
+  esac
+  log "$module: $expected_arch 架构、目标机运行库与安全入口冒烟通过"
 }
 
 upgrade_one() {
   local m="$1"
-  local version artifact sha256 target
+  local version artifact sha256 target artifact_arch
   version="$(manifest_get "$m" 5)"
   artifact="$(manifest_get "$m" 6)"
   sha256="$(manifest_get "$m" 7)"
@@ -153,9 +272,18 @@ upgrade_one() {
   case "$sha256" in
     *[!0-9a-f]*) die "$m 的 manifest sha256 不是小写十六进制" ;;
   esac
+  artifact_arch="$(artifact_arch_from_name "$artifact")"
 
-  local inst; inst="$(installed_version "$m")"
-  if [ "$inst" = "$version" ]; then log "$m 已是 ${version}，跳过"; return 0; fi
+  local inst inst_sha256
+  inst="$(installed_version "$m")"
+  inst_sha256="$(installed_artifact_sha256 "$m")"
+  if current_matches_artifact_identity "$m" "$version" "$sha256"; then
+    log "$m 已是 ${version}（artifact ${sha256:0:12}），跳过"
+    return 0
+  fi
+  if [ "$inst" = "$version" ]; then
+    warn "$m 版本号仍为 ${version}，但产物身份为 ${inst_sha256}；按 manifest SHA 重新安装"
+  fi
 
   local pkg="$CACHE_DIR/$artifact"
   ACTIVE_DOWNLOAD_PART="$pkg.part"
@@ -168,13 +296,16 @@ upgrade_one() {
   ACTIVE_DOWNLOAD_CACHE=""
   ACTIVE_DOWNLOAD_SHA=""
 
-  local mdir="$MODULES_DIR/$m" newdir="$MODULES_DIR/$m/$m-$version"
+  local mdir="$MODULES_DIR/$m"
+  local newdir="$MODULES_DIR/$m/$m-$version.sha256-$sha256"
+  local expected_name="$m-$version" candidate
   mkdir -p "$mdir"
   if [ -e "$newdir" ] || [ -L "$newdir" ]; then
     [ -d "$newdir" ] && [ ! -L "$newdir" ] || \
-      die "目标版本路径已存在但不是实际目录: $newdir"
+      die "目标产物身份路径已存在但不是实际目录: $newdir"
+    validate_artifact_identity "$newdir" "$version" "$sha256"
+    validate_module_runtime "$m" "$newdir" "$artifact_arch"
   else
-    local expected_name="$m-$version"
     ACTIVE_UPGRADE_STAGE_PARENT="$mdir"
     ACTIVE_UPGRADE_STAGE="$(mktemp -d "$mdir/.upgrade-staging.XXXXXX")"
     log "解包 $artifact"
@@ -182,15 +313,21 @@ upgrade_one() {
       die "解包失败: $artifact"
     fi
     validate_staged_module "$ACTIVE_UPGRADE_STAGE" "$expected_name"
+    candidate="$ACTIVE_UPGRADE_STAGE/$expected_name"
+    validate_module_runtime "$m" "$candidate" "$artifact_arch"
+    write_artifact_identity "$candidate" "$version" "$sha256"
 
-    # staging 与最终目录同在 mdir 下；该 mv 是同文件系统内的原子 rename。
-    # 发布前再次拒绝已有路径，避免把 staging 嵌套进疑似完整的版本目录。
+    # staging 与最终目录同在 mdir 下；GNU mv -T 保证同文件系统原子 rename，
+    # 即使并发出现同名目录也不会把 candidate 嵌套进去或覆盖旧身份。
     [ ! -e "$newdir" ] && [ ! -L "$newdir" ] || \
-      die "目标版本目录在解包期间出现，拒绝覆盖: $newdir"
-    mv -- "$ACTIVE_UPGRADE_STAGE/$expected_name" "$newdir"
+      die "目标产物身份目录在解包期间出现，拒绝覆盖: $newdir"
+    if ! mv -T -- "$candidate" "$newdir"; then
+      die "发布产物身份目录失败（拒绝覆盖已有路径）: $newdir"
+    fi
     rmdir -- "$ACTIVE_UPGRADE_STAGE"
     ACTIVE_UPGRADE_STAGE=""
     ACTIVE_UPGRADE_STAGE_PARENT=""
+    validate_artifact_identity "$newdir" "$version" "$sha256"
   fi
 
   # 停该模块的服务（记录原本在跑的，升级后拉回来）
@@ -219,6 +356,7 @@ upgrade_one() {
   [ -n "$running" ] && "$DBDOGCTL" stop $running
 
   run_hook "$newdir" pre-switch     # 数据库增量迁移在这里（goose up / drizzle）
+  validate_artifact_identity "$newdir" "$version" "$sha256"
   if [ "$UPGRADE_RECOVERY_OLD_PRESENT" -eq 1 ]; then
     [ -L "$current" ] && \
       [ "$(readlink "$current")" = "$UPGRADE_RECOVERY_OLD_TARGET" ] || \
@@ -229,6 +367,7 @@ upgrade_one() {
   fi
   ln -sfn "$newdir" "$current"
   run_hook "$newdir" post-switch
+  validate_artifact_identity "$newdir" "$version" "$sha256"
 
   # 首次安装时把包内配置模板放进 etc/（已存在则不覆盖——配置永不被升级碰）
   if [ -d "$newdir/etc" ]; then
@@ -250,19 +389,20 @@ upgrade_one() {
   UPGRADE_RECOVERY_OLD_PRESENT=0
   UPGRADE_RECOVERY_OLD_TARGET=""
   UPGRADE_RECOVERY_RUNNING=""
-  log "$m: $inst → $version 完成"
+  log "$m: $inst → ${version}（artifact ${sha256:0:12}）完成"
 }
 
 ensure_layout
 if [ $# -gt 0 ]; then
   targets=("$@")
 else
-  # 默认：已安装且版本与 manifest 不同的模块
+  # 默认：已安装且版本或产物 SHA 与 manifest 不同（含旧目录无 SHA marker）的模块
   targets=()
-  while IFS=$'\t' read -r m _kind target _svc version _a _s _ss; do
+  while IFS=$'\t' read -r m _kind target _svc version _artifact sha256 _source_sha; do
     [ "$target" = "stack" ] || continue
-    inst="$(installed_version "$m")"
-    [ "$inst" != "-" ] && [ "$version" != "-" ] && [ "$inst" != "$version" ] && targets+=("$m")
+    [ "$version" != "-" ] || continue
+    [ -e "$MODULES_DIR/$m/current" ] || [ -L "$MODULES_DIR/$m/current" ] || continue
+    current_matches_artifact_identity "$m" "$version" "$sha256" || targets+=("$m")
   done < <(manifest_rows)
   [ ${#targets[@]} -gt 0 ] || { log "没有可升级的模块（check-upgrade.sh 可查看详情）"; exit 0; }
 fi

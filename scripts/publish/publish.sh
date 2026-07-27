@@ -7,6 +7,7 @@
 #   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
+# 本机还需 tar、file、find、objdump，用于上传前核对包内全部机器码架构。
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../lib.sh"   # log/die/manifest_* （其内网路径变量在本机不使用）
@@ -86,7 +87,8 @@ update_manifest_row() { # <module> <version> <artifact> <sha256> <source_sha>
 }
 
 build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUILT_ARTIFACT/BUILT_SHA256
-  local m="$1" ver="$2" recipe="$HERE/recipes/$m.sh" sha="" core=""
+  local m="$1" ver="$2" sha="" core=""
+  local recipe="$HERE/recipes/$m.sh"
   [ -f "$recipe" ] || die "缺少构建配方: $recipe"
   [ -n "${BUILD_HOST:-}" ] && [ "$BUILD_HOST" != "z1@CHANGE-ME" ] \
     || die "publish.conf 未配置 BUILD_HOST（cp publish.conf.example publish.conf）"
@@ -94,6 +96,12 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
     sha="$(git -C "$SRC_ROOT/$m" rev-parse HEAD)"
     [ "$m" = "dbdog-agent" ] && core="$(git -C "$SRC_ROOT/dbdog-agent-core" rev-parse HEAD)"
   fi
+
+  local build_arch
+  build_arch="$(ssh "$BUILD_HOST" uname -m | tail -n1)" \
+    || die "[$m] 无法读取构建机架构"
+  [ "$build_arch" = "$ARCH" ] \
+    || die "[$m] 构建机架构是 $build_arch，不能发布为 $ARCH"
 
   log "[$m] 构建于 $BUILD_HOST ..."
   local out
@@ -106,13 +114,31 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
 
   mkdir -p "$SCRATCH"
   BUILT_ARTIFACT="$(basename "$rpath")"
+  case "$BUILT_ARTIFACT" in
+    "$m"-*) ;;
+    *) die "[$m] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
+  esac
   log "[$m] 取回产物 $BUILT_ARTIFACT"
   scp -q "$BUILD_HOST:$rpath" "$SCRATCH/$BUILT_ARTIFACT"
+  local artifact_arch
+  case "$BUILT_ARTIFACT" in
+    *-"$ARCH".tar.gz) artifact_arch="$ARCH" ;;
+    *-noarch.tar.gz) artifact_arch="noarch" ;;
+    *) die "[$m] 产物名没有受支持的架构后缀: $BUILT_ARTIFACT" ;;
+  esac
+  "$HERE/verify-artifact-arch.sh" "$SCRATCH/$BUILT_ARTIFACT" "$artifact_arch" "$m"
   BUILT_SHA256="$(shasum -a 256 "$SCRATCH/$BUILT_ARTIFACT" | awk '{print $1}')"
 
   ensure_bucket
+  local existing_assets
+  existing_assets="$(gh release view "$BUCKET_TAG" -R "$REPO" \
+    --json assets --jq '.assets[].name')" \
+    || die "[$m] 无法读取产物桶资产名"
+  if printf '%s\n' "$existing_assets" | grep -Fqx -- "$BUILT_ARTIFACT"; then
+    die "[$m] 产物桶已存在同名文件，拒绝覆盖: $BUILT_ARTIFACT（请增加版本或 -dbdog.N revision）"
+  fi
   log "[$m] 上传产物桶"
-  gh release upload "$BUCKET_TAG" "$SCRATCH/$BUILT_ARTIFACT" --clobber -R "$REPO"
+  gh release upload "$BUCKET_TAG" "$SCRATCH/$BUILT_ARTIFACT" -R "$REPO"
 
   local srcsha="-"
   [ "$(manifest_get "$m" 2)" = "first-party" ] && srcsha="$(live_sha "$m")"

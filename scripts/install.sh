@@ -18,7 +18,7 @@ preflight_host() {
   local arch cmd
   arch="$(uname -m)"
   [ "$arch" = "aarch64" ] || die "仅支持 aarch64，当前架构: $arch"
-  for cmd in id git curl tar awk grep find install mktemp readlink; do
+  for cmd in id git curl tar awk grep find install mktemp readlink file ldd env; do
     command -v "$cmd" >/dev/null 2>&1 || die "缺少必需命令: $cmd"
   done
   [ "$(id -un)" = "dbdog" ] || die "请用专用 dbdog 账户执行，当前用户: $(id -un)"

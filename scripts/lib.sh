@@ -17,6 +17,8 @@ DATA_DIR="$DBDOG_HOME/data"
 LOGS_DIR="$DBDOG_HOME/logs"
 RUN_DIR="$DBDOG_HOME/run"
 CACHE_DIR="$DBDOG_HOME/cache"
+MODULE_VERSION_MARKER=".dbdog-manifest-version"
+MODULE_ARTIFACT_SHA256_MARKER=".dbdog-artifact-sha256"
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -43,9 +45,82 @@ manifest_modules() { # manifest_modules [target 过滤]
   manifest_rows | awk -F'\t' -v t="$t" 't=="" || $3==t {print $1}'
 }
 
-installed_version() { # 已装版本；未装输出 "-"
-  local m="$1" link="$MODULES_DIR/$1/current"
-  if [ -L "$link" ]; then basename "$(readlink "$link")" | sed "s/^$m-//"; else echo "-"; fi
+installed_module_dir() { # installed_module_dir <模块>；仅返回模块目录内的 current 实体
+  local m="$1" link="$MODULES_DIR/$1/current" dir module_root
+  [ -L "$link" ] || return 1
+  dir="$(cd "$link" 2>/dev/null && pwd -P)" || return 1
+  [ -d "$dir" ] || return 1
+  module_root="$(cd "$MODULES_DIR/$m" 2>/dev/null && pwd -P)" || return 1
+  case "$dir" in
+    "$module_root"/*) printf '%s\n' "$dir" ;;
+    *) return 1 ;;
+  esac
+}
+
+module_marker_value() { # module_marker_value <版本目录> <marker 文件名>
+  local dir="$1" marker="$1/$2" value lines
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  lines="$(awk 'END { print NR }' "$marker")"
+  [ "$lines" -eq 1 ] || return 1
+  value="$(<"$marker")"
+  case "$value" in
+    "" | *$'\n'* | *$'\r'*) return 1 ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+installed_version() { # 已装 manifest 版本；旧目录无 marker 时兼容目录名
+  local m="$1" link="$MODULES_DIR/$1/current" dir marker value base
+  if ! dir="$(installed_module_dir "$m")"; then
+    if [ -e "$link" ] || [ -L "$link" ]; then echo "?"; else echo "-"; fi
+    return
+  fi
+  marker="$dir/$MODULE_VERSION_MARKER"
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    if value="$(module_marker_value "$dir" "$MODULE_VERSION_MARKER")"; then
+      case "$value" in
+        "." | ".." | */*) echo "?" ;;
+        *) printf '%s\n' "$value" ;;
+      esac
+    else
+      echo "?"
+    fi
+    return
+  fi
+  base="$(basename "$(readlink "$link")")"
+  case "$base" in
+    "$m-"*) printf '%s\n' "${base#"$m-"}" ;;
+    *) printf '%s\n' "$base" ;;
+  esac
+}
+
+installed_artifact_sha256() { # 已装产物 SHA；旧目录/缺失 marker 输出 "-"，损坏输出 "?"
+  local m="$1" dir marker value
+  if ! dir="$(installed_module_dir "$m")"; then
+    if [ -e "$MODULES_DIR/$m/current" ] || [ -L "$MODULES_DIR/$m/current" ]; then
+      echo "?"
+    else
+      echo "-"
+    fi
+    return
+  fi
+  marker="$dir/$MODULE_ARTIFACT_SHA256_MARKER"
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    echo "-"
+    return
+  fi
+  if ! value="$(module_marker_value "$dir" "$MODULE_ARTIFACT_SHA256_MARKER")"; then
+    echo "?"
+    return
+  fi
+  if [ "${#value}" -ne 64 ]; then
+    echo "?"
+    return
+  fi
+  case "$value" in
+    *[!0-9a-f]*) echo "?" ;;
+    *) printf '%s\n' "$value" ;;
+  esac
 }
 
 # ---- 下载与校验 ----
