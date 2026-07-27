@@ -111,6 +111,20 @@ check_elf_paths() { # check_elf_paths <文件> <显示路径>
               ;;
           esac
           ;;
+        /ClickHouse/ci/tmp/build/contrib/libllvmlibc-cmake)
+          # ClickHouse 官方 aarch64v80compat 下载物是自解压 ELF：外壳会在首次
+          # `--version` 探测时原地展开为正式 clickhouse-stripped。该外壳只依赖
+          # glibc 系统库，却残留了官方 CI 的无效 RUNPATH；仅对固定模块位置及
+          # 自解压尾标放行，不能借此接受普通 ELF 的绝对构建路径。
+          [ "$module" = "clickhouse" ] \
+            || die "ELF 含不可搬迁的 RPATH/RUNPATH: $path ($entry)"
+          case "$path" in
+            clickhouse-[0-9]*/bin/clickhouse) ;;
+            *) die "ClickHouse 自解压 ELF 位于未知路径: $path" ;;
+          esac
+          tail -c 512 "$file_path" | grep -aFq 'clickhouse-stripped' \
+            || die "ClickHouse ELF 缺少官方自解压尾标: $path"
+          ;;
         *) die "ELF 含不可搬迁的 RPATH/RUNPATH: $path ($entry)" ;;
       esac
     done

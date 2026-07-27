@@ -8,7 +8,7 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-07-26 23:28（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-07-27 00:22（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 |
 | --- | --- | --- | --- | --- |
@@ -17,7 +17,7 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 | dbdog-mcp | first-party | 全家桶机 | 0.1.0 | dbdog-mcp-0.1.0-noarch.tar.gz |
 | dbdog-agent | first-party | DB 主机 | 7.81.1-dbdog.1 | dbdog-agent-7.81.1-dbdog.1-aarch64.tar.gz |
 | postgresql | third-party | 全家桶机 | 16.14 | postgresql-16.14-aarch64.tar.gz |
-| clickhouse | third-party | 全家桶机 | 24.8.5.115 | clickhouse-24.8.5.115-aarch64.tar.gz |
+| clickhouse | third-party | 全家桶机 | 26.8.1.184 | clickhouse-26.8.1.184-aarch64.tar.gz |
 | node | third-party | 全家桶机 | 20.18.1 | node-20.18.1-aarch64.tar.gz |
 | goose | third-party | 全家桶机 | 3.27.3 | goose-3.27.3-aarch64.tar.gz |
 <!-- VERSION-TABLE:END -->
@@ -30,8 +30,9 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 ## 内网首次安装：全家桶机
 
 前提：麒麟 V10 / aarch64、专用 `dbdog` 账户、出网 HTTPS 可达 `github.com` 和
-`release-assets.githubusercontent.com`。当前 stack 压缩产物合计约 300 MiB，此外还需
-模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。
+`release-assets.githubusercontent.com`。当前 stack 压缩产物合计约 305 MiB，此外还需
+模块解包及 PG/CH 数据空间；先用 `df -h "$HOME"` 确认实际余量。ClickHouse 首次探测会
+从约 154 MiB 自解压为约 708 MiB，模块目录应至少额外留出 1 GiB。
 
 ### 1. 拉取并安装到配置阶段
 
@@ -90,9 +91,9 @@ tail -n 100 ~/dbdog/logs/dbdog-server.log   # 按失败项换成对应日志
 ```
 
 判断架构以 `file <二进制>` 为准；当前发布物中的 Linux 用户态机器码均为 AArch64。
-ClickHouse 24.8.5.115 是官方 arm64 构建，要求现代 ARMv8.2 CPU 特性，但**不要求 SVE**。
-若 `clickhouse --version` 报 `Illegal instruction`，请保留下面各项原始输出，不要换用 amd64
-文件，也不要用 `OPENSSL_no_sve` 绕过：
+ClickHouse 26.8.1.184 是官方 `aarch64v80compat` 快照，基线为 ARMv8+CRC，不要求
+RCpc/LDAPR，供鲲鹏 920 等缺少 `lrcpc` 的 CPU 使用。安装/升级会先在 staging 中运行
+`--version`，成功后才切换 `current`。若仍报 `Illegal instruction`，请保留下面各项原始输出：
 
 ```bash
 uname -m
