@@ -1089,6 +1089,8 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
     /usr/bin/flock -n "$pipeline_lock_fd" || die '另一个 Agent 构建/seed 正持有固定 pipeline lock'
     preflight_fresh_build_capacity
     prepare_fresh_system_probe_seed
+    # publish.sh 通过 ssh `bash -s` 流式送入本配方；runner 若继承 stdin，可能读走
+    # Bash 尚未解析的后半段并制造“退出 0、结果行为空”的假成功。
     /usr/bin/env -i \
       HOME=/home/dbdog \
       USER=dbdog \
@@ -1098,7 +1100,7 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
       LANG=C.UTF-8 \
       LC_ALL=C.UTF-8 \
       DBDOG_PACKAGE_VERSION="$VERSION" \
-      "$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR" >&2
+      "$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR" </dev/null >&2
   ) || die '固定 v13 Omnibus fresh seed/runner 失败'
   runner_executed=1
 fi

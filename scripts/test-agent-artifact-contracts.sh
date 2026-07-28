@@ -121,8 +121,8 @@ grep -Fq 'target_prefix="$BUILD_DIR/src/"' "$RECIPE" ||
   fail "sealed output manifest is not relocated to the v13 attempt"
 grep -Fq 'mv -- "$FRESH_SEED_PROGRESS" "$FRESH_SEED_MARKER"' "$RECIPE" ||
   fail "fresh seed lacks an atomic complete-marker transition"
-grep -Fq '"$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR"' "$RECIPE" ||
-  fail "seed and v13 runner are not serialized by the same pipeline lock"
+grep -Fq '"$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR" </dev/null >&2' "$RECIPE" ||
+  fail "v13 runner can consume the remaining SSH-fed recipe or escape the shared pipeline lock"
 grep -Fq 'exec {pipeline_lock_fd}<"$PIPELINE_LOCK"' "$RECIPE" ||
   fail "recipe does not open the root-owned pipeline lock read-only"
 if grep -Fq 'exec {pipeline_lock_fd}>"$PIPELINE_LOCK"' "$RECIPE"; then
