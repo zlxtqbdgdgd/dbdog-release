@@ -12,8 +12,10 @@ BUILD_WORK="/home/z1/dbdog-release-build" # 发布构建工作目录（自动创
 # 构建机上工具链 PATH 前缀（go / cargo / node 所在 bin 目录，冒号分隔）
 TOOL_PATH="/home/z1/dbdog/dev/go/bin:/home/z1/.cargo/bin"
 
-# dbdog-agent 版本基线（上游 milestone；发布号形如 7.81.1-dbdog.N）
-AGENT_BASE_VERSION="7.81.1"
+# dbdog-agent 版本前缀和实际出货源码不接受本机配置覆盖。发布器只读取：
+#   $SRC_ROOT/dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv
+# 官方稳定三段 tag 是版本前缀，-dbdog.N 是本地打包修订；官方基线变化时 N 从 1 重置。
+# release.json 的 current_milestone 不是发布依据。
 
 # PostgreSQL 留空时从构建机 PATH 自动探测 pg_config。
 #PG_PREFIX="/usr/local/pgsql"   # PostgreSQL 安装前缀（bin/lib/share 的父目录）

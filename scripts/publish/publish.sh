@@ -22,13 +22,188 @@ SRC_ROOT="${SRC_ROOT:-$(cd "$RELEASE_DIR/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-/home/z1/dbdog/repo}"
 BUILD_WORK="${BUILD_WORK:-/home/z1/dbdog-release-build}"
 TOOL_PATH="${TOOL_PATH:-}"
-AGENT_BASE_VERSION="${AGENT_BASE_VERSION:-7.81.1}"
+
+# Agent 的版本前缀和实际出货源码都只能来自 Agent 仓中已提交、已推送的发布基线。
+# 这里故意不保留环境变量或 release.json/current_milestone fallback，避免构建者本机配置
+# 把同一份源码打成不同版本，或把尚未钉住的 HEAD 悄悄带入产物。
+load_agent_release_baseline() {
+  local agent_repo="$SRC_ROOT/dbdog-agent"
+  local core_repo="$SRC_ROOT/dbdog-agent-core"
+  local baseline_rel="dbdog-deploy/RELEASE-BASELINE.tsv"
+  local baseline="$agent_repo/$baseline_rel"
+
+  [ -d "$agent_repo/.git" ] || die "Agent 源仓不存在: $agent_repo"
+  [ -d "$core_repo/.git" ] || die "Agent integrations-core 源仓不存在: $core_repo"
+  [ -f "$baseline" ] && [ ! -L "$baseline" ] \
+    || die "Agent 发布基线不存在或不是普通文件: $baseline"
+  git -C "$agent_repo" ls-files --error-unmatch -- "$baseline_rel" >/dev/null 2>&1 \
+    || die "Agent 发布基线尚未纳入版本控制: $baseline_rel"
+  git -C "$agent_repo" diff --quiet HEAD -- "$baseline_rel" \
+    || die "Agent 发布基线有未提交变更，拒绝发布: $baseline_rel"
+  git -C "$agent_repo" rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
+    || die "Agent 源仓缺少 origin/main，无法验证发布基线"
+  git -C "$agent_repo" diff --quiet origin/main -- "$baseline_rel" \
+    || die "Agent 发布基线尚未原样推送到 origin/main，拒绝发布"
+
+  # v1 是严格的 key<TAB>value 合约：不得缺键、重复、留空或夹带未知字段。
+  if ! awk -F '\t' '
+      BEGIN {
+        allowed["schema"] = 1
+        allowed["agent_official_version"] = 1
+        allowed["agent_official_tag"] = 1
+        allowed["agent_official_commit"] = 1
+        allowed["agent_release_source_commit"] = 1
+        allowed["integrations_core_official_version"] = 1
+        allowed["integrations_core_official_tag"] = 1
+        allowed["integrations_core_official_commit"] = 1
+        allowed["integrations_core_release_source_commit"] = 1
+        allowed["official_version_format"] = 1
+        allowed["official_tag_must_equal_version"] = 1
+        allowed["official_commit_must_be_tag_target"] = 1
+        allowed["official_commit_must_be_release_source_ancestor"] = 1
+        allowed["release_source_commit_must_be_head_ancestor"] = 1
+        allowed["release_prefix_key"] = 1
+        allowed["dbdog_version_template"] = 1
+        allowed["dbdog_revision_initial"] = 1
+        allowed["dbdog_revision_reset_on_official_baseline_change"] = 1
+        allowed["release_build_must_use_explicit_source_commits"] = 1
+        allowed["release_json_current_milestone_is_prefix_authority"] = 1
+        expected = 20
+      }
+      {
+        if (NF != 2 || $1 == "" || $2 == "" || !($1 in allowed) || seen[$1]++) bad = 1
+      }
+      END {
+        if (NR != expected) bad = 1
+        for (key in allowed) if (!(key in seen)) bad = 1
+        exit bad ? 1 : 0
+      }
+    ' "$baseline"; then
+    die "Agent 发布基线不符合 dbdog-agent-release-baseline/v1 严格字段合约"
+  fi
+
+  agent_baseline_value() {
+    awk -F '\t' -v key="$1" '$1 == key { print $2; exit }' "$baseline"
+  }
+  AGENT_BASELINE_SCHEMA="$(agent_baseline_value schema)"
+  AGENT_OFFICIAL_VERSION="$(agent_baseline_value agent_official_version)"
+  AGENT_OFFICIAL_TAG="$(agent_baseline_value agent_official_tag)"
+  AGENT_OFFICIAL_COMMIT="$(agent_baseline_value agent_official_commit)"
+  AGENT_RELEASE_SOURCE_COMMIT="$(agent_baseline_value agent_release_source_commit)"
+  INTEGRATIONS_CORE_OFFICIAL_VERSION="$(agent_baseline_value integrations_core_official_version)"
+  INTEGRATIONS_CORE_OFFICIAL_TAG="$(agent_baseline_value integrations_core_official_tag)"
+  INTEGRATIONS_CORE_OFFICIAL_COMMIT="$(agent_baseline_value integrations_core_official_commit)"
+  INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT="$(agent_baseline_value integrations_core_release_source_commit)"
+
+  [ "$AGENT_BASELINE_SCHEMA" = "dbdog-agent-release-baseline/v1" ] \
+    || die "不支持的 Agent 发布基线 schema: $AGENT_BASELINE_SCHEMA"
+  [[ "$AGENT_OFFICIAL_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || die "Agent 官方版本必须是稳定三段 SemVer: $AGENT_OFFICIAL_VERSION"
+  [[ "$INTEGRATIONS_CORE_OFFICIAL_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || die "integrations-core 官方版本必须是稳定三段 SemVer: $INTEGRATIONS_CORE_OFFICIAL_VERSION"
+  [ "$AGENT_OFFICIAL_TAG" = "$AGENT_OFFICIAL_VERSION" ] \
+    || die "Agent 官方 tag 必须等于官方版本"
+  [ "$INTEGRATIONS_CORE_OFFICIAL_TAG" = "$INTEGRATIONS_CORE_OFFICIAL_VERSION" ] \
+    || die "integrations-core 官方 tag 必须等于官方版本"
+
+  local commit
+  for commit in \
+    "$AGENT_OFFICIAL_COMMIT" "$AGENT_RELEASE_SOURCE_COMMIT" \
+    "$INTEGRATIONS_CORE_OFFICIAL_COMMIT" "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT"; do
+    [ "${#commit}" -eq 40 ] || die "Agent 发布基线 commit 不是 40 位 SHA: $commit"
+    case "$commit" in *[!0-9a-f]*) die "Agent 发布基线 commit 含非法字符: $commit" ;; esac
+  done
+
+  [ "$(agent_baseline_value official_version_format)" = "three_segment_semver" ] \
+    || die "Agent 发布基线禁止使用非三段稳定版本"
+  [ "$(agent_baseline_value official_tag_must_equal_version)" = "true" ] \
+    || die "Agent 发布基线必须要求 tag 等于 version"
+  [ "$(agent_baseline_value official_commit_must_be_tag_target)" = "true" ] \
+    || die "Agent 发布基线必须钉住 tag target"
+  [ "$(agent_baseline_value official_commit_must_be_release_source_ancestor)" = "true" ] \
+    || die "Agent 发布基线必须要求官方 commit 是出货源码祖先"
+  [ "$(agent_baseline_value release_source_commit_must_be_head_ancestor)" = "true" ] \
+    || die "Agent 发布基线必须要求出货源码是 HEAD 祖先"
+  [ "$(agent_baseline_value release_prefix_key)" = "agent_official_version" ] \
+    || die "Agent 发布前缀只能取 agent_official_version"
+  [ "$(agent_baseline_value dbdog_version_template)" = '${agent_official_version}-dbdog.${revision}' ] \
+    || die "Agent dbdog 版本模板不符合发布政策"
+  [ "$(agent_baseline_value dbdog_revision_initial)" = "1" ] \
+    || die "Agent 本地打包修订必须从 1 开始"
+  [ "$(agent_baseline_value dbdog_revision_reset_on_official_baseline_change)" = "true" ] \
+    || die "Agent 官方基线变化时必须重置本地打包修订"
+  [ "$(agent_baseline_value release_build_must_use_explicit_source_commits)" = "true" ] \
+    || die "Agent 构建必须使用显式源码锚"
+  [ "$(agent_baseline_value release_json_current_milestone_is_prefix_authority)" = "false" ] \
+    || die "release.json current_milestone 禁止作为 Agent 发布前缀"
+
+  git -C "$agent_repo" show-ref --verify --quiet "refs/tags/$AGENT_OFFICIAL_TAG" \
+    || die "Agent 官方 tag 不存在: $AGENT_OFFICIAL_TAG"
+  [ "$(git -C "$agent_repo" rev-parse --verify "refs/tags/$AGENT_OFFICIAL_TAG^{commit}")" = \
+      "$AGENT_OFFICIAL_COMMIT" ] \
+    || die "Agent 官方 tag 没有精确解析到基线 commit"
+  git -C "$core_repo" show-ref --verify --quiet "refs/tags/$INTEGRATIONS_CORE_OFFICIAL_TAG" \
+    || die "integrations-core 官方 tag 不存在: $INTEGRATIONS_CORE_OFFICIAL_TAG"
+  [ "$(git -C "$core_repo" rev-parse --verify "refs/tags/$INTEGRATIONS_CORE_OFFICIAL_TAG^{commit}")" = \
+      "$INTEGRATIONS_CORE_OFFICIAL_COMMIT" ] \
+    || die "integrations-core 官方 tag 没有精确解析到基线 commit"
+
+  git -C "$agent_repo" merge-base --is-ancestor \
+    "$AGENT_OFFICIAL_COMMIT" "$AGENT_RELEASE_SOURCE_COMMIT" \
+    || die "Agent 官方 commit 不是实际出货源码的祖先"
+  git -C "$core_repo" merge-base --is-ancestor \
+    "$INTEGRATIONS_CORE_OFFICIAL_COMMIT" "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" \
+    || die "integrations-core 官方 commit 不是实际出货源码的祖先"
+  git -C "$agent_repo" merge-base --is-ancestor "$AGENT_RELEASE_SOURCE_COMMIT" HEAD \
+    || die "Agent 实际出货源码不是当前 HEAD 的祖先"
+  git -C "$core_repo" merge-base --is-ancestor "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" HEAD \
+    || die "integrations-core 实际出货源码不是当前 HEAD 的祖先"
+  git -C "$agent_repo" merge-base --is-ancestor "$AGENT_RELEASE_SOURCE_COMMIT" origin/main \
+    || die "Agent 实际出货源码尚未进入 origin/main"
+  git -C "$core_repo" rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
+    || die "integrations-core 源仓缺少 origin/main"
+  git -C "$core_repo" merge-base --is-ancestor "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" origin/main \
+    || die "integrations-core 实际出货源码尚未进入 origin/main"
+
+  unset -f agent_baseline_value
+}
+
+warn_agent_unshipped_heads() { # 调用前已 load_agent_release_baseline
+  local agent_head core_head
+  agent_head="$(git -C "$SRC_ROOT/dbdog-agent" rev-parse HEAD)"
+  core_head="$(git -C "$SRC_ROOT/dbdog-agent-core" rev-parse HEAD)"
+  [ "$agent_head" = "$AGENT_RELEASE_SOURCE_COMMIT" ] \
+    || warn "dbdog-agent HEAD 已超前；本次只出货基线源码 ${AGENT_RELEASE_SOURCE_COMMIT:0:12}，HEAD ${agent_head:0:12} 未纳入"
+  [ "$core_head" = "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" ] \
+    || warn "dbdog-agent-core HEAD 已超前；本次只出货基线源码 ${INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT:0:12}，HEAD ${core_head:0:12} 未纳入"
+}
+
+agent_version_uses_loaded_baseline() { # <manifest version>；调用前已 load_agent_release_baseline
+  local version="$1" revision prefix
+  prefix="$AGENT_OFFICIAL_VERSION-dbdog."
+  case "$version" in "$prefix"*) revision="${version#"$prefix"}" ;; *) return 1 ;; esac
+  case "$revision" in "" | 0 | 0* | *[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+agent_version_uses_current_baseline() { # <manifest version>
+  load_agent_release_baseline
+  agent_version_uses_loaded_baseline "$1"
+}
+
+agent_loaded_source_fingerprint() { # 调用前已 load_agent_release_baseline
+  local agent_short core_short
+  agent_short="$(git -C "$SRC_ROOT/dbdog-agent" rev-parse --short=7 "$AGENT_RELEASE_SOURCE_COMMIT")"
+  core_short="$(git -C "$SRC_ROOT/dbdog-agent-core" rev-parse --short=7 "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT")"
+  printf 'agent:%s,core:%s\n' "$agent_short" "$core_short"
+}
 
 # ---- 变更检测 ----
 live_sha() { # 当前源码指纹（与 manifest.source_sha 同格式）
   case "$1" in
     dbdog-agent)
-      echo "agent:$(git -C "$SRC_ROOT/dbdog-agent" rev-parse --short=7 HEAD),core:$(git -C "$SRC_ROOT/dbdog-agent-core" rev-parse --short=7 HEAD)" ;;
+      load_agent_release_baseline
+      agent_loaded_source_fingerprint ;;
     *) git -C "$SRC_ROOT/$1" rev-parse --short=7 HEAD ;;
   esac
 }
@@ -37,17 +212,37 @@ changed_first_party() {
   while IFS=$'\t' read -r m kind _t _s _v _a _h recorded; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || { warn "源仓不存在: $SRC_ROOT/${m}，跳过 $m"; continue; }
-    [ "$(live_sha "$m")" != "$recorded" ] && echo "$m"
+    if [ "$m" = "dbdog-agent" ]; then
+      load_agent_release_baseline
+      local current_sha
+      current_sha="$(agent_loaded_source_fingerprint)"
+      if [ "$current_sha" != "$recorded" ] || ! agent_version_uses_loaded_baseline "$_v"; then
+        echo "$m"
+      fi
+    elif [ "$(live_sha "$m")" != "$recorded" ]; then
+      echo "$m"
+    fi
   done < <(manifest_rows)
 }
 
 ensure_pushed() { # 构建机从 origin 取码，未推送的提交构建不到
-  local repo
+  local repo target
   for repo in "$@"; do
+    target=HEAD
+    case "$repo" in
+      dbdog-agent)
+        load_agent_release_baseline
+        target="$AGENT_RELEASE_SOURCE_COMMIT"
+        ;;
+      dbdog-agent-core)
+        load_agent_release_baseline
+        target="$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT"
+        ;;
+    esac
     git -C "$SRC_ROOT/$repo" fetch -q origin \
       || warn "$repo fetch origin 失败，用本地已有的 origin/main 引用判断"
-    git -C "$SRC_ROOT/$repo" merge-base --is-ancestor HEAD origin/main \
-      || die "$repo 本地 HEAD 尚未推送到 origin/main，先 push 再发布"
+    git -C "$SRC_ROOT/$repo" merge-base --is-ancestor "$target" origin/main \
+      || die "$repo 出货源码 $target 尚未推送到 origin/main，先 push 再发布"
   done
 }
 
@@ -55,10 +250,16 @@ ensure_pushed() { # 构建机从 origin 取码，未推送的提交构建不到
 bump_version() { # bump_version <模块> <当前版本> <patch|minor|major>
   local m="$1" cur="$2" level="${3:-patch}"
   if [ "$m" = "dbdog-agent" ]; then
-    if [[ "$cur" == "$AGENT_BASE_VERSION-dbdog."* ]]; then
-      echo "$AGENT_BASE_VERSION-dbdog.$(( ${cur##*.} + 1 ))"
+    local revision prefix
+    load_agent_release_baseline
+    prefix="$AGENT_OFFICIAL_VERSION-dbdog."
+    if agent_version_uses_loaded_baseline "$cur"; then
+      revision="${cur#"$prefix"}"
+      echo "$prefix$((revision + 1))"
+    elif [ "$cur" = "-" ] || [[ "$cur" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dbdog\.([1-9][0-9]*)$ ]]; then
+      echo "${prefix}1"
     else
-      echo "$AGENT_BASE_VERSION-dbdog.1"
+      die "Agent manifest 版本格式非法，不能安全推导下一修订: $cur"
     fi
     return
   fi
@@ -139,14 +340,24 @@ fetch_remote_artifact() { # <远端绝对路径> <本地文件>；校验远端 S
 }
 
 build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUILT_ARTIFACT/BUILT_SHA256
-  local m="$1" ver="$2" sha="" core=""
+  local m="$1" ver="$2" sha="" core="" kind agent_baseline_blob=""
   local recipe="$HERE/recipes/$m.sh"
   [ -f "$recipe" ] || die "缺少构建配方: $recipe"
   [ -n "${BUILD_HOST:-}" ] && [ "$BUILD_HOST" != "z1@CHANGE-ME" ] \
     || die "publish.conf 未配置 BUILD_HOST（cp publish.conf.example publish.conf）"
-  if [ "$(manifest_get "$m" 2)" = "first-party" ]; then
-    sha="$(git -C "$SRC_ROOT/$m" rev-parse HEAD)"
-    [ "$m" = "dbdog-agent" ] && core="$(git -C "$SRC_ROOT/dbdog-agent-core" rev-parse HEAD)"
+  kind="$(manifest_get "$m" 2)"
+  if [ "$kind" = "first-party" ]; then
+    if [ "$m" = "dbdog-agent" ]; then
+      load_agent_release_baseline
+      sha="$AGENT_RELEASE_SOURCE_COMMIT"
+      core="$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT"
+      agent_version_uses_loaded_baseline "$ver" \
+        || die "[$m] 待构建版本不属于当前官方基线: $ver"
+      agent_baseline_blob="$(git -C "$SRC_ROOT/dbdog-agent" hash-object \
+        dbdog-deploy/RELEASE-BASELINE.tsv)"
+    else
+      sha="$(git -C "$SRC_ROOT/$m" rev-parse HEAD)"
+    fi
   fi
 
   local build_arch
@@ -163,6 +374,9 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   BUILT_VERSION="${out%%$'\t'*}"
   local rpath="${out#*$'\t'}"
   [ -n "$BUILT_VERSION" ] && [ "$rpath" != "$out" ] || die "[$m] 配方输出不合约定（应为 版本<TAB>产物路径）: $out"
+  if [ "$kind" = "first-party" ] && [ "$BUILT_VERSION" != "$ver" ]; then
+    die "[$m] 配方返回版本与发布计划不一致: 计划=$ver，实际=$BUILT_VERSION"
+  fi
 
   mkdir -p "$SCRATCH"
   BUILT_ARTIFACT="$(basename "$rpath")"
@@ -174,7 +388,7 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   if [ "$m" = dbdog-agent ]; then
     # Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个 build attempt；
     # 它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的路径/owner/mode 门禁。
-    expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build2/out/$BUILT_ARTIFACT"
+    expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build3/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
   fi
@@ -191,6 +405,19 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   "$HERE/verify-artifact-arch.sh" "$SCRATCH/$BUILT_ARTIFACT" "$artifact_arch" "$m"
   BUILT_SHA256="$(shasum -a 256 "$SCRATCH/$BUILT_ARTIFACT" | awk '{print $1}')"
 
+  if [ "$m" = "dbdog-agent" ]; then
+    # Agent 构建耗时很长；上传前重读基线，避免等待期间有人换锚，导致版本/manifest
+    # 记录与刚构建完成的实际 SHA 不一致。
+    load_agent_release_baseline
+    [ "$AGENT_RELEASE_SOURCE_COMMIT" = "$sha" ] \
+      && [ "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" = "$core" ] \
+      && [ "$(git -C "$SRC_ROOT/dbdog-agent" hash-object \
+        dbdog-deploy/RELEASE-BASELINE.tsv)" = "$agent_baseline_blob" ] \
+      || die "[$m] 构建期间发布基线发生变化，拒绝上传；请按新基线重新构建"
+    agent_version_uses_loaded_baseline "$BUILT_VERSION" \
+      || die "[$m] 构建版本已不属于当前官方基线，拒绝上传: $BUILT_VERSION"
+  fi
+
   ensure_bucket
   local existing_assets
   existing_assets="$(gh release view "$BUCKET_TAG" -R "$REPO" \
@@ -203,7 +430,13 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   gh release upload "$BUCKET_TAG" "$SCRATCH/$BUILT_ARTIFACT" -R "$REPO"
 
   local srcsha="-"
-  [ "$(manifest_get "$m" 2)" = "first-party" ] && srcsha="$(live_sha "$m")"
+  if [ "$kind" = "first-party" ]; then
+    if [ "$m" = "dbdog-agent" ]; then
+      srcsha="$(agent_loaded_source_fingerprint)"
+    else
+      srcsha="$(live_sha "$m")"
+    fi
+  fi
   update_manifest_row "$m" "$BUILT_VERSION" "$BUILT_ARTIFACT" "$BUILT_SHA256" "$srcsha"
 }
 
@@ -233,8 +466,17 @@ cmd_plan() {
   while IFS=$'\t' read -r m kind _t _s v _a _h recorded; do
     if [ "$kind" = "first-party" ]; then
       if [ -d "$SRC_ROOT/$m/.git" ]; then
-        local_sha="$(live_sha "$m")"
+        if [ "$m" = "dbdog-agent" ]; then
+          load_agent_release_baseline
+          warn_agent_unshipped_heads
+          local_sha="$(agent_loaded_source_fingerprint)"
+        else
+          local_sha="$(live_sha "$m")"
+        fi
         st="一致"; [ "$local_sha" != "$recorded" ] && st="有变更 ←"
+        if [ "$m" = "dbdog-agent" ]; then
+          agent_version_uses_loaded_baseline "$v" || st="官方版本基线变化 ←"
+        fi
         printf '%-14s %-24s %-24s %s\n' "$m(v$v)" "$recorded" "$local_sha" "$st"
       else
         printf '%-14s %-24s %-24s %s\n' "$m(v$v)" "$recorded" "?" "源仓缺失"
@@ -336,8 +578,14 @@ cmd_publish() {
       *) mods+=("$1"); shift ;;
     esac
   done
+  case "$bump" in patch | minor | major) ;; *) die "未知 bump 级别: $bump" ;; esac
   if [ ${#mods[@]} -eq 0 ]; then
-    while read -r m; do mods+=("$m"); done < <(changed_first_party)
+    local changed
+    changed="$(changed_first_party)" \
+      || die "检测一方模块发布状态失败"
+    while IFS= read -r m; do
+      [ -n "$m" ] && mods+=("$m")
+    done <<<"$changed"
     [ ${#mods[@]} -gt 0 ] || { log "没有变更的一方模块（三方件需点名发布）"; exit 0; }
   fi
 
@@ -346,7 +594,15 @@ cmd_publish() {
   for m in "${mods[@]}"; do
     local kind cur nv
     kind="$(manifest_get "$m" 2)"; cur="$(manifest_get "$m" 5)"
-    if [ "$kind" = "first-party" ]; then nv="$(bump_version "$m" "$cur" "$bump")"; else nv="(配方探测)"; fi
+    if [ "$kind" = "first-party" ]; then
+      if [ "$m" = "dbdog-agent" ]; then
+        load_agent_release_baseline
+        warn_agent_unshipped_heads
+      fi
+      nv="$(bump_version "$m" "$cur" "$bump")"
+    else
+      nv="(配方探测)"
+    fi
     plan_vers+=("$nv")
     printf '  %-14s %s → %s\n' "$m" "$cur" "$nv"
   done
@@ -388,10 +644,16 @@ cmd_prune() {
   prune_modules_to_manifest "$yes"
 }
 
-case "${1:-plan}" in
-  plan) cmd_plan ;;
-  publish) shift; cmd_publish "$@" ;;
-  regen-readme) regen_readme ;;
-  prune) shift; cmd_prune "$@" ;;
-  *) die "用法: publish.sh plan|publish|regen-readme|prune" ;;
-esac
+main() {
+  case "${1:-plan}" in
+    plan) cmd_plan ;;
+    publish) shift; cmd_publish "$@" ;;
+    regen-readme) regen_readme ;;
+    prune) shift; cmd_prune "$@" ;;
+    *) die "用法: publish.sh plan|publish|regen-readme|prune" ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

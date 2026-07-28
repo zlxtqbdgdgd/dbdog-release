@@ -2,7 +2,7 @@
 # 配方：固定输入的 Kylin V10 AArch64 dbdog-agent Omnibus 运行时。
 # 输入 env（由 publish.sh 提供）：MODULE VERSION SHA CORE_SHA ARCH。
 #
-# 本配方消费已经持久化并校验过的 v7 manifest、v11 control overlay、固定
+# 本配方消费已经持久化并校验过的 v7 manifest、v12 control overlay、固定
 # patchelf 工具和 post-build dependency seal；不会重新解析版本或另建一次性
 # 依赖目录。当前 seal
 # 明确是 partial closure，不等于“任意新机器离线一键重放”。新构建机必须先迁移
@@ -48,21 +48,21 @@ readonly PINNED_OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
 readonly PINNED_INTEGRATION_CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly CORE_REPO="$CACHE_ROOT/git/dbdog-agent-core.git"
-readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
+readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3
 readonly INSTALL_DIR=/opt/dbdog-agent
-readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2/out
+readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3/out
 readonly MANIFEST_REL="manifests/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7"
 readonly MANIFEST_DIR="$CACHE_ROOT/$MANIFEST_REL"
 readonly INPUTS_MANIFEST_SHA256=e050cda2067907527b5ff4d3991320d75a2cc8b1f68e078531c1b5fae502ef79
 readonly RUBY_CACHE_MANIFEST_SHA256=29539b716e760e178b3a11ce07256e39438dbb5f1008898590ce355eda823c45
-readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v11"
+readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v12"
 readonly OVERLAY_DIR="$CACHE_ROOT/$OVERLAY_REL"
 readonly RUNNER="$OVERLAY_DIR/run-agent-omnibus.sh"
-readonly RUNNER_SHA256=b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184
+readonly RUNNER_SHA256=82c0514179d586f569e7287cbad28893ac4b9009e5fc3b61300d33085d0fbcc6
 readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly CONTROL_INFO_SHA256=3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647
-readonly CONTROL_MANIFEST_SHA256=5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81
-# dependency seal 是在 v10 构建依赖闭包上生成的；v11 只增加显式版本输入，
+readonly CONTROL_INFO_SHA256=3febbbe8331078aa8b9f12592ef95731b5913bc066faecc8bc8e786ba53ecc1a
+readonly CONTROL_MANIFEST_SHA256=0c01d4833beb9391fd411bcae4ca23208d6ad73e3e5935f549a9a3b5e24c2ff4
+# dependency seal 是在 v10 构建依赖闭包上生成的；v12 只校正显式版本输入，
 # 不重写也不冒充旧 seal 的控制元数据。
 readonly SEAL_OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
 readonly SEAL_RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
@@ -85,9 +85,9 @@ readonly SEAL_DIR="$CACHE_ROOT/seals/${MANIFEST_REL##*/}/omnibus-cache-v2"
 # all-zero placeholder while preparing a new control generation.
 readonly TRACKED_SEAL_CONTROL_SHA256=ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3
 readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
-readonly FINALIZER_SHA256=41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07
+readonly FINALIZER_SHA256=968bdc937041b2aacef7173afc4dbe0b68ab063a5374211b29f987c450438e82
 readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"
-readonly FINALIZER_WRAPPER_SHA256=4abdafe78d8394f30f7f26abaeafc2a0f716b2e5f5494c9cafe909b8e7d7d905
+readonly FINALIZER_WRAPPER_SHA256=9d97177db1fe5ddf4ac2559eade9395c62408a169c69cd783fcd3bac6d967ac5
 readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
 readonly GAUSSDB_INTEGRATION_VERSION=1.0.0
 readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
@@ -101,13 +101,13 @@ for frozen_sha_name in \
   TRACKED_SEAL_CONTROL_SHA256 FINALIZER_SHA256 FINALIZER_WRAPPER_SHA256; do
   frozen_sha=${!frozen_sha_name}
   [[ $frozen_sha =~ ^[0-9a-f]{64}$ && $frozen_sha != "$UNFROZEN_SHA256" ]] || \
-    die "$frozen_sha_name 尚未冻结为 v11 控制文件的真实 SHA-256"
+    die "$frozen_sha_name 尚未冻结为 v12 控制文件的真实 SHA-256"
 done
 unset frozen_sha_name frozen_sha
 
 [[ $MODULE == dbdog-agent ]] || die "MODULE 必须是 dbdog-agent，实际为 $MODULE"
-[[ $VERSION =~ ^7[.]81[.]1-dbdog[.][1-9][0-9]*$ ]] || \
-  die "VERSION 必须是 7.81.1-dbdog.N（N 从 1 开始），实际为 $VERSION"
+[[ $VERSION =~ ^7[.]81[.]0-dbdog[.][1-9][0-9]*$ ]] || \
+  die "VERSION 必须是 7.81.0-dbdog.N（N 从 1 开始），实际为 $VERSION"
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || die 'SHA 必须是完整的小写 40 位提交 SHA'
 [[ $CORE_SHA =~ ^[0-9a-f]{40}$ ]] || die 'CORE_SHA 必须是完整的小写 40 位提交 SHA'
 [[ $SHA == "$PINNED_AGENT_SHA" ]] || \
@@ -181,22 +181,22 @@ verify_persistent_controls() {
   (cd "$CACHE_ROOT" && sha256sum -c "$MANIFEST_REL/RUBY-BUNDLE-CACHE.sha256" >/dev/null) || \
     die 'v7 Ruby 持久化缓存校验失败'
 
-  require_root_readonly_dir 'v11 control overlay' "$OVERLAY_DIR"
+  require_root_readonly_dir 'v12 control overlay' "$OVERLAY_DIR"
   expected_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
   overlay_inventory=$(find "$OVERLAY_DIR" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v11 control overlay 文件集合不匹配'
+  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v12 control overlay 文件集合不匹配'
   printf '%s  %s\n' "$CONTROL_MANIFEST_SHA256" "$OVERLAY_DIR/CONTROL.sha256" | \
-    sha256sum -c - >/dev/null || die 'v11 CONTROL.sha256 自身不匹配'
+    sha256sum -c - >/dev/null || die 'v12 CONTROL.sha256 自身不匹配'
   cmp -s -- "$OVERLAY_DIR/CONTROL.sha256" <(
     printf '%s  %s\n' \
       "$RUNNER_SHA256" "$OVERLAY_REL/run-agent-omnibus.sh" \
       "$PLATFORM_PATCH_SHA256" "$OVERLAY_REL/agent-build-kylin-platform.patch" \
       "$CONTROL_INFO_SHA256" "$OVERLAY_REL/CONTROL-INFO" \
       "$PATCHELF_SHA256" "$PATCHELF_REL"
-  ) || die 'v11 CONTROL.sha256 必须精确包含固定顺序的四行清单'
+  ) || die 'v12 CONTROL.sha256 必须精确包含固定顺序的四行清单'
   (cd "$CACHE_ROOT" && sha256sum -c "$OVERLAY_REL/CONTROL.sha256" >/dev/null) || \
-    die 'v11 control overlay 或固定 patchelf 内容校验失败'
-  require_root_control 'v11 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
+    die 'v12 control overlay 或固定 patchelf 内容校验失败'
+  require_root_control 'v12 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
 }
 
 verify_patchelf_tool() (
@@ -354,7 +354,7 @@ verify_live_omnibus_handoff() {
   write_expected_omnibus_marker "$expected"
   if ! cmp -s -- "$expected" "$BUILD_DIR/omnibus.success"; then
     rm -f -- "$expected"
-    die 'omnibus.success 与固定 v7/v11 handoff 不匹配'
+    die 'omnibus.success 与固定 v7/v12 handoff 不匹配'
   fi
   rm -f -- "$expected"
 }
@@ -578,19 +578,20 @@ fi
 
 runner_executed=0
 if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; then
-  runner_mode=()
-  if [[ -e $BUILD_DIR/omnibus-post-health-v2.log || -L $BUILD_DIR/omnibus-post-health-v2.log || \
-        -e $BUILD_DIR/src/omnibus/pkg/post-health-resume.json || -L $BUILD_DIR/src/omnibus/pkg/post-health-resume.json || \
-        -e $INSTALL_DIR/.debug || -L $INSTALL_DIR/.debug ]]; then
-    runner_mode=(--adopt-post-health-v2)
-    log '未发现成功 handoff，但发现 post-health v2 完成态；调用固定 v11 adoption 入口'
-  elif [[ -e $BUILD_DIR/omnibus-v9-retry6.log && -d /opt/.dbdog-agent-prestrip-post-health-v2-20260727 ]] && \
-       find "$INSTALL_DIR" -mindepth 1 -print -quit | grep -q .; then
-    runner_mode=(--resume-v9-retry6-post-health)
-    log '未发现成功 handoff；调用固定 v11 retry6 post-health resume 入口'
-  else
-    log '未发现成功 handoff；调用固定 v11 fresh runner（依赖和 patchelf 从已验证的持久 cache 复用）'
+  # resume/adopt 仅属于历史 build1 的一次性恢复合同。build3 若根据共享的
+  # /opt/dbdog-agent 状态猜测续跑模式，会被 runner 拒绝，也可能把旧 attempt 当成
+  # 当前输入。v12 因此只允许显式 fresh；管理员需先把上一轮 runtime 移到其历史
+  # build 目录并准备一个 canonical、dbdog-owned 的空 install root。
+  [[ -d $INSTALL_DIR && ! -L $INSTALL_DIR ]] || \
+    die "v12 fresh install root 不是实际目录: $INSTALL_DIR"
+  [[ $(readlink -e -- "$INSTALL_DIR") == "$INSTALL_DIR" ]] || \
+    die 'v12 fresh install root 路径发生解析'
+  [[ $(stat -c '%u:%g:%a' -- "$INSTALL_DIR") == 1001:1001:755 ]] || \
+    die 'v12 fresh install root 必须是 dbdog:dbdog mode 0755'
+  if find "$INSTALL_DIR" -mindepth 1 -print -quit | grep -q .; then
+    die 'v12/build3 只接受空的 /opt/dbdog-agent；请先把旧 runtime 完整移入其历史 build 目录，禁止删除依赖 cache'
   fi
+  log '未发现成功 handoff；调用固定 v12 fresh runner（依赖和 patchelf 从已验证的持久 cache 复用）'
   /usr/bin/env -i \
     HOME=/home/dbdog \
     USER=dbdog \
@@ -600,7 +601,7 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     DBDOG_PACKAGE_VERSION="$VERSION" \
-    "$RUNNER" "${runner_mode[@]}" "$BUILD_DIR" >&2 || die '固定 v11 Omnibus runner 失败'
+    "$RUNNER" "$BUILD_DIR" >&2 || die '固定 v12 Omnibus fresh runner 失败'
   runner_executed=1
 fi
 verify_live_omnibus_handoff

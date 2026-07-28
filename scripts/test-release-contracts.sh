@@ -42,7 +42,7 @@ DBDOG_MIGRATION_REQUIRED=1 run_hook "$hook_root" pre-switch >/dev/null
 pass "升级编排把 required=1 传入模块迁移钩子"
 
 # shellcheck disable=SC2016
-grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build2/out/$BUILT_ARTIFACT"' \
+grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-4c39489b-build3/out/$BUILT_ARTIFACT"' \
   "$SCRIPTS_DIR/publish/publish.sh" || fail "Agent 发布器未钉住 seal 的 canonical out 路径"
 # shellcheck disable=SC2016
 grep -Fq 'expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"' \

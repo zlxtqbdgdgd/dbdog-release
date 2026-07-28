@@ -1,14 +1,14 @@
 # dbdog-agent build controls
 
 This directory tracks the small, exact controls for the pinned Kylin V10
-AArch64 build. The active control generation is v11, the active attempt is
-`/home/dbdog/work/dbdog-agent-4c39489b-build2`, and the current release version
-authority is exactly `7.81.1-dbdog.3`.
+AArch64 build. The active control generation is v12, the active attempt is
+`/home/dbdog/work/dbdog-agent-4c39489b-build3`, and the current release version
+authority is exactly `7.81.0-dbdog.1`.
 
 Toolchains, source archives, Go modules, Ruby gems, Bazel repositories,
 Omnibus downloads, and compiled tools are not stored here. Persistent inputs
 remain below `/home/dbdog/cache/dbdog-agent` and are verified by the v7 base
-manifest, the active v11 control overlay, and the dependency seal.
+manifest, the active v12 control overlay, and the dependency seal.
 
 ## Pinned identities and their roles
 
@@ -19,9 +19,10 @@ manifest, the active v11 control overlay, and the dependency seal.
 - post-Omnibus GaussDB integration source:
   `662ad3974b950f67cf162fb273c180d08cc87a06`
 - GaussDB integration package: `datadog-gaussdb` `1.0.0`
-- release version: `7.81.1-dbdog.3`
+- official synchronized Agent tag: `7.81.0`
+- release version: `7.81.0-dbdog.1`
 - platform: Kylin V10 AArch64
-- build attempt: `/home/dbdog/work/dbdog-agent-4c39489b-build2`
+- build attempt: `/home/dbdog/work/dbdog-agent-4c39489b-build3`
 - base manifest:
   `manifests/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7`
 
@@ -36,37 +37,53 @@ The integration version is the version of the packaged collector code. It is
 not the version of a monitored GaussDB server. Target database version and
 environment information are discovered at runtime.
 
-## Active v11 overlay and explicit Agent version
+The official baseline and the two actual release-source commits are read from
+`dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv`. The three-segment prefix must
+equal the last fully merged official Agent tag. `-dbdog.N` is the local release
+revision: it increases within one official baseline and resets to 1 when that
+baseline changes. Upstream `release.json.current_milestone` is not a release
+version authority.
 
-Install the four files below `omnibus-kylin-platform-v11/` without changing
+## Active v12 overlay and explicit Agent version
+
+Install the four files below `omnibus-kylin-platform-v12/` without changing
 their bytes at:
 
-`/home/dbdog/cache/dbdog-agent/control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v11/`
+`/home/dbdog/cache/dbdog-agent/control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v12/`
 
 The directory is `root:root` mode `0555`; `run-agent-omnibus.sh` is mode
 `0555`; the other three files are mode `0444`. `CONTROL.sha256` verifies the
 three overlay files plus the external pinned patchelf binary at its
 cache-relative path.
 
-The v11 runner retains the v10 Kylin health-check and native-build controls,
+The v12 runner retains the v10 Kylin health-check and native-build controls,
 but it no longer derives the package version from the build machine's
 incomplete Git tag namespace. For the current build, the recipe passes
-`DBDOG_PACKAGE_VERSION=7.81.1-dbdog.3`. The runner:
+`DBDOG_PACKAGE_VERSION=7.81.0-dbdog.1`. The runner:
 
 1. rejects a pre-existing `agent-version.cache`;
 2. creates an attempt-local, exact version cache;
 3. verifies `dda inv -- agent.version --url-safe` resolves to
-   `7.81.1-dbdog.3`;
+   `7.81.0-dbdog.1`;
 4. verifies the compiled Agent and Omnibus version manifest report the same
    version; and
 5. removes the temporary cache on exit.
+
+build3 is always a fresh attempt. Historical `--resume`/`--adopt` modes remain
+evidence for build1 only and the active recipe never infers them from the
+shared install prefix. Before the first build3 invocation, preserve the old
+runtime as
+`/home/dbdog/work/dbdog-agent-4c39489b-build2/finalized-runtime-7.81.1-dbdog.3`
+and recreate `/opt/dbdog-agent` as an empty, canonical `dbdog:dbdog` mode
+`0755` directory. Dependency manifests, seals, mirrors, downloads, and build
+caches below `/home/dbdog/cache/dbdog-agent` are retained unchanged.
 
 The finalizer independently requires agreement among the outer release
 version, `agent version`, the `version-manifest.txt` header and component row,
 and `version-manifest.json`'s `build_version`. The canonical artifact verifier
 rechecks the resulting hashes and provenance before publication. A build that
 internally reports `7.79.0` or any other version cannot be published as
-`7.81.1-dbdog.3`.
+`7.81.0-dbdog.1`.
 
 ## GaussDB integration wheel authority
 
@@ -110,14 +127,14 @@ Install these controls as `root:root` mode `0555`:
 - `seal-agent-build-dependencies-v1.sh` →
   `/home/dbdog/cache/dbdog-agent/controls/seal-agent-build-dependencies-v1.sh`
 
-The current wrapper is pinned to build2, the v11 overlay, Omnibus core
+The current wrapper is pinned to build3, the v12 overlay, Omnibus core
 `7a424759...`, post-Omnibus integration core `662ad397...`, and the current
 finalizer checksum. After the Omnibus handoff and dependency-seal checks pass,
 the current release is finalized interactively with:
 
 ```bash
 sudo /home/dbdog/cache/dbdog-agent/controls/run-finalize-agent-runtime-v1.sh \
-  7.81.1-dbdog.3
+  7.81.0-dbdog.1
 ```
 
 Do not grant this command `NOPASSWD`: the finalizer deliberately executes the
@@ -126,7 +143,7 @@ does not install controls, edit sudoers, or perform non-interactive privilege
 escalation. A later publish invocation verifies and reuses the root-owned
 artifact and sidecar under:
 
-`/home/dbdog/work/dbdog-agent-4c39489b-build2/out/`
+`/home/dbdog/work/dbdog-agent-4c39489b-build3/out/`
 
 `/run/dbdog-agent-finalize` contains only the root-private build lock. Large
 archive and extraction work is created below the root-owned mode `0700`
@@ -149,13 +166,13 @@ The seal records the runuser shim/target and the exact `checkmodule`,
 identity, SHA-256, size, mode, canonical path, and execution/read contracts.
 
 The dependency seal was generated from the build1/v10 dependency closure and
-intentionally retains that identity. v11 changes only the explicit Agent
+intentionally retains that identity. v12 corrects only the explicit Agent
 version authority; it does not change the source, compiler, dependency, or
 platform-patch closure. The active recipe therefore verifies two separate
 control layers: `SEAL_*` pins must match the existing v10 seal, while the live
-Omnibus handoff must match the v11 runner. The tracked
+Omnibus handoff must match the v12 runner. The tracked
 `seal-agent-build-dependencies-v1.sh` is the expected generator for that v10
-seal and no v11 relabeling or seal regeneration is required.
+seal and no v12 relabeling or seal regeneration is required.
 
 The cache is a reusable build input, not disposable state. Pinned archives,
 Git mirrors, the Bazel repository cache, `distdir`, manifests, bundles, and
@@ -171,8 +188,9 @@ mutate the immutable dependency authorities.
 
 ## Current SHA-256 values
 
-The first four v10 entries identify the dependency seal; the following v11
-entries identify the active live build handoff.
+The first four v10 entries identify the dependency seal. The v11 entries are
+retained as history; the following v12 and root-control entries identify the
+active live build handoff.
 
 ```text
 abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812  omnibus-kylin-platform-v10/run-agent-omnibus.sh
@@ -183,14 +201,18 @@ b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184  omnibus-kylin-
 b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe  omnibus-kylin-platform-v11/agent-build-kylin-platform.patch
 3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647  omnibus-kylin-platform-v11/CONTROL-INFO
 5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81  omnibus-kylin-platform-v11/CONTROL.sha256
+82c0514179d586f569e7287cbad28893ac4b9009e5fc3b61300d33085d0fbcc6  omnibus-kylin-platform-v12/run-agent-omnibus.sh
+b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe  omnibus-kylin-platform-v12/agent-build-kylin-platform.patch
+3febbbe8331078aa8b9f12592ef95731b5913bc066faecc8bc8e786ba53ecc1a  omnibus-kylin-platform-v12/CONTROL-INFO
+0c01d4833beb9391fd411bcae4ca23208d6ad73e3e5935f549a9a3b5e24c2ff4  omnibus-kylin-platform-v12/CONTROL.sha256
 a9a043a7975a7b4b1f43de46cdcaca292adc51799aa281cb9b47a276134871b7  patchelf-0.18.0-aarch64-kylin10-v2/PATCHELF-INFO
 4d49826b6fcfdd770c1c5e36182d4f5dc103e333a420a71e8d6d04ea867147d7  patchelf-0.18.0-aarch64-kylin10-v2/SHA256SUMS
 01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf  external tools/patchelf/0.18.0-aarch64-kylin10-v2/bin/patchelf
 06fd5eea7acd51a0ebf519be58a2700f1ca4142a13b0668cb7f5e66ef022f7f6  external sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
-41e0c25a51672d01a687c431535c06772b48895b18b694c976b877f0cbe5ac07  finalize-agent-runtime-v1.sh
-4abdafe78d8394f30f7f26abaeafc2a0f716b2e5f5494c9cafe909b8e7d7d905  run-finalize-agent-runtime-v1.sh
+968bdc937041b2aacef7173afc4dbe0b68ab063a5374211b29f987c450438e82  finalize-agent-runtime-v1.sh
+9d97177db1fe5ddf4ac2559eade9395c62408a169c69cd783fcd3bac6d967ac5  run-finalize-agent-runtime-v1.sh
 ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3  seal-agent-build-dependencies-v1.sh
-0f63879423a69300797f254e9dc23796783fa59001937eef084b700dbbc1c106  ../recipes/dbdog-agent.sh
+9161fbcd20ee6e4d15ac8cb981a54dc411acb9c3aef88235761a0e5a53a3b158  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical overlays
@@ -207,7 +229,11 @@ authority, but its ambient incomplete Git tag namespace produced a compiled
 Agent version of `7.79.0` while the outer artifact was named
 `7.81.1-dbdog.2`.
 
-v11 retains the established Kylin build and dependency contract and adds the
-explicit release-version authority and post-build version gates described
-above. The active recipe, finalizer, and root wrapper accept only the v11
-handoff and build2 paths.
+v11 retained the established Kylin build and dependency contract and added
+the explicit release-version authority and post-build version gates. It built
+and finalized `7.81.1-dbdog.3` consistently, but that three-segment prefix came
+from upstream `current_milestone`, not the last fully merged official tag.
+
+v12 keeps those gates, binds the prefix to official tag `7.81.0`, resets the
+local revision to `dbdog.1`, and uses the isolated build3 path. The active
+recipe, finalizer, and root wrapper accept only this v12/build3 handoff.

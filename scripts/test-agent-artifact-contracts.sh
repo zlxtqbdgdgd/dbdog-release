@@ -37,12 +37,20 @@ grep -Fq 'integrations_core_git_sha=$core_sha' "$FINALIZER" ||
   fail "build provenance does not identify the integration source core"
 pass "sealed Omnibus input and post-build integration source have separate identities"
 
-grep -Fq 'omnibus-kylin-platform-v11' "$FINALIZER" || fail "finalizer is not pinned to v11"
-grep -Fq 'BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2' "$RECIPE" ||
-  fail "recipe is not pinned to the v11 build2 attempt"
+grep -Fq 'omnibus-kylin-platform-v12' "$FINALIZER" || fail "finalizer is not pinned to v12"
+grep -Fq 'BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3' "$RECIPE" ||
+  fail "recipe is not pinned to the v12 build3 attempt"
 grep -Fq 'DBDOG_PACKAGE_VERSION="$VERSION"' "$RECIPE" ||
-  fail "recipe does not pass the explicit release VERSION authority into v11"
-pass "v11/build2 receives an explicit package version authority"
+  fail "recipe does not pass the explicit release VERSION authority into v12"
+grep -Fq '^7[.]81[.]0-dbdog[.][1-9][0-9]*$' "$RECIPE" ||
+  fail "recipe does not bind releases to the synchronized official 7.81.0 baseline"
+if grep -Fq 'runner_mode=(--adopt-post-health-v2)' "$RECIPE" ||
+   grep -Fq 'runner_mode=(--resume-v9-retry6-post-health)' "$RECIPE"; then
+  fail "v12/build3 recipe still guesses a legacy build1 resume mode"
+fi
+grep -Fq 'v12/build3 只接受空的 /opt/dbdog-agent' "$RECIPE" ||
+  fail "v12/build3 recipe does not fail closed on a shared old install tree"
+pass "v12/build3 receives the explicit official-baseline package version authority"
 
 for required in --no-index --no-deps --force-reinstall --no-cache-dir; do
   grep -Fq -- "$required" "$FINALIZER" || fail "offline wheel install lacks $required"

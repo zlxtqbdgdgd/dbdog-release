@@ -23,11 +23,11 @@ readonly ADP_INPUT_SHA256=f071bd14e06308754848140f7b5beac27b02e11105e0970b293417
 readonly AGENT_CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly EXPECTED_MANIFEST_REL=manifests/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7
 readonly EXPECTED_OMNIBUS_RUBY_SHA=5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749
-readonly EXPECTED_CONTROL_OVERLAY_REL=control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v11
-readonly EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=b28e75b7bc1318a82b5584e747e83b11d596ac7b403292162e8c7599c3f58184
+readonly EXPECTED_CONTROL_OVERLAY_REL=control-overlays/4c39489b8c0b7fb7a46af88062fb9aadf2c08264-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v12
+readonly EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=82c0514179d586f569e7287cbad28893ac4b9009e5fc3b61300d33085d0fbcc6
 readonly EXPECTED_PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly EXPECTED_CONTROL_INFO_SHA256=3c5af9befdf56c45ebfb14e366b3324f84aa9f0f81390e47a5357beca70a5647
-readonly EXPECTED_CONTROL_MANIFEST_SHA256=5bf2b308b3d3e936c95080b4577630c65f0606008ce652ae06b5c36b20551c81
+readonly EXPECTED_CONTROL_INFO_SHA256=3febbbe8331078aa8b9f12592ef95731b5913bc066faecc8bc8e786ba53ecc1a
+readonly EXPECTED_CONTROL_MANIFEST_SHA256=0c01d4833beb9391fd411bcae4ca23208d6ad73e3e5935f549a9a3b5e24c2ff4
 readonly EXPECTED_PATCHELF_TOOL_REL=tools/patchelf/0.18.0-aarch64-kylin10-v2
 readonly EXPECTED_PATCHELF_REL=$EXPECTED_PATCHELF_TOOL_REL/bin/patchelf
 readonly EXPECTED_PATCHELF_SHA256=01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf
@@ -147,7 +147,7 @@ verify_omnibus_success_marker() {
       "patchelf_sha256=$EXPECTED_PATCHELF_SHA256" \
       "host_distribution=$EXPECTED_HOST_DISTRIBUTION"
   ); then
-    die "omnibus.success does not match the exact Kylin v11 control handoff"
+    die "omnibus.success does not match the exact Kylin v12 control handoff"
   fi
 }
 
@@ -236,27 +236,27 @@ verify_omnibus_control_overlay() {
     die "agent cache root must resolve exactly to $AGENT_CACHE_ROOT"
   overlay_dir="$cache_root/$EXPECTED_CONTROL_OVERLAY_REL"
   [[ -d $overlay_dir && ! -L $overlay_dir ]] ||
-    die "missing real Omnibus v11 control-overlay directory"
+    die "missing real Omnibus v12 control-overlay directory"
   [[ $(readlink -e -- "$overlay_dir") == "$overlay_dir" ]] ||
-    die "Omnibus v11 control overlay resolves through an unexpected path"
+    die "Omnibus v12 control overlay resolves through an unexpected path"
   [[ $(stat -c '%u:%g:%a' -- "$overlay_dir") == 0:0:555 ]] ||
-    die "Omnibus v11 control-overlay directory must be root:root mode 0555"
+    die "Omnibus v12 control-overlay directory must be root:root mode 0555"
 
   expected_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
   actual_inventory=$(find "$overlay_dir" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
   [[ $actual_inventory == "$expected_inventory" ]] ||
-    die "Omnibus v11 control-overlay inventory differs from the exact four-file set"
+    die "Omnibus v12 control-overlay inventory differs from the exact four-file set"
 
   for overlay_file in CONTROL-INFO CONTROL.sha256 agent-build-kylin-platform.patch; do
     [[ -f $overlay_dir/$overlay_file && ! -L $overlay_dir/$overlay_file ]] ||
-      die "Omnibus v11 control file is not a real regular file: $overlay_file"
+      die "Omnibus v12 control file is not a real regular file: $overlay_file"
     [[ $(stat -c '%u:%g:%a' -- "$overlay_dir/$overlay_file") == 0:0:444 ]] ||
-      die "Omnibus v11 control file must be root:root mode 0444: $overlay_file"
+      die "Omnibus v12 control file must be root:root mode 0444: $overlay_file"
   done
   [[ -f $overlay_dir/run-agent-omnibus.sh && ! -L $overlay_dir/run-agent-omnibus.sh ]] ||
-    die "Omnibus v11 runner is not a real regular file"
+    die "Omnibus v12 runner is not a real regular file"
   [[ $(stat -c '%u:%g:%a' -- "$overlay_dir/run-agent-omnibus.sh") == 0:0:555 ]] ||
-    die "Omnibus v11 runner must be root:root mode 0555"
+    die "Omnibus v12 runner must be root:root mode 0555"
 
   if ! cmp -s -- "$overlay_dir/CONTROL.sha256" <(
     printf '%s  %s\n' \
@@ -269,15 +269,15 @@ verify_omnibus_control_overlay() {
       "$EXPECTED_PATCHELF_SHA256" \
       "$EXPECTED_PATCHELF_REL"
   ); then
-    die "Omnibus v11 CONTROL.sha256 does not match the pinned four-entry manifest"
+    die "Omnibus v12 CONTROL.sha256 does not match the pinned four-entry manifest"
   fi
   printf '%s  %s\n' "$EXPECTED_CONTROL_MANIFEST_SHA256" \
     "$overlay_dir/CONTROL.sha256" | sha256sum -c - >/dev/null ||
-    die "Omnibus v11 CONTROL.sha256 digest differs from the pinned value"
+    die "Omnibus v12 CONTROL.sha256 digest differs from the pinned value"
   (
     cd "$cache_root"
     sha256sum -c "$EXPECTED_CONTROL_OVERLAY_REL/CONTROL.sha256"
-  ) >/dev/null || die "Omnibus v11 control-overlay checksum verification failed"
+  ) >/dev/null || die "Omnibus v12 control-overlay checksum verification failed"
 
   verify_patchelf_tool_authority "$cache_root"
 }
