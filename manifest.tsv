@@ -11,7 +11,7 @@
 #     DB 主机通过 scripts/upgrade.sh dbdog-agent 完成下载、root cutover、配置与真实采集验收。
 #   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 运行时。
 dbdog-server	first-party	stack	yes	0.1.4	dbdog-server-0.1.4-aarch64.tar.gz	24826c3906bbf17738d30cb342e8e807eabf4fff59e0f0d8259802743041bf04	3c89a96
-dbdog-web	first-party	stack	yes	0.1.4	dbdog-web-0.1.4-aarch64.tar.gz	8d13e738e6d8edbd5a879f767dd4f42a8e766c2ea92a0647ea00ea9dd46a4c1d	5052411
+dbdog-web	first-party	stack	yes	0.1.5	dbdog-web-0.1.5-aarch64.tar.gz	a45d32ad994ea1a990b55a1498710995b601858a8bb1534733a8fc6d49ef1a69	ba67842
 dbdog-mcp	first-party	stack	yes	0.1.2	dbdog-mcp-0.1.2-noarch.tar.gz	a7552d1709f15fba33c19c1558c5ab13b09225f317a4ede9a223e7bff601f6df	1f900e3
 dbdog-agent	first-party	dbhost	no	7.81.0-dbdog.2	dbdog-agent-7.81.0-dbdog.2-aarch64.tar.gz	921686a1e507d231dad57157bbe9b826fa81494d05be2588f31be2e9db8b107c	agent:4c39489,core:662ad39
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-
