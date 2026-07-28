@@ -71,12 +71,34 @@ incomplete Git tag namespace. For the current build, the recipe passes
 
 build3 is always a fresh attempt. Historical `--resume`/`--adopt` modes remain
 evidence for build1 only and the active recipe never infers them from the
-shared install prefix. Before the first build3 invocation, preserve the old
-runtime as
+shared install prefix. The old runtime is preserved as
 `/home/dbdog/work/dbdog-agent-4c39489b-build2/finalized-runtime-7.81.1-dbdog.3`
-and recreate `/opt/dbdog-agent` as an empty, canonical `dbdog:dbdog` mode
-`0755` directory. Dependency manifests, seals, mirrors, downloads, and build
-caches below `/home/dbdog/cache/dbdog-agent` are retained unchanged.
+and `/opt/dbdog-agent` is an empty, canonical `dbdog:dbdog` mode `0755`
+directory. Dependency manifests, seals, mirrors, downloads, and build caches
+below `/home/dbdog/cache/dbdog-agent` are retained unchanged.
+
+The normal publish invocation now prepares the build3 pre-Omnibus handoff
+automatically under the same pipeline lock as the runner. It creates a fresh,
+no-hardlink checkout of `4c39489...` from the pinned Agent mirror, applies the
+six immutable v7 base patches and the v12 platform patch, and restores the
+four checksum-pinned preparation files. From build2 it copies only the three
+sealed system-probe tool assets and the 69 generated output files, validating
+every byte against the root-owned dependency-seal handoff. It does not copy
+build2's Omnibus work, package output, Bazel convenience symlinks, logs,
+runtime, stage config, temporary directories, or output directory.
+
+The sealed output manifest originally named build1 absolute paths. The recipe
+requires its exact `ae13f9...` checksum, strictly relocates all 69 entries to
+build3, and requires the deterministic relocated checksum
+`8b67ad9503d58431d46e058b9b15f8e5477a02a7c9c764524e77fcd0fd24437f`.
+The rebuilt `system-probe.success` marker is pinned to
+`04e6ea2758be07035dd35cc42457941c9c861739d51ad946609e63a4db1d588e`.
+The runner therefore validates build3 itself and no longer succeeds merely
+because build1 still exists. An atomic in-progress/complete marker permits
+safe restart of an interrupted seed while unknown or partial runner state
+still fails closed. Build2 is required only until that complete marker is
+created; later build3 or canonical-artifact reuse depends on the immutable
+seal and verified build3 bytes, not on retaining a mutable historical attempt.
 
 The finalizer independently requires agreement among the outer release
 version, `agent version`, the `version-manifest.txt` header and component row,
@@ -212,7 +234,7 @@ a9a043a7975a7b4b1f43de46cdcaca292adc51799aa281cb9b47a276134871b7  patchelf-0.18.
 968bdc937041b2aacef7173afc4dbe0b68ab063a5374211b29f987c450438e82  finalize-agent-runtime-v1.sh
 9d97177db1fe5ddf4ac2559eade9395c62408a169c69cd783fcd3bac6d967ac5  run-finalize-agent-runtime-v1.sh
 ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3  seal-agent-build-dependencies-v1.sh
-9161fbcd20ee6e4d15ac8cb981a54dc411acb9c3aef88235761a0e5a53a3b158  ../recipes/dbdog-agent.sh
+733389f2ce21b83a7b40983c3b61126e0689810f579abf5c5e11c8cef9d9c2e3  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical overlays

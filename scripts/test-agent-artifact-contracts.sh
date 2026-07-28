@@ -52,6 +52,41 @@ grep -Fq 'v12/build3 只接受空的 /opt/dbdog-agent' "$RECIPE" ||
   fail "v12/build3 recipe does not fail closed on a shared old install tree"
 pass "v12/build3 receives the explicit official-baseline package version authority"
 
+grep -Fq 'SYSTEM_PROBE_SEED_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2' "$RECIPE" ||
+  fail "recipe lost the exact validated system-probe seed attempt"
+grep -Fq 'SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073cf88b9510bde5f22bc1d84b3688f52' \
+  "$RECIPE" || fail "recipe does not pin the sealed 69-output manifest"
+grep -Fq 'BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256=8b67ad9503d58431d46e058b9b15f8e5477a02a7c9c764524e77fcd0fd24437f' \
+  "$RECIPE" || fail "recipe does not pin the build3-relocated output manifest"
+grep -Fq 'BUILD3_SYSTEM_PROBE_MARKER_SHA256=04e6ea2758be07035dd35cc42457941c9c861739d51ad946609e63a4db1d588e' \
+  "$RECIPE" || fail "recipe does not pin the relocated build3 handoff marker"
+grep -Fq 'git clone --local --no-hardlinks --no-checkout --no-tags' "$RECIPE" ||
+  fail "fresh source is not recreated independently from the pinned Agent mirror"
+grep -Fq 'relative=${source_path#"$SEALED_SYSTEM_PROBE_SOURCE_PREFIX"}' "$RECIPE" ||
+  fail "system-probe outputs are not copied through a strict sealed-prefix mapping"
+grep -Fq 'target_prefix="$BUILD_DIR/src/"' "$RECIPE" ||
+  fail "sealed output manifest is not relocated to build3"
+grep -Fq 'mv -- "$FRESH_SEED_PROGRESS" "$FRESH_SEED_MARKER"' "$RECIPE" ||
+  fail "fresh seed lacks an atomic complete-marker transition"
+grep -Fq '"$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR"' "$RECIPE" ||
+  fail "seed and v12 runner are not serialized by the same pipeline lock"
+grep -Fq 'exec {pipeline_lock_fd}<"$PIPELINE_LOCK"' "$RECIPE" ||
+  fail "recipe does not open the root-owned pipeline lock read-only"
+if grep -Fq 'exec {pipeline_lock_fd}>"$PIPELINE_LOCK"' "$RECIPE"; then
+  fail "recipe tries to truncate the root-owned pipeline lock as dbdog"
+fi
+if grep -Eq 'mktemp "?\$BUILD_DIR/\.v12-(seed-index|seed-marker-verify|sealed-marker-verify)' "$RECIPE"; then
+  fail "pre-seed validation temp files can poison an otherwise empty build3 after interruption"
+fi
+if grep -Eq 'cp .*"?\$SYSTEM_PROBE_SEED_BUILD_DIR/src/?"?[[:space:]]' "$RECIPE" ||
+   grep -Eq 'rsync .*SYSTEM_PROBE_SEED_BUILD_DIR' "$RECIPE"; then
+  fail "recipe copies the mutable build2 source tree wholesale"
+fi
+for excluded in 'omnibus/pkg' bazel-bin bazel-out bazel-src bazel-testlogs; do
+  grep -Fq "$excluded" "$RECIPE" || fail "fresh seed does not explicitly reject inherited $excluded"
+done
+pass "fresh build3 is recreated from pinned Git plus a sealed, path-relocated 69-output handoff"
+
 for required in --no-index --no-deps --force-reinstall --no-cache-dir; do
   grep -Fq -- "$required" "$FINALIZER" || fail "offline wheel install lacks $required"
 done

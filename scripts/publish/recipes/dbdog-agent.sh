@@ -47,7 +47,10 @@ readonly PINNED_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
 readonly PINNED_OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
 readonly PINNED_INTEGRATION_CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
+readonly AGENT_REPO="$CACHE_ROOT/git/dbdog-agent.git"
 readonly CORE_REPO="$CACHE_ROOT/git/dbdog-agent-core.git"
+readonly SYSTEM_PROBE_SEED_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
+readonly SEALED_SYSTEM_PROBE_SOURCE_PREFIX=/home/dbdog/work/dbdog-agent-4c39489b-build1/src/
 readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3
 readonly INSTALL_DIR=/opt/dbdog-agent
 readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3/out
@@ -84,6 +87,27 @@ readonly SEAL_DIR="$CACHE_ROOT/seals/${MANIFEST_REL##*/}/omnibus-cache-v2"
 # gate below keeps future edits fail-closed if a maintainer resets one to the
 # all-zero placeholder while preparing a new control generation.
 readonly TRACKED_SEAL_CONTROL_SHA256=ae4d099588ec5ae3181009bd49a3af1498755fd654673b73534498c55009b2c3
+readonly SEALED_HANDOFF_DIR="$SEAL_DIR/handoffs"
+readonly SEALED_SYSTEM_PROBE_MARKER_SHA256=7019303658b85efde4df1c5c2a1d2ac2b5f456ad51ef261fa3b79fafd829d429
+readonly SEALED_SYSTEM_PROBE_ASSETS_SHA256=a70cdbaa3632dffaee82ed7fa66feb2df7bc7dad594ca75823302601bb1ef16d
+readonly SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073cf88b9510bde5f22bc1d84b3688f52
+readonly BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256=8b67ad9503d58431d46e058b9b15f8e5477a02a7c9c764524e77fcd0fd24437f
+readonly BUILD3_SYSTEM_PROBE_MARKER_SHA256=04e6ea2758be07035dd35cc42457941c9c861739d51ad946609e63a4db1d588e
+readonly FRESH_SEED_MARKER="$BUILD_DIR/.v12-system-probe-seed"
+readonly FRESH_SEED_PROGRESS="$BUILD_DIR/.v12-system-probe-seed.in-progress"
+readonly PIPELINE_LOCK="$CACHE_ROOT/locks/dbdog-agent-4c39489b-aarch64-kylin10.pipeline.lock"
+readonly PREPARED_GO_WORK_SUM_SHA256=b7b9e2672075a3563d4327751bb42ca630f824e8f50b88d625c947e5e33a61de
+readonly PREPARED_BUNDLE_CONFIG_SHA256=ef55e48e7e17fc28cca7dfe8d54ae0ba5faff4bb23e02970f97da079a3c43e7e
+readonly PREPARED_GEMFILE_LOCK_SHA256=aac25290049ce954c2296f9e1c1694205eaa886c46c27f7d9a5b085ba9582d99
+readonly PREPARED_USER_BAZELRC_SHA256=5c848f37c71b14adc81b4a49ac34ae429ba55bbfd0aca95c253127699c64055e
+readonly -a BASE_PATCH_NAMES=(
+  agent-build-staging-only.patch
+  agent-build-resource.patch
+  agent-build-old-glibc.patch
+  agent-build-llvm-kylin.patch
+  agent-build-clang-runtime.patch
+  agent-build-omnibus-repro.patch
+)
 readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
 readonly FINALIZER_SHA256=968bdc937041b2aacef7173afc4dbe0b68ab063a5374211b29f987c450438e82
 readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"
@@ -116,7 +140,7 @@ unset frozen_sha_name frozen_sha
   die "CORE_SHA 必须是固定的 GaussDB integration 源提交 $PINNED_INTEGRATION_CORE_SHA"
 [[ $ARCH == aarch64 ]] || die "ARCH 必须是 aarch64，实际为 $ARCH"
 
-for required_tool in awk bash chmod cmp cp find git grep id mktemp python3 readlink rm rmdir sha256sum sort stat tar uname; do
+for required_tool in awk bash chmod cmp cp find flock git grep id install mkdir mktemp mv python3 readlink rm rmdir sha256sum sort stat tar uname; do
   command -v "$required_tool" >/dev/null 2>&1 || die "构建机缺少工具: $required_tool"
 done
 [[ $(id -un) == dbdog ]] || die 'Omnibus 配方必须由 dbdog 构建用户运行'
@@ -166,6 +190,322 @@ read_exact_field() {
   count=$(awk -F= -v key="$key" '$1 == key { count++ } END { print count + 0 }' "$file")
   [[ $count == 1 ]] || die "$file 必须且只能包含一个 $key"
   awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print }' "$file"
+}
+
+write_expected_system_probe_marker() {
+  local destination=$1
+  printf '%s\n' \
+    "manifest_rel=$MANIFEST_REL" \
+    "agent_sha=$PINNED_AGENT_SHA" \
+    "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
+    "assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
+    "outputs_manifest_sha256=$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    >"$destination"
+}
+
+write_expected_fresh_seed_marker() {
+  local destination=$1
+  printf '%s\n' \
+    'format=dbdog-agent-v12-system-probe-seed-v1' \
+    "agent_sha=$PINNED_AGENT_SHA" \
+    "agent_repository=$AGENT_REPO" \
+    "seed_build_dir=$SYSTEM_PROBE_SEED_BUILD_DIR" \
+    "sealed_source_prefix=$SEALED_SYSTEM_PROBE_SOURCE_PREFIX" \
+    "target_source_prefix=$BUILD_DIR/src/" \
+    "sealed_marker_sha256=$SEALED_SYSTEM_PROBE_MARKER_SHA256" \
+    "sealed_assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
+    "sealed_outputs_manifest_sha256=$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    "target_outputs_manifest_sha256=$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    >"$destination"
+}
+
+verify_fresh_seed_source_tree() (
+  local source_dir=$1 patch_name patch_index
+  [[ -d $source_dir/.git && ! -L $source_dir/.git ]] || die 'fresh seed source 缺少真实 Git 元数据目录'
+  [[ $(/usr/bin/git -C "$source_dir" rev-parse HEAD) == "$PINNED_AGENT_SHA" ]] || \
+    die 'fresh seed source HEAD 不属于固定 Agent release source'
+  [[ ! -e $source_dir/agent-version.cache && ! -L $source_dir/agent-version.cache ]] || \
+    die 'fresh seed source 含预先生成的 agent-version.cache'
+  for excluded in \
+    omnibus/pkg bazel-bin bazel-out bazel-src bazel-testlogs; do
+    [[ ! -e $source_dir/$excluded && ! -L $source_dir/$excluded ]] || \
+      die "fresh seed source 错误继承构建输出: $excluded"
+  done
+
+  patch_index=$(mktemp /tmp/.dbdog-agent-v12-seed-index.XXXXXX)
+  rm -f -- "$patch_index"
+  trap 'rm -f -- "$patch_index"' EXIT
+  cd "$source_dir"
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_INDEX_FILE="$patch_index"
+  /usr/bin/git read-tree HEAD
+  for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+    /usr/bin/git apply --cached "$MANIFEST_DIR/controls/$patch_name"
+  done
+  /usr/bin/git apply --cached "$OVERLAY_DIR/agent-build-kylin-platform.patch"
+  /usr/bin/git diff --quiet || die 'fresh seed source 不等于固定 base + Kylin platform patch 栈'
+  /usr/bin/git diff --check || die 'fresh seed source patch 栈含 whitespace 错误'
+)
+
+verify_fresh_system_probe_seed() (
+  local expected marker patch_name actual_inventory expected_inventory
+  local source_dir="$BUILD_DIR/src" assets_dir="$BUILD_DIR/exact-system-probe-assets"
+  local outputs_manifest="$assets_dir/SYSTEM-PROBE-OUTPUTS.sha256"
+
+  [[ -f $FRESH_SEED_MARKER && ! -L $FRESH_SEED_MARKER ]] || \
+    die 'build3 fresh seed 缺少原子完成标记'
+  expected=$(mktemp /tmp/.dbdog-agent-v12-seed-marker-verify.XXXXXX)
+  trap 'rm -f -- "$expected"' EXIT
+  write_expected_fresh_seed_marker "$expected"
+  cmp -s -- "$expected" "$FRESH_SEED_MARKER" || die 'build3 fresh seed 完成标记与固定输入不一致'
+
+  [[ -d $source_dir && ! -L $source_dir && $(readlink -e -- "$source_dir") == "$source_dir" ]] || \
+    die 'build3 fresh seed source 不是 canonical 实际目录'
+  [[ -d $assets_dir && ! -L $assets_dir && $(readlink -e -- "$assets_dir") == "$assets_dir" ]] || \
+    die 'build3 fresh seed assets 不是 canonical 实际目录'
+  for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+    [[ -f $BUILD_DIR/$patch_name && ! -L $BUILD_DIR/$patch_name ]] || \
+      die "build3 fresh seed 缺少 base patch: $patch_name"
+    cmp -s -- "$BUILD_DIR/$patch_name" "$MANIFEST_DIR/controls/$patch_name" || \
+      die "build3 fresh seed base patch 不属于 immutable manifest: $patch_name"
+  done
+
+  expected_inventory=$'SHA256SUMS\nSYSTEM-PROBE-OUTPUTS.sha256\nclang-bpf\nllc-bpf\nminimized-btfs.tar.xz'
+  actual_inventory=$(find "$assets_dir" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+  [[ $actual_inventory == "$expected_inventory" ]] || die 'build3 fresh seed assets 不是固定五文件集合'
+  printf '%s  %s\n' "$SEALED_SYSTEM_PROBE_ASSETS_SHA256" "$assets_dir/SHA256SUMS" | \
+    sha256sum -c - >/dev/null || die 'build3 system-probe assets manifest 不匹配'
+  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" "$outputs_manifest" | \
+    sha256sum -c - >/dev/null || die 'build3 relocated system-probe outputs manifest 不匹配'
+  (cd "$assets_dir" && sha256sum -c SHA256SUMS >/dev/null) || \
+    die 'build3 system-probe tool assets 校验失败'
+  (cd "$source_dir" && sha256sum -c "$outputs_manifest" >/dev/null) || \
+    die 'build3 的 69 个 system-probe 输出校验失败'
+
+  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_MARKER_SHA256" "$BUILD_DIR/system-probe.success" | \
+    sha256sum -c - >/dev/null || die 'build3 system-probe success marker SHA-256 不匹配'
+  write_expected_system_probe_marker "$expected"
+  cmp -s -- "$expected" "$BUILD_DIR/system-probe.success" || \
+    die 'build3 system-probe success marker 内容不匹配'
+
+  printf '%s  %s\n' "$PREPARED_GO_WORK_SUM_SHA256" "$source_dir/go.work.sum" | \
+    sha256sum -c - >/dev/null || die 'build3 go.work.sum 不匹配'
+  printf '%s  %s\n' "$PREPARED_BUNDLE_CONFIG_SHA256" "$source_dir/omnibus/.bundle/config" | \
+    sha256sum -c - >/dev/null || die 'build3 Omnibus bundle config 不匹配'
+  printf '%s  %s\n' "$PREPARED_GEMFILE_LOCK_SHA256" "$source_dir/omnibus/Gemfile.lock" | \
+    sha256sum -c - >/dev/null || die 'build3 Omnibus Gemfile.lock 不匹配'
+  printf '%s  %s\n' "$PREPARED_USER_BAZELRC_SHA256" "$source_dir/user.bazelrc" | \
+    sha256sum -c - >/dev/null || die 'build3 user.bazelrc 不匹配'
+  verify_fresh_seed_source_tree "$source_dir"
+)
+
+verify_sealed_system_probe_authority() {
+  local expected
+  require_root_readonly_dir 'sealed system-probe handoff' "$SEALED_HANDOFF_DIR"
+  require_root_control 'sealed system-probe marker' \
+    "$SEALED_HANDOFF_DIR/system-probe.success" 444 "$SEALED_SYSTEM_PROBE_MARKER_SHA256"
+  require_root_control 'sealed system-probe assets manifest' \
+    "$SEALED_HANDOFF_DIR/system-probe-assets.sha256" 444 "$SEALED_SYSTEM_PROBE_ASSETS_SHA256"
+  require_root_control 'sealed system-probe outputs manifest' \
+    "$SEALED_HANDOFF_DIR/system-probe-outputs.sha256" 444 "$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256"
+
+  expected=$(mktemp /tmp/.dbdog-agent-v12-sealed-marker-verify.XXXXXX)
+  trap 'rm -f -- "$expected"' RETURN
+  printf '%s\n' \
+    "manifest_rel=$MANIFEST_REL" \
+    "agent_sha=$PINNED_AGENT_SHA" \
+    "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
+    "assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
+    "outputs_manifest_sha256=$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    >"$expected"
+  cmp -s -- "$expected" "$SEALED_HANDOFF_DIR/system-probe.success" || \
+    die 'sealed system-probe marker 与固定 v7 handoff 不一致'
+  rm -f -- "$expected"
+  trap - RETURN
+
+  # build2 is a byte source only while preparing the first seed. Once the
+  # atomically completed build3 seed exists, later runner/artifact reuse is
+  # verified from build3 plus the immutable seal and must not depend on keeping
+  # an obsolete mutable build attempt forever.
+  if [[ -f $FRESH_SEED_MARKER && ! -L $FRESH_SEED_MARKER ]]; then
+    return
+  fi
+  [[ -d $SYSTEM_PROBE_SEED_BUILD_DIR && ! -L $SYSTEM_PROBE_SEED_BUILD_DIR ]] || \
+    die '缺少固定 build2 system-probe seed attempt'
+  [[ $(readlink -e -- "$SYSTEM_PROBE_SEED_BUILD_DIR") == "$SYSTEM_PROBE_SEED_BUILD_DIR" ]] || \
+    die 'build2 system-probe seed attempt 路径发生解析'
+  [[ $(stat -c '%u:%g' -- "$SYSTEM_PROBE_SEED_BUILD_DIR") == 1001:1001 ]] || \
+    die 'build2 system-probe seed attempt 必须由 dbdog:dbdog 持有'
+  cmp -s -- "$SYSTEM_PROBE_SEED_BUILD_DIR/system-probe.success" \
+    "$SEALED_HANDOFF_DIR/system-probe.success" || die 'build2 system-probe marker 不属于 sealed handoff'
+  cmp -s -- "$SYSTEM_PROBE_SEED_BUILD_DIR/exact-system-probe-assets/SHA256SUMS" \
+    "$SEALED_HANDOFF_DIR/system-probe-assets.sha256" || die 'build2 assets manifest 不属于 sealed handoff'
+  cmp -s -- "$SYSTEM_PROBE_SEED_BUILD_DIR/exact-system-probe-assets/SYSTEM-PROBE-OUTPUTS.sha256" \
+    "$SEALED_HANDOFF_DIR/system-probe-outputs.sha256" || die 'build2 outputs manifest 不属于 sealed handoff'
+}
+
+write_relocated_system_probe_outputs_manifest() {
+  local destination=$1
+  awk \
+    -v source_prefix="$SEALED_SYSTEM_PROBE_SOURCE_PREFIX" \
+    -v target_prefix="$BUILD_DIR/src/" '
+      BEGIN { count = 0 }
+      {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || index($2, source_prefix) != 1) exit 10
+        relative = substr($2, length(source_prefix) + 1)
+        if (relative == "" || relative ~ /^\// || relative ~ /(^|\/)\.\.(\/|$)/ || relative ~ /\\/) exit 11
+        print $1 "  " target_prefix relative
+        count++
+      }
+      END { if (count != 69) exit 12 }
+    ' "$SEALED_HANDOFF_DIR/system-probe-outputs.sha256" >"$destination" || \
+    die '无法把 sealed system-probe outputs 严格迁移到 build3'
+  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" "$destination" | \
+    sha256sum -c - >/dev/null || die 'relocated build3 system-probe outputs manifest 不确定'
+}
+
+clean_incomplete_fresh_seed() {
+  local node name patch_name allowed
+  while IFS= read -r node; do
+    name=${node##*/}
+    allowed=0
+    case $name in
+      .v12-system-probe-seed.in-progress | .v12-system-probe-seed.tmp.* | \
+      src | exact-system-probe-assets | system-probe.success)
+        allowed=1
+        ;;
+    esac
+    for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+      [[ $name == "$patch_name" ]] && allowed=1
+    done
+    ((allowed == 1)) || die "build3 在 seed 完成前出现非预期节点，拒绝清理: $node"
+  done < <(find "$BUILD_DIR" -xdev -mindepth 1 -maxdepth 1 -print)
+
+  rm -rf -- "$BUILD_DIR/src" "$BUILD_DIR/exact-system-probe-assets"
+  rm -f -- "$BUILD_DIR/system-probe.success"
+  for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+    rm -f -- "$BUILD_DIR/$patch_name"
+  done
+  while IFS= read -r node; do
+    rm -rf -- "$node"
+  done < <(find "$BUILD_DIR" -xdev -mindepth 1 -maxdepth 1 \
+    -name '.v12-system-probe-seed.tmp.*' -print)
+}
+
+prepare_fresh_system_probe_seed() {
+  local seed_stage marker_tmp patch_name expected_sha source_path relative seed_file destination
+  local asset_name
+
+  if [[ -e $FRESH_SEED_MARKER || -L $FRESH_SEED_MARKER ]]; then
+    [[ ! -e $FRESH_SEED_PROGRESS && ! -L $FRESH_SEED_PROGRESS ]] || \
+      die 'build3 同时存在 seed complete 与 in-progress 标记'
+    verify_fresh_system_probe_seed
+    return
+  fi
+
+  if [[ -e $FRESH_SEED_PROGRESS || -L $FRESH_SEED_PROGRESS ]]; then
+    [[ -f $FRESH_SEED_PROGRESS && ! -L $FRESH_SEED_PROGRESS ]] || \
+      die 'build3 seed in-progress 标记不是普通文件'
+    marker_tmp=$(mktemp /tmp/.dbdog-agent-v12-seed-marker.XXXXXX)
+    write_expected_fresh_seed_marker "$marker_tmp"
+    cmp -s -- "$marker_tmp" "$FRESH_SEED_PROGRESS" || \
+      die 'build3 seed in-progress 标记不属于当前固定输入'
+    rm -f -- "$marker_tmp"
+    log '发现可识别的 build3 seed 中断状态；仅清理该 seed 的固定节点后重新准备'
+    clean_incomplete_fresh_seed
+  else
+    if find "$BUILD_DIR" -mindepth 1 -print -quit | grep -q .; then
+      die 'build3 不是空目录且没有可信 seed 状态标记，拒绝猜测或覆盖'
+    fi
+    # The temporary marker lives beside build3, not inside it. A power loss
+    # before the rename therefore cannot turn an otherwise empty attempt into
+    # an unrecognizable non-empty directory; rename remains same-filesystem.
+    marker_tmp=$(mktemp "${BUILD_DIR%/*}/.dbdog-agent-build3-seed-marker.XXXXXX")
+    write_expected_fresh_seed_marker "$marker_tmp"
+    mv -- "$marker_tmp" "$FRESH_SEED_PROGRESS"
+  fi
+
+  seed_stage=$(mktemp -d "$BUILD_DIR/.v12-system-probe-seed.tmp.XXXXXX")
+  trap 'if [[ -n ${seed_stage:-} && -e $seed_stage ]]; then rm -rf -- "$seed_stage"; fi' RETURN
+
+  /usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    /usr/bin/git clone --local --no-hardlinks --no-checkout --no-tags \
+    "$AGENT_REPO" "$seed_stage/src" >/dev/null 2>&1 || die '无法从固定 Agent mirror 创建 fresh source'
+  /usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    /usr/bin/git -C "$seed_stage/src" checkout --detach "$PINNED_AGENT_SHA" >/dev/null 2>&1 || \
+    die '无法 checkout 固定 Agent release source'
+
+  for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+    cp -- "$MANIFEST_DIR/controls/$patch_name" "$seed_stage/$patch_name"
+    /usr/bin/git -C "$seed_stage/src" apply "$MANIFEST_DIR/controls/$patch_name" || \
+      die "无法应用固定 base patch: $patch_name"
+  done
+  /usr/bin/git -C "$seed_stage/src" apply "$OVERLAY_DIR/agent-build-kylin-platform.patch" || \
+    die '无法应用固定 Kylin platform patch'
+
+  for source_path in \
+    "$SYSTEM_PROBE_SEED_BUILD_DIR/src/go.work.sum" \
+    "$SYSTEM_PROBE_SEED_BUILD_DIR/src/omnibus/.bundle/config" \
+    "$SYSTEM_PROBE_SEED_BUILD_DIR/src/omnibus/Gemfile.lock"; do
+    [[ -f $source_path && ! -L $source_path ]] || \
+      die "build2 缺少真实的固定准备文件: $source_path"
+  done
+  install -D -m 0644 "$SYSTEM_PROBE_SEED_BUILD_DIR/src/go.work.sum" \
+    "$seed_stage/src/go.work.sum"
+  install -D -m 0644 "$SYSTEM_PROBE_SEED_BUILD_DIR/src/omnibus/.bundle/config" \
+    "$seed_stage/src/omnibus/.bundle/config"
+  install -D -m 0644 "$SYSTEM_PROBE_SEED_BUILD_DIR/src/omnibus/Gemfile.lock" \
+    "$seed_stage/src/omnibus/Gemfile.lock"
+  install -D -m 0644 "$MANIFEST_DIR/controls/agent-user.bazelrc" \
+    "$seed_stage/src/user.bazelrc"
+  printf '%s  %s\n' "$PREPARED_GO_WORK_SUM_SHA256" "$seed_stage/src/go.work.sum" | sha256sum -c - >/dev/null
+  printf '%s  %s\n' "$PREPARED_BUNDLE_CONFIG_SHA256" "$seed_stage/src/omnibus/.bundle/config" | sha256sum -c - >/dev/null
+  printf '%s  %s\n' "$PREPARED_GEMFILE_LOCK_SHA256" "$seed_stage/src/omnibus/Gemfile.lock" | sha256sum -c - >/dev/null
+  printf '%s  %s\n' "$PREPARED_USER_BAZELRC_SHA256" "$seed_stage/src/user.bazelrc" | sha256sum -c - >/dev/null
+
+  mkdir -p -- "$seed_stage/exact-system-probe-assets"
+  cp -- "$SEALED_HANDOFF_DIR/system-probe-assets.sha256" \
+    "$seed_stage/exact-system-probe-assets/SHA256SUMS"
+  while read -r expected_sha asset_name; do
+    case $asset_name in clang-bpf | llc-bpf | minimized-btfs.tar.xz) ;; *) die "sealed assets manifest 含非预期名称: $asset_name" ;; esac
+    seed_file="$SYSTEM_PROBE_SEED_BUILD_DIR/exact-system-probe-assets/$asset_name"
+    [[ -f $seed_file && ! -L $seed_file ]] || die "build2 缺少真实 system-probe asset: $asset_name"
+    printf '%s  %s\n' "$expected_sha" "$seed_file" | sha256sum -c - >/dev/null || \
+      die "build2 system-probe asset 不匹配 sealed manifest: $asset_name"
+    cp -p --reflink=auto --sparse=always -- "$seed_file" \
+      "$seed_stage/exact-system-probe-assets/$asset_name"
+  done <"$SEALED_HANDOFF_DIR/system-probe-assets.sha256"
+  write_relocated_system_probe_outputs_manifest \
+    "$seed_stage/exact-system-probe-assets/SYSTEM-PROBE-OUTPUTS.sha256"
+
+  while read -r expected_sha source_path; do
+    relative=${source_path#"$SEALED_SYSTEM_PROBE_SOURCE_PREFIX"}
+    [[ $relative != "$source_path" && -n $relative ]] || die 'sealed output 路径没有固定 build1 source 前缀'
+    seed_file="$SYSTEM_PROBE_SEED_BUILD_DIR/src/$relative"
+    destination="$seed_stage/src/$relative"
+    [[ -f $seed_file && ! -L $seed_file ]] || die "build2 缺少真实 system-probe output: $relative"
+    printf '%s  %s\n' "$expected_sha" "$seed_file" | sha256sum -c - >/dev/null || \
+      die "build2 system-probe output 不匹配 sealed handoff: $relative"
+    mkdir -p -- "${destination%/*}"
+    cp -p --reflink=auto --sparse=always -- "$seed_file" "$destination"
+  done <"$SEALED_HANDOFF_DIR/system-probe-outputs.sha256"
+
+  write_expected_system_probe_marker "$seed_stage/system-probe.success"
+  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_MARKER_SHA256" "$seed_stage/system-probe.success" | \
+    sha256sum -c - >/dev/null || die 'build3 system-probe marker 生成结果不确定'
+  verify_fresh_seed_source_tree "$seed_stage/src"
+
+  mv -- "$seed_stage/src" "$BUILD_DIR/src"
+  mv -- "$seed_stage/exact-system-probe-assets" "$BUILD_DIR/exact-system-probe-assets"
+  for patch_name in "${BASE_PATCH_NAMES[@]}"; do
+    mv -- "$seed_stage/$patch_name" "$BUILD_DIR/$patch_name"
+  done
+  mv -- "$seed_stage/system-probe.success" "$BUILD_DIR/system-probe.success"
+  rmdir -- "$seed_stage"
+  seed_stage=
+  mv -- "$FRESH_SEED_PROGRESS" "$FRESH_SEED_MARKER"
+  verify_fresh_system_probe_seed
+  trap - RETURN
+  log 'build3 fresh seed 已由固定 Git source + sealed 69 项 system-probe handoff 自动准备并验证'
 }
 
 verify_persistent_controls() {
@@ -325,8 +665,10 @@ verify_dependency_seal_metadata() {
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     DBDOG_AGENT_CACHE_ROOT="$CACHE_ROOT" \
-    /usr/bin/bash "$SEAL_DIR/VERIFY.sh" >&2 || \
-    die '依赖 seal 或它引用的持久 cache 校验失败；不允许回退到重新下载'
+    # VERIFY.sh checks tens of thousands of objects. Keep failures and its
+    # summary on stderr, but suppress sha256sum's per-file `OK` stdout flood.
+    /usr/bin/bash "$SEAL_DIR/VERIFY.sh" >/dev/null || \
+      die '依赖 seal 或它引用的持久 cache 校验失败；不允许回退到重新下载'
   log '依赖 seal 校验通过（其 portability 声明仍为 partial，不冒充 clean-host 离线闭包）'
 }
 
@@ -558,9 +900,19 @@ require_root_control \
 /usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
   /usr/bin/git -C "$CORE_REPO" cat-file -e "$PINNED_INTEGRATION_CORE_SHA^{commit}" ||
   die "GaussDB integration core mirror 缺少固定提交 $PINNED_INTEGRATION_CORE_SHA"
+[[ -d $AGENT_REPO && ! -L $AGENT_REPO && $(readlink -e -- "$AGENT_REPO") == "$AGENT_REPO" ]] ||
+  die "Agent mirror 不是 canonical 实际目录: $AGENT_REPO"
+[[ $(/usr/bin/git -C "$AGENT_REPO" rev-parse --is-bare-repository) == true ]] ||
+  die 'Agent mirror 不是 bare repository'
+/usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /usr/bin/git -C "$AGENT_REPO" cat-file -e "$PINNED_AGENT_SHA^{commit}" ||
+  die "Agent mirror 缺少固定提交 $PINNED_AGENT_SHA"
 
 [[ -d $BUILD_DIR && ! -L $BUILD_DIR ]] || die "缺少固定 build attempt: $BUILD_DIR"
 [[ $(readlink -e -- "$BUILD_DIR") == "$BUILD_DIR" ]] || die '固定 build attempt 路径发生解析'
+[[ $(stat -c '%u:%g:%a' -- "$BUILD_DIR") == 1001:1001:775 ]] ||
+  die '固定 build attempt 必须是 dbdog:dbdog mode 0775'
+verify_sealed_system_probe_authority
 if [[ -e $OUTPUT_DIR || -L $OUTPUT_DIR ]]; then
   [[ -d $OUTPUT_DIR && ! -L $OUTPUT_DIR ]] || die "固定输出路径不是实际目录: $OUTPUT_DIR"
   [[ $(readlink -e -- "$OUTPUT_DIR") == "$OUTPUT_DIR" ]] || die '固定输出目录路径发生解析'
@@ -591,17 +943,23 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
   if find "$INSTALL_DIR" -mindepth 1 -print -quit | grep -q .; then
     die 'v12/build3 只接受空的 /opt/dbdog-agent；请先把旧 runtime 完整移入其历史 build 目录，禁止删除依赖 cache'
   fi
-  log '未发现成功 handoff；调用固定 v12 fresh runner（依赖和 patchelf 从已验证的持久 cache 复用）'
-  /usr/bin/env -i \
-    HOME=/home/dbdog \
-    USER=dbdog \
-    LOGNAME=dbdog \
-    SHELL=/bin/bash \
-    PATH=/usr/local/bin:/usr/bin:/bin \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    DBDOG_PACKAGE_VERSION="$VERSION" \
-    "$RUNNER" "$BUILD_DIR" >&2 || die '固定 v12 Omnibus fresh runner 失败'
+  log '未发现成功 handoff；在同一 pipeline lock 内自动准备 build3 seed 并调用固定 v12 fresh runner'
+  (
+    [[ -f $PIPELINE_LOCK && ! -L $PIPELINE_LOCK ]] || die '固定 pipeline lock 不是普通文件'
+    exec {pipeline_lock_fd}<"$PIPELINE_LOCK"
+    /usr/bin/flock -n "$pipeline_lock_fd" || die '另一个 Agent 构建/seed 正持有固定 pipeline lock'
+    prepare_fresh_system_probe_seed
+    /usr/bin/env -i \
+      HOME=/home/dbdog \
+      USER=dbdog \
+      LOGNAME=dbdog \
+      SHELL=/bin/bash \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      DBDOG_PACKAGE_VERSION="$VERSION" \
+      "$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR" >&2
+  ) || die '固定 v12 Omnibus fresh seed/runner 失败'
   runner_executed=1
 fi
 verify_live_omnibus_handoff
