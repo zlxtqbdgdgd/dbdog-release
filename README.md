@@ -146,7 +146,7 @@ tail -n 80 ~/dbdog/logs/clickhouse.err.log
 
 ```bash
 cd ~/dbdog/release
-./scripts/check-upgrade.sh --pull   # 0=已装模块版本+SHA一致，10=需要升级/身份校准
+./scripts/check-upgrade.sh --pull   # 0=版本+SHA一致（Agent 另含安装器合约），10=需升级/校准
 ./scripts/upgrade.sh                # 升级已安装且版本或产物 SHA 不同的模块
 ./scripts/verify.sh
 ```
@@ -186,6 +186,29 @@ API key。GaussDB `dbdog` 监控用户密码由安装器随机生成并写入 ro
 systemd。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入；确需接管既有监控
 密码时才设置 `DBDOG_GAUSSDB_MONITOR_PASSWORD`。不要把明文写进仓库、shell history 或命令参数。
 
+日常采集使用包内 psycopg/libpq，经 `127.0.0.1` TCP 和密码连接 GaussDB，不使用 Unix socket
+`trust` 绕过认证。标准 PostgreSQL libpq 并非只支持 MD5，但 GaussDB 的私有 SHA256/SM3 认证不等同于
+PostgreSQL SCRAM；当前经过交付验证、明确支持的兼容合同是本机 TCP + MD5。安装/升级前必须由 DBA
+按 GaussDB 规范完成并确认以下前置条件：
+
+```text
+SHOW password_encryption_type;          -- 必须返回 1
+host all dbdog 127.0.0.1/32 md5         # pg_hba.conf 中必须存在
+```
+
+`password_encryption_type=1` 决定新建监控用户时同时保存 SHA256 与 MD5 凭证，HBA 的 `md5` 才决定
+这次 TCP 连接采用 MD5 认证；两个配置缺一不可。HBA 中不能存在任何 `dbdog ... trust` 规则。
+安装器只读检查这两项，不会修改 `postgresql.conf`、`pg_hba.conf`，也不会替 DBA reload/restart
+GaussDB。前置条件不满足会在创建用户和切换 Agent 配置前直接失败，并输出应处理的准确配置。
+创建/确认用户后，安装器还会读取服务端当前生效的协议认证请求，必须得到 MD5 challenge；因此磁盘
+文件已改但尚未 reload、规则顺序被其他认证方式遮蔽等情况也不会误报成功。
+
+如果旧环境中的 `dbdog` 用户是在 `password_encryption_type=2/3` 下创建的，仅把参数改为 `1` 不会
+补出 MD5 凭证。安装器不会擅自替已有数据库账号改密：应由 DBA 在 mode `1` 已生效后按安全流程为
+该用户设置一个不同的新密码，并在同次升级中通过安全环境注入
+`DBDOG_GAUSSDB_MONITOR_PASSWORD`；或者删除确认可重建的旧监控用户，让安装器重新创建。全新/已重装
+且不存在 `dbdog` 用户的环境不需要这一步，安装器会自动生成密码并创建账号。
+
 安装器自动完成以下工作：
 
 - 下载并校验 manifest 产物，确认它确实包含 GaussDB integration、编译后的
@@ -195,11 +218,13 @@ systemd。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入�
   优先；同时在清空的环境中，以数据库 OS 用户权限和硬超时加载 `.profile`、`.bash_profile`、
   `.bashrc`，以及 `MPPDB_ENV_SEPARATE_PATH`、`gauss_env_file`/`gsql_env.sh` 等常见环境文件，
   最终只把 gsql 启动所需的白名单变量交给 root 安装器；
-- 用发现出的同一套客户端环境依次执行 `ldd gsql`、`gsql --version` 和本地 `SELECT 1`
-  预检，全部通过后才修改监控用户、兼容对象或 HBA；
-- 用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备：创建/刷新 `dbdog`
-  MONADMIN、`dbdog.statements`/`dbdog.activity`/explain 兼容对象，并为本机
-  `127.0.0.1` 监控连接落一条受管 HBA 规则。`gsql` 不参与日常采集；
+- 用发现出的同一套客户端环境和目标 Unix socket，依次执行 `ldd gsql`、`gsql --version` 和
+  本地 `SELECT 1` 预检；这个 socket 只属于安装期管理通道，不会写进日常采集配置；
+- 只读核对 `password_encryption_type=1`、本机 `dbdog` TCP MD5 HBA 规则及不存在
+  `dbdog trust`；用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备。用户不存在时
+  创建随机密码的 `dbdog` MONADMIN，用户已存在时只验证已保存密码而不擅自改密；随后创建
+  `dbdog.statements`/`dbdog.activity`/explain 兼容对象；最后以协议握手确认当前生效认证确为 MD5，
+  并用包内实际 psycopg/libpq 完成 `127.0.0.1` TCP 登录验证。`gsql` 不参与日常采集；
 - 默认开启现网已验证的 GaussDB DBM（query metrics/samples、schema、settings、activity、
   database size）、数据库日志、主机指标、Live Processes/Process Discovery、NPM/USM、
   APM/OpenLineage、Remote Config 与 inventories/metadata；同时把全部 intake/EvP endpoint
@@ -226,7 +251,14 @@ git pull --ff-only
 sudo ./scripts/upgrade.sh dbdog-agent
 ```
 
-显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`、
+新版 `check-upgrade.sh --pull` 除了比较 Agent 二进制版本和产物 SHA，还比较 Agent 专属安装器合约
+指纹；因此只更新安装、认证前置校验或配置逻辑而无需重编二进制时，也会明确提示执行上面同一条正常升级
+命令，不会因为 manifest 版本未变化而误报“已是最新”。但从不具备该机制的旧 release 首次过渡到
+本版本时，旧 checker 进程无法在运行中获得新判断逻辑；本次必须按上面的两条命令先独立
+`git pull --ff-only`，再直接执行正常的 `upgrade.sh dbdog-agent`。之后 checker 会在 pull 到新脚本时
+自动重新执行最新逻辑。
+
+显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`（仅安装期 gsql 管理 socket）、
 `DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、
 `DBDOG_GAUSSDB_DEPLOYMENT`、`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的
 特殊部署。正常集中式安装不需要这些覆盖。上一套 root/config 会保留在安装输出给出的

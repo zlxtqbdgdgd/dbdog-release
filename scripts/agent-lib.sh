@@ -6,6 +6,41 @@ AGENT_RUNTIME_DIR="${AGENT_RUNTIME_DIR:-/opt/dbdog-agent}"
 AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
+# shellcheck disable=SC2034 # 由 source 本文件的 agent-install.sh/check-upgrade.sh 使用。
+AGENT_INSTALLER_CONTRACT_MARKER=".dbdog-installer-contract-sha256"
+
+agent_sha256_file() { # <文件>
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    return 1
+  fi
+}
+
+agent_sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{ print $1 }'
+  else
+    return 1
+  fi
+}
+
+agent_installer_contract_fingerprint() { # <scripts 目录>；覆盖 Agent 专属脚本及其共享 shell 运行库
+  local scripts="$1" relative path digest payload=""
+  for relative in lib.sh agent-install.sh agent-lib.sh agent/init-gaussdb-perdb.sql; do
+    path="$scripts/$relative"
+    [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] || return 1
+    digest="$(agent_sha256_file "$path")" || return 1
+    [ "${#digest}" -eq 64 ] || return 1
+    case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+    payload+="${relative}:${digest}"$'\n'
+  done
+  printf '%s' "$payload" | agent_sha256_stdin
+}
 
 agent_generate_gaussdb_password() {
   local random
@@ -464,8 +499,8 @@ agent_detect_gaussdb() {
     agent_valid_port "$port" || die "无法从 gaussdb PID $pid 确定有效监听端口"
     agent_add_unique AGENT_GAUSS_PORTS "$port"
 
-    # 标准 libpq 与 GaussDB 私有 TCP SASL 不兼容。自动发现到 hostname/IP 时，
-    # 丢弃它并继续从 postmaster.pid 或监听 socket 事实中恢复本地目录。
+    # 这里发现的 PGHOST 只供安装期目标 gsql 管理连接使用，因此必须恢复为
+    # 目标实例自己的 Unix socket；Agent 日常采集端点固定为 127.0.0.1 TCP。
     case "$env_host" in /*) ;; *) env_host="" ;; esac
     if [ -z "$env_host" ] && [ -n "$data" ] && [ -r "$data/postmaster.pid" ]; then
       socket_dir="$(sed -n '5p' "$data/postmaster.pid" | awk '{$1=$1; print}')"
@@ -525,6 +560,13 @@ agent_detect_gaussdb() {
 
     [ -n "$env_log" ] && agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/*/gaussdb-*.log"
   done
+
+  # 日常采集固定使用 127.0.0.1:port；两个实例若端口相同，即使管理 socket
+  # 不同，也无法被该 TCP endpoint 唯一区分，必须在渲染配置前 fail closed。
+  if [ "${#AGENT_GAUSS_PID_PORTS[@]}" -gt 0 ] && \
+     [ "${#AGENT_GAUSS_PID_PORTS[@]}" -ne "${#AGENT_GAUSS_PORTS[@]}" ]; then
+    die "发现多个 GaussDB 实例共享监听端口；127.0.0.1 TCP 监控无法唯一区分，请调整实例端口后重跑"
+  fi
 
   if [ -n "${DBDOG_GAUSSDB_LOG_GLOB:-}" ]; then
     AGENT_GAUSS_LOG_GLOBS=("$DBDOG_GAUSSDB_LOG_GLOB")
@@ -715,7 +757,7 @@ EOF
 
 agent_render_checks() { # <conf.d> <db_password> <db_user> <db_name> <env>
   local confd="$1" password="$2" username="$3" dbname="$4" env_name="$5"
-  local check dir port host glob index count
+  local check dir port glob
   for check in cpu disk file_handle io load memory network system_core uptime; do
     dir="$confd/$check.d"
     install -d -m 0755 "$dir"
@@ -743,20 +785,14 @@ init_config:
 
 instances:
 EOF
-  count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ "$count" -eq "${#AGENT_GAUSS_PID_HOSTS[@]}" ] || \
-    die "GaussDB 实例端口与 Unix socket 探测结果数量不一致"
-  [ "$count" -gt 0 ] || die "没有可渲染的 GaussDB 运行实例"
-  for ((index=0; index<count; index++)); do
-    port="${AGENT_GAUSS_PID_PORTS[$index]}"
-    host="${AGENT_GAUSS_PID_HOSTS[$index]}"
-    [ -n "$host" ] || die "GaussDB 实例索引 ${index} 缺少 Unix socket 目录"
+  [ "${#AGENT_GAUSS_PORTS[@]}" -gt 0 ] || die "没有可渲染的 GaussDB 运行实例"
+  for port in "${AGENT_GAUSS_PORTS[@]}"; do
     cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
     database_identifier:
       template: '\$resolved_hostname:\$port'
     service: gaussdb
-    host: $(agent_yaml_quote "$host")
+    host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "$password")

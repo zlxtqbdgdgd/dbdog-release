@@ -30,16 +30,9 @@ INSTALL_SUCCEEDED=0
 RUNTIME_CHANGED=0
 PREVIOUS_INSTALL=0
 HAD_CONFIG=0
-PREVIOUS_DB_PASSWORD=""
-DB_PASSWORD_CHANGED=0
-DB_PASSWORD_RESET_WITHOUT_ROLLBACK=0
-DB_HBA_PATHS=()
-DB_HBA_BACKUPS=()
-DB_HBA_APPLIED=()
-HBA_RECOVERY_DIR=""
-PRESERVE_WORK_DIR=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
+INSTALLER_CONTRACT_SHA256=""
 
 usage() {
   cat <<'EOF'
@@ -52,7 +45,7 @@ usage() {
 可选覆盖（正常情况下自动发现或使用稳定默认值）：
   DBDOG_GAUSSDB_MONITOR_PASSWORD         默认首次生成、升级保留
   DBDOG_GAUSSDB_ENV_FILE                 显式 GaussDB 客户端环境文件（绝对路径）
-  DBDOG_GAUSSDB_PGHOST                   显式本地 Unix socket 目录
+  DBDOG_GAUSSDB_PGHOST                   仅安装期 gsql 使用的本地 Unix socket 目录
   DBDOG_GAUSSDB_LD_LIBRARY_PATH           显式 gsql 动态库搜索路径
   DBDOG_GAUSSDB_PORT                     仅在无法从运行进程发现时使用
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
@@ -74,40 +67,10 @@ remove_known_stage() { # <路径> <允许的精确前缀>
 }
 
 cleanup_stages() {
-  if [ "$PRESERVE_WORK_DIR" -eq 1 ]; then
-    warn "为人工恢复保留安装工作目录: $WORK_DIR"
-  else
-    remove_known_stage "$WORK_DIR" /tmp/dbdog-agent-install.
-  fi
+  remove_known_stage "$WORK_DIR" /tmp/dbdog-agent-install.
   remove_known_stage "$RUNTIME_STAGE" /opt/.dbdog-agent-stage.
   remove_known_stage "$CONFIG_STAGE" /etc/.dbdog-agent-stage.
   remove_known_stage "$UNIT_STAGE" /etc/systemd/system/.dbdog-agent-units.
-}
-
-persist_hba_recovery_materials() {
-  local recovery index path backup applied metadata
-  install -d -o root -g root -m 0755 "$AGENT_LOG_DIR" || return 1
-  recovery="$(mktemp -d "$AGENT_LOG_DIR/install-hba-recovery.XXXXXXXX")" || return 1
-  chown root:root "$recovery" || return 1
-  chmod 0700 "$recovery" || return 1
-  metadata="$recovery/README"
-  : >"$metadata" || return 1
-  chmod 0600 "$metadata" || return 1
-  for index in "${!DB_HBA_PATHS[@]}"; do
-    path="${DB_HBA_PATHS[$index]:-}"
-    [ -n "$path" ] || continue
-    backup="${DB_HBA_BACKUPS[$index]:-}"
-    applied="${DB_HBA_APPLIED[$index]:-}"
-    printf 'instance_index=%s\nhba_path=%s\n\n' "$index" "$path" >>"$metadata" || return 1
-    [ ! -f "$backup" ] || \
-      install -o root -g root -m 0600 "$backup" "$recovery/pg_hba.$index.before" || return 1
-    [ ! -f "$applied" ] || \
-      install -o root -g root -m 0600 "$applied" "$recovery/pg_hba.$index.applied" || return 1
-    [ ! -f "$path" ] || \
-      install -o root -g root -m 0600 "$path" "$recovery/pg_hba.$index.current" || return 1
-  done
-  HBA_RECOVERY_DIR="$recovery"
-  warn "HBA 自动恢复未完全成功；原始、受管和当前副本已保留在 $HBA_RECOVERY_DIR"
 }
 
 unit_exists() {
@@ -177,24 +140,6 @@ rollback_install() {
 on_exit() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ] && [ "${#DB_HBA_PATHS[@]}" -gt 0 ]; then
-    if ! agent_restore_hba_rules; then
-      warn "部分 GaussDB HBA 规则未能自动恢复"
-      if ! persist_hba_recovery_materials; then
-        PRESERVE_WORK_DIR=1
-        warn "持久化 HBA 恢复材料也失败；保留 root 安装工作目录供人工恢复"
-      fi
-    fi
-  fi
-  if [ "$rc" -ne 0 ] && [ "$DB_PASSWORD_CHANGED" -eq 1 ] && \
-    [ -n "$PREVIOUS_DB_PASSWORD" ]; then
-    warn "恢复安装前的 GaussDB 监控用户密码"
-    if ! agent_set_gaussdb_password "$PREVIOUS_DB_PASSWORD" force; then
-      warn "GaussDB 监控用户密码自动恢复失败，请立即人工核对"
-    fi
-  elif [ "$rc" -ne 0 ] && [ "$DB_PASSWORD_RESET_WITHOUT_ROLLBACK" -eq 1 ]; then
-    warn "本次设置前没有旧 Agent 密码可恢复；新密码保留在失败配置目录 *.failed.* 中"
-  fi
   if [ "$rc" -ne 0 ] && [ "$MUTATION_STARTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
     rollback_install
   fi
@@ -257,11 +202,9 @@ resolve_inputs() {
     if [ -n "$recovery" ] && [ -f "$recovery/conf.d/gaussdb.d/conf.yaml" ]; then
       old_datadog="$recovery/datadog.yaml"
       old_gauss="$recovery/conf.d/gaussdb.d/conf.yaml"
-      log "复用上次首装失败目录中的凭证，避免重复重置 GaussDB 监控密码: $recovery"
+      log "复用上次首装失败目录中的凭证，避免已创建监控用户在重跑时凭证失配: $recovery"
     fi
   fi
-
-  PREVIOUS_DB_PASSWORD="$(agent_existing_gauss_scalar "$old_gauss" password 2>/dev/null || true)"
 
   if [ -z "${DBDOG_SERVER_URL:-}" ]; then
     old="$(agent_existing_top_scalar "$old_datadog" dd_url 2>/dev/null || true)"
@@ -453,12 +396,53 @@ agent_show_preflight_error() { # <文件> <错误>
   die "$message"
 }
 
+agent_gaussdb_hba_file() { # <进程索引>；输出规范化 HBA 路径
+  local index="$1" data hba
+  data="${AGENT_GAUSS_PID_DATA_DIRS[$index]}"
+  hba="$(agent_gsql "$index" -c 'SHOW hba_file;' 2>/dev/null \
+    | awk 'NF { value=$0 } END { print value }' || true)"
+  if [ -z "$hba" ] && [ -n "$data" ]; then hba="$data/pg_hba.conf"; fi
+  [ -n "$hba" ] || return 1
+  case "$hba" in /*) ;; *) [ -n "$data" ] && hba="$data/$hba" ;; esac
+  hba="$(readlink -f "$hba" 2>/dev/null || true)"
+  [ -f "$hba" ] || return 1
+  printf '%s\n' "$hba"
+}
+
+agent_hba_has_required_tcp_md5() { # <HBA 文件>
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
+      gsub(/^"|"$/, "", user)
+      if (kind == "host" && database == "all" && user == "dbdog" \
+          && address == "127.0.0.1/32" && method == "md5") found=1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
+agent_hba_has_dbdog_trust() { # <HBA 文件>
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      kind=tolower($1); user=$3
+      method=(kind == "local" ? tolower($4) : tolower($5))
+      gsub(/^"|"$/, "", user)
+      count=split(user, users, ",")
+      for (i=1; i<=count; i++) {
+        gsub(/^"|"$/, "", users[i])
+        if ((users[i] == "dbdog" || users[i] == "all") && method == "trust") found=1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
 preflight_gaussdb_clients() {
-  local index count gsql ldd_bin out value mode exists
+  local index count gsql ldd_bin out value mode hba
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
-  AGENT_GAUSS_PID_PASSWORD_MODES=()
-  AGENT_GAUSS_PID_USER_EXISTS=()
   log "预检目标 GaussDB 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
   for ((index=0; index<count; index++)); do
     gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
@@ -490,28 +474,20 @@ preflight_gaussdb_clients() {
       | awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }')" || \
       agent_show_preflight_error "$WORK_DIR/gsql-password-mode.$index.err" \
         "无法读取 password_encryption_type（实例索引 ${index}）"
-    exists="$(agent_gsql "$index" -c \
-      "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
-      2>"$WORK_DIR/gsql-user-exists.$index.err" \
-      | awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }')" || \
-      agent_show_preflight_error "$WORK_DIR/gsql-user-exists.$index.err" \
-        "无法检查 dbdog 监控用户（实例索引 ${index}）"
-    case "$exists" in 0 | 1) ;; *) die "dbdog 监控用户存在性返回异常（实例索引 ${index}）" ;; esac
-    AGENT_GAUSS_PID_PASSWORD_MODES+=("$mode")
-    AGENT_GAUSS_PID_USER_EXISTS+=("$exists")
-
-    # 运行期通过受管 local trust + Unix socket 连接，密码加密模式不参与
-    # Agent 认证；这里只拒绝数据库返回未知值，避免错误环境下继续 mutation。
-    if [ "$exists" = 0 ]; then
-      case "$mode" in
-        0 | 1 | 2 | 3) ;;
-        *) die "当前 password_encryption_type=${mode} 不在安装器支持范围 0/1/2/3；拒绝创建监控用户" ;;
-      esac
-    fi
+    # 日常采集的已验证兼容合同是标准 libpq 经 127.0.0.1 TCP + MD5 HBA。
+    # mode=1 让新建监控用户同时具有 SHA256 与 MD5 凭证；安装器只读校验。
+    [ "$mode" = 1 ] || die \
+      "GaussDB 前置条件不满足：SHOW password_encryption_type 当前为 ${mode}，必须由 DBA 按数据库规范配置为 1 并确认生效；dbdog 安装器不会修改 postgresql.conf"
+    hba="$(agent_gaussdb_hba_file "$index")" || \
+      die "无法在预检阶段确定 GaussDB HBA 文件（实例索引 ${index}）"
+    ! agent_hba_has_dbdog_trust "$hba" || die \
+      "GaussDB HBA 含 dbdog trust 规则；请 DBA 删除该规则并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+    agent_hba_has_required_tcp_md5 "$hba" || die \
+      "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 添加并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
   done
 }
 
-agent_monitor_connection_works() { # 经受管 Unix socket 验证监控连接；0=有效，其他=失败
+agent_monitor_password_works() { # 经 127.0.0.1 TCP 验证密码；0=有效，2=明确拒绝，1=基础设施失败
   local index="$1" password="$2" python password_file out attempt rc success=0 rejected=0
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
   python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
@@ -525,8 +501,7 @@ agent_monitor_connection_works() { # 经受管 Unix socket 验证监控连接；
     rc=0
     "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
       PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_HOSTS[$index]}" \
-      "${AGENT_GAUSS_PID_PORTS[$index]}" \
+      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_PORTS[$index]}" \
       "$DBDOG_GAUSSDB_DBNAME" >"$out" 2>&1 <<'PY' || rc=$?
 import pathlib
 import sys
@@ -536,9 +511,9 @@ import psycopg
 password = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 try:
     with psycopg.connect(
-        host=sys.argv[2],
-        port=int(sys.argv[3]),
-        dbname=sys.argv[4],
+        host="127.0.0.1",
+        port=int(sys.argv[2]),
+        dbname=sys.argv[3],
         user="dbdog",
         password=password,
         connect_timeout=5,
@@ -574,8 +549,63 @@ PY
   return 1
 }
 
-agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置同一个 dbdog MONADMIN 密码
-  local password="$1" force="${2:-}" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
+agent_active_auth_is_md5() { # <进程索引>；读取当前生效的 PostgreSQL v3 认证请求，不提交失败密码
+  local index="$1" python out
+  local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
+  python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
+  [ -x "$python" ] && [ -x "$timeout_bin" ] || return 1
+  out="$WORK_DIR/active-auth.$index.out"
+  if ! "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
+    PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    "$python" -I - "${AGENT_GAUSS_PID_PORTS[$index]}" \
+    "$DBDOG_GAUSSDB_DBNAME" >"$out" 2>&1 <<'PY'
+import socket
+import struct
+import sys
+
+
+def receive_exact(connection, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise RuntimeError("database closed connection during authentication probe")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+parameters = (
+    b"user\0dbdog\0database\0"
+    + sys.argv[2].encode("utf-8")
+    + b"\0application_name\0dbdog-auth-probe\0\0"
+)
+payload = struct.pack("!I", 196608) + parameters
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as connection:
+    connection.sendall(struct.pack("!I", len(payload) + 4) + payload)
+    message_type = receive_exact(connection, 1)
+    message_length = struct.unpack("!I", receive_exact(connection, 4))[0]
+    if message_length < 8 or message_length > 1024 * 1024:
+        raise RuntimeError("invalid authentication response length")
+    body = receive_exact(connection, message_length - 4)
+
+if message_type != b"R":
+    raise SystemExit("database did not return an AuthenticationRequest")
+authentication_code = struct.unpack("!I", body[:4])[0]
+if authentication_code != 5:
+    raise SystemExit(f"active authentication method is not MD5 (code={authentication_code})")
+print("active authentication method: MD5")
+PY
+  then
+    [ ! -s "$out" ] || sed -n '1,80p' "$out" >&2
+    warn "实例索引 ${index} 当前生效的 127.0.0.1 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序并确认配置已重新加载"
+    return 1
+  fi
+}
+
+agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭证
+  local password="$1" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
   local index count exists mode reset=0 password_status
   escaped="$(agent_sql_literal "$password")" || return 1
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
@@ -588,26 +618,20 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
       | awk 'NF { value=$0 } END { print value }')" || return 1
     case "$exists" in
       0)
-        case "$mode" in 0 | 1 | 2 | 3) ;; *) return 1 ;; esac
+        [ "$mode" = 1 ] || return 1
         printf "CREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
         reset=1
         ;;
       1)
-        password_status=2
-        if [ "$force" != force ]; then
-          password_status=0
-          agent_monitor_connection_works "$index" "$password" || password_status=$?
-        fi
+        password_status=0
+        agent_monitor_password_works "$index" "$password" || password_status=$?
         case "$password_status" in
           0)
             printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
             ;;
           2)
-            case "$mode" in 0 | 1 | 2 | 3) ;;
-              *) warn "实例索引 ${index} 的现有 dbdog 密码不可用，且 password_encryption_type=${mode} 不允许安全重置"; return 1 ;;
-            esac
-            printf "ALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
-            reset=1
+            warn "实例索引 ${index} 已存在 dbdog 用户，但已保存密码无法经 127.0.0.1 TCP + MD5 登录；安装器不会擅自重置已有数据库账号，请核对 /etc/dbdog-agent 配置或由 DBA 处理后重跑"
+            return 1
             ;;
           *)
             warn "实例索引 ${index} 无法可靠判定现有 dbdog 密码；拒绝把探测故障当作密码错误并重置"
@@ -618,138 +642,16 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
       *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
     esac
     chmod 0600 "$sql" || return 1
-    # 服务端可能在客户端收到成功响应前就提交密码修改。先进入“不确定但需回滚”
-    # 状态，确保连接中断/超时也不会让旧配置与数据库凭证永久失配。
+    agent_gsql "$index" <"$sql" || return 1
     if [ "$reset" -eq 1 ]; then
-      if [ -n "$PREVIOUS_DB_PASSWORD" ] && [ "$PREVIOUS_DB_PASSWORD" != "$password" ]; then
-        DB_PASSWORD_CHANGED=1
-      elif [ -z "$PREVIOUS_DB_PASSWORD" ]; then
-        DB_PASSWORD_RESET_WITHOUT_ROLLBACK=1
+      if ! agent_monitor_password_works "$index" "$password"; then
+        warn "实例索引 ${index} 已设置 dbdog 密码，但标准 libpq 仍无法经 127.0.0.1 TCP + MD5 登录"
+        return 1
       fi
     fi
-    agent_gsql "$index" <"$sql" || return 1
+    agent_active_auth_is_md5 "$index" || return 1
     reset=0
   done
-}
-
-agent_validate_hba_markers() { # <pg_hba.conf>；拒绝残缺、嵌套或重复受管块
-  awk '
-    BEGIN { inside=0; begin_count=0; end_count=0; bad=0 }
-    $0 == "# dbdog-release BEGIN: local Agent monitor" {
-      begin_count++
-      if (inside) bad=1
-      inside=1
-      next
-    }
-    $0 == "# dbdog-release END: local Agent monitor" {
-      end_count++
-      if (!inside) bad=1
-      inside=0
-      next
-    }
-    END {
-      if (inside || begin_count != end_count || begin_count > 1) bad=1
-      exit bad
-    }
-  ' "$1"
-}
-
-agent_install_hba_rule() { # <进程索引>
-  local index="$1" data hba backup applied temp reload legacy_trust unsafe_trust
-  data="${AGENT_GAUSS_PID_DATA_DIRS[$index]}"
-  hba="$(agent_gsql "$index" -c 'SHOW hba_file;' 2>/dev/null \
-    | awk 'NF { value=$0 } END { print value }' || true)"
-  if [ -z "$hba" ] && [ -n "$data" ]; then hba="$data/pg_hba.conf"; fi
-  [ -n "$hba" ] || die "无法确定 GaussDB HBA 文件"
-  case "$hba" in /*) ;; *) [ -n "$data" ] && hba="$data/$hba" ;; esac
-  hba="$(readlink -f "$hba" 2>/dev/null || true)"
-  [ -f "$hba" ] || die "GaussDB HBA 不是普通文件: $hba"
-  agent_validate_hba_markers "$hba" || \
-    die "GaussDB HBA 的 dbdog-release BEGIN/END 标记残缺、嵌套或重复；拒绝改写: $hba"
-  read -r legacy_trust unsafe_trust < <(awk '
-    /^[[:space:]]*#/ { next }
-    {
-      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
-      gsub(/^"|"$/, "", user)
-      if (kind ~ /^host/ && user == "dbdog" && method == "trust") {
-        if (kind == "host" && database == "all" && address == "127.0.0.1/32") legacy++
-        else unsafe++
-      }
-    }
-    END { print legacy + 0, unsafe + 0 }
-  ' "$hba")
-  [ "$unsafe_trust" -eq 0 ] || \
-    die "GaussDB HBA 含非受管的 dbdog trust 规则；拒绝在不明确其作用域时继续: $hba"
-  [ "$legacy_trust" -eq 0 ] || \
-    warn "发现旧安装遗留的本机 dbdog TCP trust HBA，将在同一事务中替换为受管 Unix socket 规则"
-  backup="$WORK_DIR/pg_hba.$index.before"
-  applied="$WORK_DIR/pg_hba.$index.applied"
-  cp -a -- "$hba" "$backup"
-  temp="$(mktemp "$(dirname "$hba")/.dbdog-pg-hba.XXXXXX")"
-  if ! awk '
-    BEGIN {
-      skip=0
-      print "# dbdog-release BEGIN: local Agent monitor"
-      print "local all dbdog trust"
-      print "# dbdog-release END: local Agent monitor"
-    }
-    $0 == "# dbdog-release BEGIN: local Agent monitor" { skip=1; next }
-    $0 == "# dbdog-release END: local Agent monitor" { skip=0; next }
-    {
-      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
-      gsub(/^"|"$/, "", user)
-      if (kind == "host" && database == "all" && user == "dbdog" \
-          && address == "127.0.0.1/32" && method == "trust") next
-    }
-    !skip { print }
-  ' "$hba" >"$temp"; then
-    rm -f -- "$temp"
-    die "生成 GaussDB HBA 配置失败"
-  fi
-  chown --reference="$hba" "$temp"
-  chmod --reference="$hba" "$temp"
-  if cmp -s "$hba" "$temp"; then
-    rm -f -- "$temp"
-    return 0
-  fi
-  cp -a -- "$temp" "$applied"
-  mv -- "$temp" "$hba"
-  DB_HBA_PATHS[index]="$hba"
-  DB_HBA_BACKUPS[index]="$backup"
-  DB_HBA_APPLIED[index]="$applied"
-  command -v restorecon >/dev/null 2>&1 && restorecon "$hba" >/dev/null 2>&1 || true
-  reload="$(agent_gsql "$index" -c 'SELECT pg_reload_conf();' 2>/dev/null \
-    | awk 'NF { value=$0 } END { print value }' || true)"
-  if [ "$reload" != t ] && [ "$reload" != true ] && [ "$reload" != 1 ]; then
-    cp -a -- "$backup" "$hba"
-    agent_gsql "$index" -c 'SELECT pg_reload_conf();' >/dev/null 2>&1 || true
-    DB_HBA_PATHS[index]=""
-    die "GaussDB HBA reload 失败，已恢复原文件"
-  fi
-}
-
-agent_restore_hba_rules() {
-  local index path backup applied reload failed=0
-  # 使用真实数组下标而不是 length-1，避免实例 0 无改动、实例 1 有改动时漏回滚。
-  for index in "${!DB_HBA_PATHS[@]}"; do
-    path="${DB_HBA_PATHS[$index]:-}"
-    [ -n "$path" ] || continue
-    backup="${DB_HBA_BACKUPS[$index]}"
-    applied="${DB_HBA_APPLIED[$index]}"
-    if ! cmp -s "$path" "$applied"; then
-      warn "GaussDB HBA 在安装期间被其他操作修改，拒绝覆盖: $path"
-      failed=1
-      continue
-    fi
-    cp -a -- "$backup" "$path" || { failed=1; continue; }
-    command -v restorecon >/dev/null 2>&1 && restorecon "$path" >/dev/null 2>&1 || true
-    reload="$(agent_gsql "$index" -c 'SELECT pg_reload_conf();' 2>/dev/null \
-      | awk 'NF { value=$0 } END { print value }' || true)"
-    case "$reload" in t | true | 1) DB_HBA_PATHS[index]="" ;;
-      *) warn "恢复 HBA 后 reload 失败: $path"; failed=1 ;;
-    esac
-  done
-  [ "$failed" -eq 0 ]
 }
 
 bootstrap_gaussdb_monitoring() {
@@ -758,11 +660,9 @@ bootstrap_gaussdb_monitoring() {
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
   log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与兼容视图（仅安装阶段）..."
-  # 先落受管 Unix socket local trust 规则，再用内嵌 psycopg 经相同 socket
-  # 做真实登录探测；这避开 GaussDB 私有 SHA256 SASL 与标准 libpq 的不兼容。
-  # 后续任一步失败，EXIT trap 会用内容比对后的备份恢复 HBA。
-  for ((index=0; index<count; index++)); do agent_install_hba_rule "$index"; done
-  agent_set_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
+  # password_encryption_type 与 HBA 已在预检中只读核对。这里仅创建/校验账号，
+  # 并用交付给 integration 的同一凭证经内嵌 psycopg/libpq 做真实 TCP 登录探测。
+  agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
     die "无法通过目标 GaussDB 的本地管理连接准备监控用户"
   for ((index=0; index<count; index++)); do
     agent_gsql "$index" <"$sql" || die "创建 GaussDB 兼容视图失败（实例索引 ${index}）"
@@ -792,6 +692,9 @@ validate_archive_members() { # <tarball>
   done
   if grep -Eq '^\./(embedded/)?bin/(gsql|gaussdb)$' "$list"; then
     die "Agent tarball 不应打包目标 GaussDB 的 gsql/gaussdb 二进制"
+  fi
+  if grep -Fqx "./$AGENT_INSTALLER_CONTRACT_MARKER" "$list"; then
+    die "Agent tarball 不得预置安装器验收 marker: $AGENT_INSTALLER_CONTRACT_MARKER"
   fi
 }
 
@@ -991,7 +894,8 @@ prepare_runtime() { # <tarball> <version> <sha>
   validate_runtime_tree "$RUNTIME_STAGE" "$version"
   printf '%s\n' "$version" >"$RUNTIME_STAGE/.dbdog-release-version"
   printf '%s\n' "$sha" >"$RUNTIME_STAGE/.dbdog-artifact-sha256"
-  chmod 0444 "$RUNTIME_STAGE/.dbdog-release-version" "$RUNTIME_STAGE/.dbdog-artifact-sha256"
+  chmod 0444 "$RUNTIME_STAGE/.dbdog-release-version" \
+    "$RUNTIME_STAGE/.dbdog-artifact-sha256"
   install -d -o root -g root -m 0700 "$RUNTIME_STAGE/run"
   if [ -d "$AGENT_RUN_DIR" ]; then
     cp -a "$AGENT_RUN_DIR/." "$RUNTIME_STAGE/run/"
@@ -1000,6 +904,38 @@ prepare_runtime() { # <tarball> <version> <sha>
     "$RUNTIME_STAGE/run/process-agent.pid" "$RUNTIME_STAGE/run/trace-agent.pid"
   chown -hR root:root "$RUNTIME_STAGE"
   RUNTIME_CHANGED=1
+}
+
+write_installer_contract_marker() { # 在全部验收成功后原子确认安装器合约
+  local marker="$AGENT_RUNTIME_DIR/$AGENT_INSTALLER_CONTRACT_MARKER" temp current=""
+  if [ -d "$marker" ] && [ ! -L "$marker" ]; then
+    warn "Agent 安装器合约 marker 被目录占用，拒绝覆盖: $marker"
+    return 1
+  fi
+  if { [ -e "$marker" ] || [ -L "$marker" ]; } && \
+     [ ! -f "$marker" ] && [ ! -L "$marker" ]; then
+    warn "Agent 安装器合约 marker 不是普通文件或符号链接，拒绝覆盖: $marker"
+    return 1
+  fi
+  if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+    current="$(awk 'NR == 1 { value=$0 } END { if (NR == 1) print value }' "$marker" 2>/dev/null || true)"
+  fi
+  [ "$current" != "$INSTALLER_CONTRACT_SHA256" ] || return 0
+  temp="$(mktemp "$AGENT_RUNTIME_DIR/.dbdog-installer-contract.XXXXXX")" || return 1
+  if ! printf '%s\n' "$INSTALLER_CONTRACT_SHA256" >"$temp" \
+    || ! chown root:root "$temp" \
+    || ! chmod 0444 "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  if [ -L "$marker" ] && ! rm -f -- "$marker"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  if ! mv -- "$temp" "$marker"; then
+    rm -f -- "$temp"
+    return 1
+  fi
 }
 
 render_install_state() {
@@ -1153,6 +1089,8 @@ main() {
   [ "$#" -le 1 ] || { usage >&2; die "参数过多"; }
   require_root_host
   WORK_DIR="$(mktemp -d /tmp/dbdog-agent-install.XXXXXX)"
+  INSTALLER_CONTRACT_SHA256="$(agent_installer_contract_fingerprint "$SCRIPT_DIR")" || \
+    die "无法计算 dbdog-agent 安装器合约指纹"
 
   local version artifact sha256 package old_gauss
   version="$(manifest_get dbdog-agent 5)"
@@ -1178,8 +1116,16 @@ main() {
   bootstrap_gaussdb_monitoring
   start_and_verify
 
+  # marker 是事务提交记录。屏蔽可捕获信号覆盖“原子写入 → 提交内存状态”的极短窗口：
+  # SIGKILL 若落在该窗口，磁盘上的 runtime/config/services 已经完整验收，marker 仍然真实。
+  trap '' INT TERM HUP
+  if ! write_installer_contract_marker; then
+    trap 'exit 130' INT TERM HUP
+    die "无法写入 dbdog-agent 安装器合约 marker"
+  fi
   INSTALL_SUCCEEDED=1
   MUTATION_STARTED=0
+  trap 'exit 130' INT TERM HUP
   log "dbdog-agent $version 安装/升级并验收通过"
   log "已启用：GaussDB DBM、schema/settings/activity、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"

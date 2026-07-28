@@ -20,6 +20,29 @@ source "$SCRIPTS_DIR/agent-lib.sh"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
 
+FINGERPRINT_ROOT="$TEST_ROOT/installer-fingerprint"
+mkdir -p "$FINGERPRINT_ROOT/agent"
+printf 'shared-lib-v1\n' >"$FINGERPRINT_ROOT/lib.sh"
+printf 'install-v1\n' >"$FINGERPRINT_ROOT/agent-install.sh"
+printf 'lib-v1\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
+printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
+FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
+  fail "无法计算安装器合约指纹"
+[ "${#FINGERPRINT_1}" -eq 64 ] || fail "安装器合约指纹不是 SHA-256"
+printf 'unrelated\n' >"$FINGERPRINT_ROOT/README.md"
+[ "$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" = "$FINGERPRINT_1" ] || \
+  fail "无关文件错误改变了 Agent 安装器合约指纹"
+printf 'lib-v2\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
+FINGERPRINT_2="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
+  fail "安装器合约变更后无法重新计算指纹"
+[ "$FINGERPRINT_2" != "$FINGERPRINT_1" ] || fail "Agent 安装器逻辑变更没有改变合约指纹"
+rm -f "$FINGERPRINT_ROOT/agent-install.sh"
+ln -s /dev/null "$FINGERPRINT_ROOT/agent-install.sh"
+if agent_installer_contract_fingerprint "$FINGERPRINT_ROOT" >/dev/null 2>&1; then
+  fail "安装器合约指纹错误接受了符号链接"
+fi
+pass "Agent 专属安装逻辑使用独立内容指纹，且对缺失/符号链接 fail closed"
+
 PROC="$TEST_ROOT/proc"
 PID=4242
 DATA="$TEST_ROOT/gauss/data"
@@ -85,8 +108,8 @@ esac
 [ "$AGENT_GAUSS_DEPLOYMENT" = centralized ] || fail "单实例拓扑推断错误"
 pass "优先从目标机运行进程发现 GaussDB 端口、socket、客户端库与日志"
 
-# 运行进程中残留 TCP PGHOST 时必须回退到 postmaster.pid 的真实 socket，
-# 但操作者显式指定 TCP host 时必须 fail closed，不能悄悄继续走 SASL。
+# 安装期 gsql 必须使用目标实例管理 socket：运行进程中残留 TCP PGHOST 时
+# 回退到 postmaster.pid；操作者也不能把这个管理通道误配成 TCP host。
 cp "$PROC/$PID/environ" "$TEST_ROOT/main-environ"
 printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=37001\0PGHOST=127.0.0.1\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
   "$GAUSSHOME" "$GAUSSLOG" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
@@ -100,9 +123,10 @@ if (DBDOG_GAUSSDB_PGHOST=127.0.0.1; export DBDOG_GAUSSDB_PGHOST; agent_detect_ga
 fi
 grep -Fq '必须是绝对 Unix socket 目录' "$TEST_ROOT/tcp-pghost.out" || \
   fail "显式 TCP PGHOST 没有给出清晰错误"
-pass "自动 TCP PGHOST 回退到 socket，显式 TCP PGHOST fail closed"
+pass "安装期 gsql 自动恢复管理 socket，显式 TCP PGHOST fail closed"
 
-# 两个实例可以监听相同端口但使用不同 socket 目录，不能只按端口合并。
+# 管理面可按 socket+port 区分实例，但运行期固定 127.0.0.1:port；同端口
+# 多实例无法形成唯一 TCP endpoint，必须拒绝而不是静默监控错实例。
 DATA2="$TEST_ROOT/gauss/data2"
 SOCKET_DIR2="$TEST_ROOT/gauss/socket2"
 mkdir -p "$PROC/4244" "$DATA2" "$SOCKET_DIR2"
@@ -113,14 +137,14 @@ printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0PGHOST=%s\0LD_LIBRAR
   >"$PROC/4244/environ"
 cp "$PROC/$PID/status" "$PROC/4244/status"
 printf '4244\n%s\n0\n15432\n%s\n' "$DATA2" "$SOCKET_DIR2" >"$DATA2/postmaster.pid"
-agent_detect_gaussdb
-[ "${#AGENT_GAUSS_PID_PORTS[@]}" -eq 2 ] || fail "相同端口的不同 socket 实例被错误合并"
-case " ${AGENT_GAUSS_PID_HOSTS[*]} " in *" $SOCKET_DIR "*) ;; *) fail "第一实例 socket 映射错误" ;; esac
-case " ${AGENT_GAUSS_PID_HOSTS[*]} " in *" $SOCKET_DIR2 "*) ;; *) fail "第二实例 socket 映射错误" ;; esac
-[ "$AGENT_GAUSS_DEPLOYMENT" = distributed ] || fail "相同端口多 socket 的拓扑推断错误"
+if (agent_detect_gaussdb) >"$TEST_ROOT/duplicate-tcp-endpoint.out" 2>&1; then
+  fail "相同 TCP endpoint 的多个实例被错误接受"
+fi
+grep -Fq '127.0.0.1 TCP 监控无法唯一区分' "$TEST_ROOT/duplicate-tcp-endpoint.out" || \
+  fail "重复 TCP endpoint 没有给出清晰错误"
 mv "$PROC/4244" "$TEST_ROOT/ignored-proc-4244"
 agent_detect_gaussdb
-pass "按 socket+端口区分同端口 GaussDB 实例"
+pass "安装期区分 socket，运行期重复 TCP endpoint fail closed"
 
 DBDOG_GAUSSDB_PGHOST="$TEST_ROOT/explicit-socket"
 DBDOG_GAUSSDB_LD_LIBRARY_PATH="$TEST_ROOT/explicit-lib"
@@ -200,36 +224,24 @@ if bash -c '
 fi
 pass "Remote Config bootstrap 只接受带签名且结构完整的 TUF root"
 
-HBA_TEST_ROOT="$TEST_ROOT/hba"
-mkdir -p "$HBA_TEST_ROOT"
-printf '# base\nhost all all 127.0.0.1/32 md5\n' >"$HBA_TEST_ROOT/valid"
-printf '# dbdog-release BEGIN: local Agent monitor\nhost all dbdog 127.0.0.1/32 md5\n' \
-  >"$HBA_TEST_ROOT/broken"
-printf '# original\n' >"$HBA_TEST_ROOT/before"
-printf '# managed\n' >"$HBA_TEST_ROOT/applied"
-cp "$HBA_TEST_ROOT/applied" "$HBA_TEST_ROOT/current"
-bash -c '
-  source "$1"
-  trap - EXIT
-  agent_validate_hba_markers "$2/valid"
-  if agent_validate_hba_markers "$2/broken"; then exit 91; fi
-  DB_HBA_PATHS=()
-  DB_HBA_BACKUPS=()
-  DB_HBA_APPLIED=()
-  DB_HBA_PATHS[1]="$2/current"
-  DB_HBA_BACKUPS[1]="$2/before"
-  DB_HBA_APPLIED[1]="$2/applied"
-  agent_gsql() { printf "t\n"; }
-  agent_restore_hba_rules
-  cmp -s "$2/current" "$2/before"
-  [ -z "${DB_HBA_PATHS[1]:-}" ]
-' bash "$SCRIPTS_DIR/agent-install.sh" "$HBA_TEST_ROOT" || \
-  fail "HBA 标记校验或稀疏实例回滚合同失败"
-grep -Fq 'legacy_trust' "$SCRIPTS_DIR/agent-install.sh" || fail "没有自动迁移旧本机 dbdog trust HBA"
-grep -Fq 'print "local all dbdog trust"' "$SCRIPTS_DIR/agent-install.sh" || \
-  fail "安装器没有交付受管 Unix socket local trust HBA"
-grep -Fq 'install-hba-recovery.' "$SCRIPTS_DIR/agent-install.sh" || fail "HBA 恢复失败未持久化恢复材料"
-pass "HBA 改写拒绝残缺标记、迁移旧 TCP trust、交付 socket 规则并按真实实例下标可靠回滚"
+INSTALL_SCRIPT="$SCRIPTS_DIR/agent-install.sh"
+for forbidden in \
+  agent_install_hba_rule \
+  agent_restore_hba_rules \
+  persist_hba_recovery_materials \
+  pg_reload_conf \
+  install-hba-recovery. \
+  legacy_trust \
+  managed_socket_trust \
+  DB_HBA_PASSWORD_REFRESH; do
+  if grep -Fq "$forbidden" "$INSTALL_SCRIPT"; then
+    fail "安装器仍含 HBA 写入、回滚或旧 socket trust 迁移逻辑: $forbidden"
+  fi
+done
+grep -Fq 'SHOW hba_file;' "$INSTALL_SCRIPT" || fail "安装器没有只读发现目标 HBA 文件"
+grep -Fq 'host all dbdog 127.0.0.1/32 md5' "$INSTALL_SCRIPT" || \
+  fail "安装器没有校验 DBA 预配置的精确 TCP MD5 规则"
+pass "安装器只读校验 DBA 预配置的 HBA，不写入、回滚或迁移生产配置"
 
 CONF="$TEST_ROOT/rendered"
 UNITS="$TEST_ROOT/units"
@@ -261,8 +273,11 @@ grep -Fq 'service_monitoring_config:' "$CONF/system-probe.yaml" || fail "USM 未
 grep -Fq 'dbm: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "GaussDB DBM 未启用"
 grep -Fq 'collect_activity_metrics: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "activity 未启用"
 grep -Fq "password: 'pa''ss: #1'" "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "密码 YAML 转义错误"
-grep -Fq "host: '$SOCKET_DIR'" "$CONF/conf.d/gaussdb.d/conf.yaml" || \
-  fail "探测到的 Unix socket 没有落入 GaussDB 配置"
+grep -Fq 'host: 127.0.0.1' "$CONF/conf.d/gaussdb.d/conf.yaml" || \
+  fail "GaussDB integration 没有使用本机 TCP endpoint"
+if grep -Fq "host: '$SOCKET_DIR'" "$CONF/conf.d/gaussdb.d/conf.yaml"; then
+  fail "安装期管理 socket 被错误写入运行期 GaussDB 配置"
+fi
 grep -Fq 'port: 15432' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "探测端口没有落入配置"
 grep -Fq "$GAUSSLOG/gs_log/*/gaussdb-*.log" "$CONF/conf.d/gaussdb.d/conf.yaml" || \
   fail "探测日志路径没有落入配置"
@@ -288,26 +303,103 @@ pass "主机 checks 与 Core/Trace/Process/System Probe 四服务一次生成且
   fail "升级无法保留 GaussDB 密码"
 pass "重复运行安装器可保留现有 server URL 与两项凭证"
 
-INSTALL_SCRIPT="$SCRIPTS_DIR/agent-install.sh"
 if grep -Fq 'SET password_encryption_type' "$INSTALL_SCRIPT"; then
   fail "安装器仍尝试在会话中修改 password_encryption_type"
 fi
-if grep -Eq 'host[[:space:]]+all[[:space:]]+dbdog.*[[:space:]]trust([[:space:]]|$)' "$INSTALL_SCRIPT"; then
-  fail "安装器绝不能给 MONADMIN 安装 trust HBA"
-fi
 grep -Fq "SHOW password_encryption_type;" "$INSTALL_SCRIPT" || fail "没有预检认证模式"
-grep -Fq 'local all dbdog trust' "$INSTALL_SCRIPT" || fail "缺少受管 Unix socket HBA"
-grep -Fq 'ALTER USER dbdog WITH MONADMIN;' "$INSTALL_SCRIPT" || fail "升级仍会重复设置未变化密码"
+grep -Fq 'host all dbdog 127.0.0.1/32 md5' "$INSTALL_SCRIPT" || fail "缺少精确本机 MD5 HBA 合同"
+for forbidden in \
+  DB_PASSWORD_CHANGED \
+  DB_PASSWORD_RESET_WITHOUT_ROLLBACK \
+  "local password=\"\$1\" force=" \
+  "agent_prepare_gaussdb_user \"\$PREVIOUS_DB_PASSWORD\" force"; do
+  if grep -Fq "$forbidden" "$INSTALL_SCRIPT"; then
+    fail "安装器仍含已有账号密码刷新或密码回滚逻辑: $forbidden"
+  fi
+done
+grep -Fq 'ALTER USER dbdog WITH MONADMIN;' "$INSTALL_SCRIPT" || \
+  fail "已有 dbdog 用户验证通过后没有幂等确保 MONADMIN"
 grep -Fq 'install-configcheck.log' "$INSTALL_SCRIPT" || fail "configcheck 诊断没有持久化"
 grep -Fq 'for ((i=1; i<=8; i++))' "$INSTALL_SCRIPT" || fail "configcheck 没有 readiness 重试"
 if grep -Fq 'PGPASSWORD=' "$INSTALL_SCRIPT"; then fail "数据库密码仍暴露在子进程 argv 环境赋值中"; fi
 grep -Fq 'error.sqlstate == "28P01"' "$INSTALL_SCRIPT" || fail "密码探测没有区分明确认证拒绝和基础设施错误"
+ACTIVE_AUTH_BODY="$(awk '/^agent_active_auth_is_md5\(\)/ { scan=1 } /^agent_prepare_gaussdb_user\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq 'socket.create_connection(("127.0.0.1"' <<<"$ACTIVE_AUTH_BODY" || \
+  fail "生效认证探测没有直接建立本机 TCP 连接"
+grep -Fq 'struct.pack("!I", 196608)' <<<"$ACTIVE_AUTH_BODY" || \
+  fail "生效认证探测没有发送最小 PostgreSQL v3 StartupMessage"
+grep -Fq 'message_type != b"R"' <<<"$ACTIVE_AUTH_BODY" || \
+  fail "生效认证探测没有要求 AuthenticationRequest"
+grep -Fq 'authentication_code != 5' <<<"$ACTIVE_AUTH_BODY" || \
+  fail "生效认证探测没有精确要求 MD5 AuthenticationRequest code=5"
+if grep -Eqi 'psycopg|password' <<<"$ACTIVE_AUTH_BODY"; then
+  fail "生效认证类型探测仍通过客户端驱动或错误密码推断"
+fi
+[ "$(grep -c 'connection.sendall' <<<"$ACTIVE_AUTH_BODY")" -eq 1 ] || \
+  fail "生效认证类型探测在 StartupMessage 后仍可能提交额外认证消息"
+PREPARE_USER_BODY="$(awk '/^agent_prepare_gaussdb_user\(\)/ { scan=1 } /^bootstrap_gaussdb_monitoring\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq "agent_monitor_password_works \"\$index\" \"\$password\"" <<<"$PREPARE_USER_BODY" || \
+  fail "准备 dbdog 用户没有用真实正确密码做驱动登录探测"
+grep -Fq "agent_active_auth_is_md5 \"\$index\"" <<<"$PREPARE_USER_BODY" || \
+  fail "准备 dbdog 用户没有在正确密码探测外核对当前生效 MD5 认证"
 MAIN_BODY="$(awk '/^main\(\)/ { scan=1 } scan { print }' "$INSTALL_SCRIPT")"
 PREFLIGHT_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'preflight_gaussdb_clients' | head -1 | cut -d: -f1)"
 CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  cutover$' | head -1 | cut -d: -f1)"
 BOOTSTRAP_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'bootstrap_gaussdb_monitoring' | head -1 | cut -d: -f1)"
+VERIFY_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  start_and_verify$' | head -1 | cut -d: -f1)"
+CONTRACT_MARKER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'write_installer_contract_marker' | head -1 | cut -d: -f1)"
+SUCCESS_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'INSTALL_SUCCEEDED=1' | head -1 | cut -d: -f1)"
 [ "$PREFLIGHT_LINE" -lt "$CUTOVER_LINE" ] && [ "$CUTOVER_LINE" -lt "$BOOTSTRAP_LINE" ] || \
   fail "gsql 精确预检没有发生在文件/数据库 mutation 之前"
+[ "$VERIFY_LINE" -lt "$CONTRACT_MARKER_LINE" ] && [ "$CONTRACT_MARKER_LINE" -lt "$SUCCESS_LINE" ] || \
+  fail "安装器 marker 没有在完整验收后、成功提交前统一写入"
+[ "$(printf '%s\n' "$MAIN_BODY" | grep -c 'write_installer_contract_marker')" -eq 1 ] || \
+  fail "main 没有让新旧 runtime 共用唯一的验收后 marker 写入路径"
+PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^write_installer_contract_marker\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+# shellcheck disable=SC2016 # 静态检查安装脚本中的字面量变量引用。
+if printf '%s\n' "$PREPARE_BODY" \
+  | grep -Eq 'AGENT_INSTALLER_CONTRACT_MARKER|\.dbdog-installer-contract-sha256'; then
+  fail "prepare_runtime/staging 仍会在完整验收前预置安装器 marker"
+fi
+
+ARCHIVE_ROOT="$TEST_ROOT/archive-contract/root"
+ARCHIVE_WORK="$TEST_ROOT/archive-contract/work"
+mkdir -p "$ARCHIVE_ROOT/provenance" "$ARCHIVE_ROOT/bin/agent" "$ARCHIVE_ROOT/embedded/bin" \
+  "$ARCHIVE_WORK"
+for required in \
+  .install_root \
+  provenance/build.txt \
+  provenance/agent-version.txt \
+  provenance/gaussdb.txt \
+  version-manifest.txt \
+  version-manifest.json \
+  bin/agent/agent \
+  embedded/bin/trace-loader \
+  embedded/bin/trace-agent \
+  embedded/bin/process-agent \
+  embedded/bin/system-probe; do
+  : >"$ARCHIVE_ROOT/$required"
+done
+tar -czf "$TEST_ROOT/archive-contract/clean.tar.gz" -C "$ARCHIVE_ROOT" .
+run_archive_contract() { # <tarball>
+  bash -c '
+    source "$1"
+    trap - EXIT
+    WORK_DIR="$2"
+    validate_archive_members "$3"
+  ' bash "$INSTALL_SCRIPT" "$ARCHIVE_WORK" "$1"
+}
+run_archive_contract "$TEST_ROOT/archive-contract/clean.tar.gz" || \
+  fail "不含 installer marker 的合法成员清单被拒绝"
+printf '%064d\n' 0 >"$ARCHIVE_ROOT/$AGENT_INSTALLER_CONTRACT_MARKER"
+tar -czf "$TEST_ROOT/archive-contract/forged-marker.tar.gz" -C "$ARCHIVE_ROOT" .
+if run_archive_contract "$TEST_ROOT/archive-contract/forged-marker.tar.gz" \
+  >"$TEST_ROOT/archive-contract/forged-marker.out" 2>&1; then
+  fail "错误接受了预置 installer marker 的 Agent tarball"
+fi
+grep -Fq '不得预置安装器验收 marker' "$TEST_ROOT/archive-contract/forged-marker.out" || \
+  fail "tarball 保留 marker 被拒绝时没有给出明确错误"
+pass "tarball 与 staging 均不能预置 installer marker，所有 runtime 只在完整验收后统一写入"
 RECOVERY_BASE="$TEST_ROOT/recovery/etc/dbdog-agent"
 mkdir -p "$RECOVERY_BASE.failed.20260727010101" "$RECOVERY_BASE.failed.20260727020202"
 RECOVERED="$(PATH="$FAKE_BIN:$PATH" bash -c '
@@ -317,10 +409,11 @@ RECOVERED="$(PATH="$FAKE_BIN:$PATH" bash -c '
   latest_failed_agent_config
 ' bash "$INSTALL_SCRIPT" "$RECOVERY_BASE")" || fail "无法发现首装失败配置"
 [ "$RECOVERED" = "$RECOVERY_BASE.failed.20260727020202" ] || fail "没有选择最新首装失败配置"
-pass "认证模式 fail closed、禁止 TCP trust、密码幂等与 configcheck 持久诊断均有流程门禁"
+pass "认证/HBA 前置条件只读 fail closed，已有账号不刷密码且诊断可追溯"
 
 PREFLIGHT_ROOT="$TEST_ROOT/preflight"
 mkdir -p "$PREFLIGHT_ROOT/bin" "$PREFLIGHT_ROOT/work"
+printf '# DBA managed\nhost all dbdog 127.0.0.1/32 md5\n' >"$PREFLIGHT_ROOT/pg_hba.conf"
 cat >"$PREFLIGHT_ROOT/bin/ldd" <<'EOF'
 #!/bin/sh
 printf '\tlibc.so.6 => /lib/libc.so.6 (0x1)\n'
@@ -341,17 +434,31 @@ done
 case "$query" in
   'SELECT 1;') printf '1\n' ;;
   'SHOW password_encryption_type;') cat "$root/mode" ;;
+  'SHOW hba_file;') printf '%s\n' "${root%/bin}/pg_hba.conf" ;;
   *pg_user*) cat "$root/exists" ;;
-  '') cat >"$root/stdin.sql" ;;
+  '')
+    cat >"$root/stdin.sql"
+    ;;
   *) printf '1\n' ;;
 esac
 EOF
 cat >"$PREFLIGHT_ROOT/bin/fake-python" <<'EOF'
 #!/bin/sh
-# agent_monitor_connection_works 的合同替身：消费 stdin 中的 Python 程序并模拟成功登录。
-printf 'python-args=%s\n' "$*" >>"$(dirname "$0")/calls"
-cat >/dev/null
-exit 0
+root=$(dirname "$0")
+program="$root/last-python-program"
+cat >"$program"
+printf 'python-args=%s\n' "$*" >>"$root/calls"
+if grep -Fq 'authentication_code != 5' "$program"; then
+  printf 'active-md5-probe\n' >>"$root/calls"
+  [ ! -f "$root/reject-active-md5" ] || exit 91
+  exit 0
+fi
+if grep -Fq 'psycopg.connect' "$program"; then
+  printf 'correct-password-probe\n' >>"$root/calls"
+  [ ! -f "$root/reject-password" ] || exit 42
+  exit 0
+fi
+exit 96
 EOF
 chmod 0755 "$PREFLIGHT_ROOT/bin/ldd" "$PREFLIGHT_ROOT/bin/gsql" \
   "$PREFLIGHT_ROOT/bin/fake-python"
@@ -359,7 +466,7 @@ cp "$FAKE_BIN/timeout" "$PREFLIGHT_ROOT/bin/timeout"
 printf '1\n' >"$PREFLIGHT_ROOT/bin/mode"
 printf '1\n' >"$PREFLIGHT_ROOT/bin/exists"
 
-run_fake_gauss_action() { # <preflight|set-password>
+run_fake_gauss_action() { # <preflight|active-auth|ensure-user>
   PATH="$FAKE_BIN:$PATH" bash -c '
     source "$1"
     trap - EXIT
@@ -367,8 +474,8 @@ run_fake_gauss_action() { # <preflight|set-password>
     DBDOG_GAUSSDB_DBNAME=postgres
     DBDOG_GAUSSDB_MONITOR_PASSWORD=Aa1_valid_monitor_password
     DBDOG_AGENT_PYTHON="$2/bin/fake-python"
-    PREVIOUS_DB_PASSWORD=""
     AGENT_GAUSS_PID_PORTS=(15432)
+    AGENT_GAUSS_PID_DATA_DIRS=("$2")
     AGENT_GAUSS_PID_HOMES=("$2")
     AGENT_GAUSS_PID_OWNERS=("$(id -un)")
     AGENT_GAUSS_PID_OWNER_HOMES=("$2")
@@ -379,49 +486,120 @@ run_fake_gauss_action() { # <preflight|set-password>
     case "$3" in
       preflight)
         preflight_gaussdb_clients
-        printf "RESULT=%s:%s\n" "${AGENT_GAUSS_PID_PASSWORD_MODES[0]}" \
-          "${AGENT_GAUSS_PID_USER_EXISTS[0]}"
+        printf "PREFLIGHT=ok\n"
         ;;
-      set-password)
-        PREVIOUS_DB_PASSWORD=Aa1_valid_monitor_password
-        agent_set_gaussdb_password "$PREVIOUS_DB_PASSWORD"
+      active-auth)
+        agent_active_auth_is_md5 0
+        ;;
+      ensure-user)
+        agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
         ;;
     esac
   ' bash "$INSTALL_SCRIPT" "$PREFLIGHT_ROOT" "$1"
 }
 
+assert_password_probe_precedes_active_md5() {
+  local password_line active_line
+  password_line="$(grep -n -m1 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" | cut -d: -f1)"
+  active_line="$(grep -n -m1 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" | cut -d: -f1)"
+  [ -n "$password_line" ] && [ -n "$active_line" ] && [ "$password_line" -lt "$active_line" ] || \
+    fail "准备 dbdog 用户没有先验证真实正确密码、再验证当前生效 MD5 认证"
+}
+
 PREFLIGHT_OUTPUT="$(run_fake_gauss_action preflight)" || fail "模拟 gsql 精确预检失败"
-[ "${PREFLIGHT_OUTPUT##*$'\n'}" = 'RESULT=1:1' ] || fail "预检没有记录认证模式和用户状态"
+printf '%s\n' "$PREFLIGHT_OUTPUT" | grep -Fqx 'PREFLIGHT=ok' || fail "合法认证/HBA 合同预检未完成"
 grep -Fq "PGHOST=$PREFLIGHT_ROOT/socket" "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 PGHOST"
 grep -Fq "LD_LIBRARY_PATH=$PREFLIGHT_ROOT/lib:$PREFLIGHT_ROOT/lib/libsimsearch" \
   "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 LD_LIBRARY_PATH"
-run_fake_gauss_action set-password >/dev/null || fail "未变化密码的幂等路径失败"
-grep -Fq "$PREFLIGHT_ROOT/socket 15432 postgres" "$PREFLIGHT_ROOT/bin/calls" || \
-  fail "内嵌 psycopg 验收没有使用目标实例 Unix socket"
+: >"$PREFLIGHT_ROOT/bin/calls"
+run_fake_gauss_action active-auth >/dev/null || fail "AuthenticationRequest code=5 主动握手探测失败"
+grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "agent_active_auth_is_md5 没有执行最小 StartupMessage 探测"
+if grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls"; then
+  fail "主动认证类型探测错误提交了数据库密码"
+fi
+touch "$PREFLIGHT_ROOT/bin/reject-active-md5"
+if run_fake_gauss_action active-auth >"$PREFLIGHT_ROOT/active-auth-rejected.out" 2>&1; then
+  fail "非 MD5 的生效认证握手被错误接受"
+fi
+rm -f -- "$PREFLIGHT_ROOT/bin/reject-active-md5"
+
+rm -f -- "$PREFLIGHT_ROOT/bin/stdin.sql" "$PREFLIGHT_ROOT/bin/reject-password"
+: >"$PREFLIGHT_ROOT/bin/calls"
+run_fake_gauss_action ensure-user >/dev/null || fail "已有用户的保存密码真实 TCP 探测失败"
+grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" || fail "内嵌 psycopg 密码验收没有执行"
+grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "已有用户正确密码探测后没有核对当前生效 MD5 认证"
+assert_password_probe_precedes_active_md5
+grep -Fq ' 15432 postgres' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "内嵌 psycopg 验收没有使用目标实例 TCP 端口"
 grep -Fqx 'ALTER USER dbdog WITH MONADMIN;' "$PREFLIGHT_ROOT/bin/stdin.sql" || \
-  fail "升级仍然重置了未变化的 GaussDB 密码"
-if grep -Fq PASSWORD "$PREFLIGHT_ROOT/bin/stdin.sql"; then fail "幂等升级 SQL 仍含 PASSWORD"; fi
-
-printf '2\n' >"$PREFLIGHT_ROOT/bin/mode"
-printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
-run_fake_gauss_action preflight >/dev/null || \
-  fail "Unix socket 认证路径错误拒绝了 GaussDB 默认 SHA256 密码模式"
-
-printf '3\n' >"$PREFLIGHT_ROOT/bin/mode"
-printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
-run_fake_gauss_action preflight >/dev/null || \
-  fail "Unix socket trust 路径错误拒绝了 GaussDB SM3 密码模式"
-
-printf '4\n' >"$PREFLIGHT_ROOT/bin/mode"
-printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode4.out" 2>&1; then
-  fail "需要创建/重置密码时错误接受了不兼容的认证模式"
+  fail "已有用户验证通过后没有幂等确保 MONADMIN"
+if grep -Eq 'ALTER[[:space:]]+USER.*PASSWORD' "$PREFLIGHT_ROOT/bin/stdin.sql"; then
+  fail "已有用户密码有效时安装器仍执行 ALTER PASSWORD"
 fi
-if ! grep -Fq 'password_encryption_type=4' "$PREFLIGHT_ROOT/mode4.out"; then
-  sed -n '1,80p' "$PREFLIGHT_ROOT/mode4.out" >&2
-  fail "认证不兼容没有给出清晰且非侵入式的错误"
+
+touch "$PREFLIGHT_ROOT/bin/reject-password"
+rm -f -- "$PREFLIGHT_ROOT/bin/stdin.sql"
+if run_fake_gauss_action ensure-user >"$PREFLIGHT_ROOT/existing-password-rejected.out" 2>&1; then
+  fail "已有用户保存密码被拒绝时安装器没有 fail closed"
 fi
-pass "真实命令形态完成 ldd/version/SELECT 预检、socket 环境传递、幂等密码与认证 fail-closed"
+if [ -f "$PREFLIGHT_ROOT/bin/stdin.sql" ] \
+  && grep -Eq 'ALTER[[:space:]]+USER.*PASSWORD' "$PREFLIGHT_ROOT/bin/stdin.sql"; then
+  fail "已有用户保存密码被拒绝后安装器擅自 ALTER PASSWORD"
+fi
+rm -f -- "$PREFLIGHT_ROOT/bin/reject-password" "$PREFLIGHT_ROOT/bin/stdin.sql"
+
+printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
+: >"$PREFLIGHT_ROOT/bin/calls"
+run_fake_gauss_action ensure-user >/dev/null || fail "缺少 dbdog 用户时无法首创并做 TCP 验收"
+grep -Eq "^CREATE USER dbdog WITH MONADMIN PASSWORD '[^']+';$" \
+  "$PREFLIGHT_ROOT/bin/stdin.sql" || fail "首装没有创建 dbdog MONADMIN 密码用户"
+grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "首创 dbdog 用户后没有执行真实 TCP 驱动探测"
+grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "首创 dbdog 用户正确密码探测后没有核对当前生效 MD5 认证"
+assert_password_probe_precedes_active_md5
+printf '1\n' >"$PREFLIGHT_ROOT/bin/exists"
+
+for rejected_mode in 0 2 3 4; do
+  printf '%s\n' "$rejected_mode" >"$PREFLIGHT_ROOT/bin/mode"
+  if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode-$rejected_mode.out" 2>&1; then
+    fail "认证合同错误接受 password_encryption_type=$rejected_mode（必须恰好为 1）"
+  fi
+  grep -Fq "当前为 $rejected_mode" \
+    "$PREFLIGHT_ROOT/mode-$rejected_mode.out" || \
+    fail "password_encryption_type=$rejected_mode 未给出清晰错误"
+done
+printf '1\n' >"$PREFLIGHT_ROOT/bin/mode"
+
+printf '%s\n' \
+  'host all dbdog 127.0.0.1/32 md5' \
+  'local all dbdog trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/local-trust.out" 2>&1; then
+  fail "预检错误接受了 dbdog local trust 规则"
+fi
+
+printf '%s\n' \
+  'host all dbdog 127.0.0.1/32 md5' \
+  'host all dbdog 127.0.0.1/32 trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/host-trust.out" 2>&1; then
+  fail "预检错误接受了 dbdog host trust 规则"
+fi
+
+printf '%s\n' \
+  'host all dbdog 127.0.0.1/32 md5' \
+  'host all all 127.0.0.1/32 trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/broad-trust.out" 2>&1; then
+  fail "预检错误接受了实际覆盖 dbdog 的 all-user trust 规则"
+fi
+
+printf '# missing exact dbdog rule\nhost all all 127.0.0.1/32 md5\n' \
+  >"$PREFLIGHT_ROOT/pg_hba.conf"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/missing-md5.out" 2>&1; then
+  fail "预检错误接受了缺少精确 dbdog TCP MD5 规则的 HBA"
+fi
+pass "只读前置合同与正确密码 probe 之外，再以最小 StartupMessage 验证生效认证为 MD5 code=5"
 
 if [ -f "$RELEASE_DIR/../dbdog-agent-core/gaussdb/datadog_checks/gaussdb/connection_pool.py" ]; then
   grep -Fq 'ConnectionPool' \
@@ -456,6 +634,9 @@ if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then
   tar -tzf "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" \
     | grep -Eq '^\./(embedded/)?bin/(gsql|gaussdb)$' && \
     fail "Agent 产物错误打包了目标 GaussDB 的 gsql/gaussdb"
+  tar -tzf "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" \
+    | grep -Fqx "./$AGENT_INSTALLER_CONTRACT_MARKER" && \
+    fail "Agent 当前产物错误预置了安装器验收 marker"
   tar -xOf "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ./provenance/build.txt \
     | grep -Fqx "version=$CURRENT_AGENT_VERSION" || \
     fail "Agent 当前产物 provenance 版本与 manifest 不一致"
@@ -616,6 +797,6 @@ mv "$VERSION_WORK/version-manifest-json.good" "$VERSION_RUNTIME/version-manifest
 PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 [ "$(printf '%s\n' "$PREPARE_BODY" | grep -c 'validate_runtime_tree')" -eq 2 ] || \
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
-pass "staging 与 SHA-skip 均精确绑定 marker、binary version 和三层 provenance/manifest"
+pass "staging 与 SHA-skip 均精确绑定版本/产物 identity、binary version 和三层 provenance/manifest"
 
-printf 'ALL PASS: 13 agent install contract groups\n'
+printf 'ALL PASS: 17 agent install contract groups\n'
