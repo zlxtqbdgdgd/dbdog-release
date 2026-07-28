@@ -1247,8 +1247,15 @@ diagnose_dbdog_agent() {
     # journal 前缀即使已安全捕获，后续 status/check/systemd/coredump 任一证据失败时，
     # 整个手工快照事务都不能越过旧水位；机器结果与最终 stdout 使用同一规范状态。
     AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
-    AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
-    backlog_value=true
+    if [ "$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" -eq \
+         "$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE" ]; then
+      # 空时间窗本身已完整，失败的是其它证据；不得伪造一个永远排不完的 backlog。
+      AGENT_DIAGNOSTIC_WINDOW_COMPLETE=1
+      backlog_value=false
+    else
+      AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
+      backlog_value=true
+    fi
   fi
   if ! agent_diagnostic_write_result_file "$healthy_value"; then
     AGENT_DIAGNOSTIC_COMPLETE=0

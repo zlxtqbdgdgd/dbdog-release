@@ -549,6 +549,25 @@ assert_contains "$LATE_FAILURE_OUT" 'processed_until_epoch=600000'
 assert_contains "$LATE_FAILURE_OUT" 'diagnostic_complete=false'
 pass 'journal 协商成功后其它证据失败仍统一回退到调用前时间水位'
 
+EMPTY_LATE_FAILURE_OUT="$TEST_ROOT/custom-empty-window-late-failure.out"
+EMPTY_LATE_FAILURE_RESULT="$TEST_ROOT/custom-empty-window-late-failure.result"
+prepare_machine_result "$EMPTY_LATE_FAILURE_RESULT"
+if FAKE_AGENT_LONG_OUTPUT=1 AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES=64 \
+    AGENT_DIAGNOSTIC_SINCE_EPOCH=700000 AGENT_DIAGNOSTIC_UNTIL_EPOCH=700000 \
+    AGENT_DIAGNOSTIC_RESULT_FILE="$EMPTY_LATE_FAILURE_RESULT" \
+    run_diagnostic >"$EMPTY_LATE_FAILURE_OUT" 2>&1; then
+  fail '空 journal 窗口后的 status 输出超限错误返回成功'
+fi
+for expected in \
+  'processed_until_epoch=700000' \
+  'window_complete=true' \
+  'evidence_complete=false'; do
+  assert_contains "$EMPTY_LATE_FAILURE_RESULT" "$expected"
+done
+assert_contains "$EMPTY_LATE_FAILURE_OUT" 'backlog_pending=false'
+assert_contains "$EMPTY_LATE_FAILURE_OUT" 'diagnostic_complete=false'
+pass '同秒空时间窗保持 window complete，后续证据失败仍不推进且不制造 backlog'
+
 DIAG_TMP_PARENT="$TEST_ROOT/diagnostic-tmp"
 mkdir -m 0700 "$DIAG_TMP_PARENT"
 FAILED_CLEANUP_OUT="$TEST_ROOT/failed-cleanup.out"
