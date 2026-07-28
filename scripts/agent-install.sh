@@ -782,7 +782,8 @@ validate_archive_members() { # <tarball>
   ' "$list" || die "Agent tarball 含越界路径"
   duplicate="$(LC_ALL=C sort "$list" | awk 'previous == $0 { print; exit } { previous=$0 }')"
   [ -z "$duplicate" ] || die "Agent tarball 含重复成员: $duplicate"
-  for required in ./.install_root ./provenance/build.txt ./provenance/gaussdb.txt \
+  for required in ./.install_root ./provenance/build.txt ./provenance/agent-version.txt \
+    ./provenance/gaussdb.txt ./version-manifest.txt ./version-manifest.json \
     ./bin/agent/agent ./embedded/bin/trace-loader ./embedded/bin/trace-agent \
     ./embedded/bin/process-agent ./embedded/bin/system-probe; do
     grep -Fqx "$required" "$list" || die "Agent tarball 缺少: $required"
@@ -796,12 +797,65 @@ build_field() { # <文件> <key>
   awk -F= -v key="$2" '$1 == key { print substr($0, length(key) + 2); found=1 } END { exit !found }' "$1"
 }
 
+agent_version_manifest_json_value() { # <version-manifest.json>；输出唯一 build_version
+  local input="$1" parser env_bin
+  env_bin="$(command -v env 2>/dev/null || true)"
+  [ -n "$env_bin" ] || return 1
+  if parser="$(command -v python3 2>/dev/null)"; then
+    "$env_bin" -i PATH=/usr/bin:/bin LANG=C LC_ALL=C "$parser" - "$input" <<'PY'
+import json
+import pathlib
+import sys
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+document = json.loads(
+    pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"),
+    object_pairs_hook=unique_object,
+)
+version = document.get("build_version") if type(document) is dict else None
+if type(version) is not str or not version:
+    raise SystemExit("version-manifest.json has no string build_version")
+print(version)
+PY
+  elif parser="$(command -v jq 2>/dev/null)"; then
+    "$env_bin" -i PATH=/usr/bin:/bin LANG=C LC_ALL=C "$parser" -er \
+      'if type == "object" and (.build_version | type) == "string" and (.build_version | length) > 0 then .build_version else error("missing build_version") end' \
+      "$input"
+  else
+    return 1
+  fi
+}
+
+agent_version_output_sha256() { # <单行 version 输出>；哈希口径与发布端 printf '%s\n' 一致
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s\n' "$1" | sha256sum | awk '{print $1}'
+  else
+    printf '%s\n' "$1" | shasum -a 256 | awk '{print $1}'
+  fi
+}
+
 validate_runtime_tree() { # <目录> <manifest version>
   local tree="$1" expected_version="$2" info="$1/provenance/build.txt" bin link resolved
   local integration_info="$1/provenance/gaussdb.txt" module_path distribution_path
+  local version_info="$1/provenance/agent-version.txt"
+  local manifest_text="$1/version-manifest.txt" manifest_json="$1/version-manifest.json"
+  local env_bin timeout_bin version_output version_rc=0 label reported_version separator details
+  local json_version build_binary_sha version_binary_sha build_text_sha version_text_sha
+  local build_json_sha version_json_sha build_output_sha version_output_sha actual_output_sha value
   [ -f "$tree/.install_root" ] || die "Agent runtime 缺少 .install_root"
   [ "$(build_field "$info" product)" = dbdog-agent ] || die "Agent provenance product 错误"
   [ "$(build_field "$info" version)" = "$expected_version" ] || die "Agent provenance version 错误"
+  [ "$(build_field "$info" compiled_agent_version)" = "$expected_version" ] || \
+    die "Agent provenance compiled_agent_version 与 manifest 版本不一致"
   [ "$(build_field "$info" architecture)" = aarch64 ] || die "Agent provenance architecture 错误"
   [ "$(build_field "$info" install_prefix)" = "$AGENT_RUNTIME_DIR" ] || die "Agent install prefix 不匹配"
   # provenance 记录的是 integration 版本；只验证采集插件完整，不拿它限制目标
@@ -832,15 +886,99 @@ validate_runtime_tree() { # <目录> <manifest version>
     resolved="$(readlink -m "$link")"
     case "$resolved" in "$tree" | "$tree"/*) ;; *) die "Agent runtime 符号链接越界: $link" ;; esac
   done < <(find "$tree" -type l -print0)
+
+  # 必须执行即将切换的那一个 binary；空环境避免误用同机官方 Agent、用户 PATH 或
+  # LD_LIBRARY_PATH。麒麟构建的稳定格式为 `Agent <release> - Commit: ...`，其中
+  # version token 必须完整相等，不能用前缀匹配让 .3 接受 .30/7.79 等版本。
+  env_bin="$(command -v env 2>/dev/null || true)"
+  timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
+  [ -n "$env_bin" ] && [ -x "$timeout_bin" ] || \
+    die "缺少 Agent version 最小环境所需的 env/timeout"
+  version_output="$("$timeout_bin" --kill-after=2 30 "$env_bin" -i \
+    PATH=/usr/bin:/bin LANG=C LC_ALL=C "$tree/bin/agent/agent" version 2>&1)" || version_rc=$?
+  [ "$version_rc" -eq 0 ] || \
+    die "Agent binary version 执行失败（rc=$version_rc）: ${version_output:-无输出}"
+  case "$version_output" in
+    "" | *$'\n'* | *$'\r'*) die "Agent binary version 输出不是单行文本" ;;
+  esac
+  IFS=' ' read -r label reported_version separator details <<<"$version_output"
+  [ "$label" = Agent ] && [ "$reported_version" = "$expected_version" ] \
+    && [ "$separator" = - ] && [ -n "$details" ] || \
+    die "Agent binary version 与 manifest 不一致: 期望 $expected_version，实际 $version_output"
+
+  [ -f "$version_info" ] || die "Agent runtime 缺少 provenance/agent-version.txt"
+  [ "$(build_field "$version_info" compiled_version)" = "$expected_version" ] || \
+    die "Agent version provenance 的 compiled_version 不一致"
+  [ "$(build_field "$version_info" manifest_header_version)" = "$expected_version" ] || \
+    die "Agent version provenance 的 manifest_header_version 不一致"
+  [ "$(build_field "$version_info" manifest_component_version)" = "$expected_version" ] || \
+    die "Agent version provenance 的 manifest_component_version 不一致"
+  [ "$(build_field "$version_info" manifest_json_version)" = "$expected_version" ] || \
+    die "Agent version provenance 的 manifest_json_version 不一致"
+  [ "$(build_field "$version_info" binary_path)" = ./bin/agent/agent ] || \
+    die "Agent version provenance 的 binary_path 不一致"
+  [ "$(build_field "$version_info" version_manifest_text_path)" = ./version-manifest.txt ] || \
+    die "Agent version provenance 的 version_manifest_text_path 不一致"
+  [ "$(build_field "$version_info" version_manifest_json_path)" = ./version-manifest.json ] || \
+    die "Agent version provenance 的 version_manifest_json_path 不一致"
+  [ "$(build_field "$version_info" version_output)" = "$version_output" ] || \
+    die "Agent 实际 version 输出与 provenance 不一致"
+
+  awk -v expected="$expected_version" '
+    $1 == "agent" {
+      header_count++
+      if (NR != 1 || NF != 2 || $2 != expected) bad=1
+    }
+    $1 == "datadog-agent" {
+      count++
+      if (NF < 2 || $2 != expected) bad=1
+    }
+    END { exit(NR > 0 && header_count == 1 && count == 1 && !bad ? 0 : 1) }
+  ' "$manifest_text" || die "version-manifest.txt 与 manifest 版本不一致"
+  json_version="$(agent_version_manifest_json_value "$manifest_json")" || \
+    die "无法严格读取 version-manifest.json build_version"
+  [ "$json_version" = "$expected_version" ] || \
+    die "version-manifest.json build_version 与 manifest 版本不一致"
+
+  build_binary_sha="$(build_field "$info" agent_binary_sha256)" || die "build provenance 缺少 binary SHA"
+  version_binary_sha="$(build_field "$version_info" binary_sha256)" || die "version provenance 缺少 binary SHA"
+  build_text_sha="$(build_field "$info" agent_version_manifest_text_sha256)" || die "build provenance 缺少 text manifest SHA"
+  version_text_sha="$(build_field "$version_info" version_manifest_text_sha256)" || die "version provenance 缺少 text manifest SHA"
+  build_json_sha="$(build_field "$info" agent_version_manifest_json_sha256)" || die "build provenance 缺少 JSON manifest SHA"
+  version_json_sha="$(build_field "$version_info" version_manifest_json_sha256)" || die "version provenance 缺少 JSON manifest SHA"
+  build_output_sha="$(build_field "$info" agent_version_output_sha256)" || die "build provenance 缺少 version output SHA"
+  version_output_sha="$(build_field "$version_info" version_output_sha256)" || die "version provenance 缺少 version output SHA"
+  [ "$build_binary_sha" = "$version_binary_sha" ] \
+    && [ "$build_text_sha" = "$version_text_sha" ] \
+    && [ "$build_json_sha" = "$version_json_sha" ] \
+    && [ "$build_output_sha" = "$version_output_sha" ] || \
+    die "Agent build/version provenance 的 SHA 记录不一致"
+  for value in "$build_binary_sha" "$build_text_sha" "$build_json_sha" "$build_output_sha"; do
+    [ "${#value}" -eq 64 ] || die "Agent version provenance 含无效 SHA-256"
+    case "$value" in *[!0-9a-f]*) die "Agent version provenance 含无效 SHA-256" ;; esac
+  done
+  sha256_verify "$tree/bin/agent/agent" "$build_binary_sha" || die "Agent binary SHA-256 与 provenance 不一致"
+  sha256_verify "$manifest_text" "$build_text_sha" || die "version-manifest.txt SHA-256 与 provenance 不一致"
+  sha256_verify "$manifest_json" "$build_json_sha" || die "version-manifest.json SHA-256 与 provenance 不一致"
+  actual_output_sha="$(agent_version_output_sha256 "$version_output")" || \
+    die "无法计算 Agent version 输出 SHA-256"
+  [ "$actual_output_sha" = "$build_output_sha" ] || \
+    die "Agent version 输出 SHA-256 与 provenance 不一致"
 }
 
 prepare_runtime() { # <tarball> <version> <sha>
-  local package="$1" version="$2" sha="$3" installed_sha=""
-  if [ -f "$AGENT_RUNTIME_DIR/.dbdog-artifact-sha256" ]; then
-    installed_sha="$(tr -d '\r\n' <"$AGENT_RUNTIME_DIR/.dbdog-artifact-sha256")"
+  local package="$1" version="$2" sha="$3" installed_sha="" installed_version=""
+  if [ -d "$AGENT_RUNTIME_DIR" ]; then
+    installed_sha="$(agent_marker_value \
+      "$AGENT_RUNTIME_DIR/.dbdog-artifact-sha256" "$AGENT_RUNTIME_DIR")"
+    installed_version="$(agent_marker_value \
+      "$AGENT_RUNTIME_DIR/.dbdog-release-version" "$AGENT_RUNTIME_DIR")"
   fi
-  if [ "$installed_sha" = "$sha" ] && [ -x "$AGENT_RUNTIME_DIR/bin/agent/agent" ]; then
-    log "Agent runtime 产物 SHA 已一致；本次刷新配置并重新验收"
+  if [ "$installed_sha" = "$sha" ]; then
+    [ "$installed_version" = "$version" ] || \
+      die "Agent runtime SHA 虽一致，但 release-version marker 不匹配，拒绝跳过切换"
+    validate_runtime_tree "$AGENT_RUNTIME_DIR" "$version"
+    log "Agent runtime 版本、产物 SHA、provenance 与 binary 已一致；本次刷新配置并重新验收"
     RUNTIME_CHANGED=0
     return
   fi

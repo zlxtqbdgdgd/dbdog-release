@@ -408,4 +408,160 @@ if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then
 fi
 pass "安装器要求预编译 GaussDB integration + psycopg/libpq，运行期不走 gsql 短连接"
 
-printf 'ALL PASS: 12 agent install contract groups\n'
+VERSION_RUNTIME="$TEST_ROOT/version-runtime"
+VERSION_FAKE_BIN="$TEST_ROOT/version-fake-bin"
+VERSION_WORK="$TEST_ROOT/version-work"
+VERSION_EXPECTED=7.81.0-dbdog.1
+VERSION_ARTIFACT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+VERSION_OUTPUT="Agent $VERSION_EXPECTED - Commit: 4c39489b8c - Serialization version: v5.0.198 - Go version: go1.26.4"
+mkdir -p "$VERSION_RUNTIME/bin/agent" "$VERSION_RUNTIME/embedded/bin" \
+  "$VERSION_RUNTIME/embedded/lib/python3.13/site-packages/datadog_checks/gaussdb" \
+  "$VERSION_RUNTIME/embedded/lib/python3.13/site-packages/datadog_gaussdb-1.0.0.dist-info" \
+  "$VERSION_RUNTIME/embedded/lib/python3.13/site-packages/psycopg_c.libs" \
+  "$VERSION_RUNTIME/provenance" "$VERSION_FAKE_BIN" "$VERSION_WORK"
+: >"$VERSION_RUNTIME/.install_root"
+: >"$VERSION_RUNTIME/embedded/lib/python3.13/site-packages/datadog_checks/gaussdb/__init__.py"
+: >"$VERSION_RUNTIME/embedded/lib/python3.13/site-packages/psycopg_c.libs/libpq-test.so"
+
+cat >"$VERSION_FAKE_BIN/file" <<'EOF'
+#!/bin/sh
+printf '%s: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked\n' "$1"
+EOF
+chmod 0755 "$VERSION_FAKE_BIN/file"
+
+write_fake_agent_version() { # <binary 自报版本>
+  cat >"$VERSION_RUNTIME/bin/agent/agent" <<EOF
+#!/bin/sh
+[ "\${1:-}" = version ] || exit 64
+printf '%s\n' 'Agent $1 - Commit: 4c39489b8c - Serialization version: v5.0.198 - Go version: go1.26.4'
+EOF
+  chmod 0755 "$VERSION_RUNTIME/bin/agent/agent"
+}
+
+for binary in trace-loader trace-agent process-agent system-probe; do
+  printf '#!/bin/sh\nexit 0\n' >"$VERSION_RUNTIME/embedded/bin/$binary"
+  chmod 0755 "$VERSION_RUNTIME/embedded/bin/$binary"
+done
+write_fake_agent_version "$VERSION_EXPECTED"
+
+cat >"$VERSION_RUNTIME/provenance/gaussdb.txt" <<'EOF'
+module_path=./embedded/lib/python3.13/site-packages/datadog_checks/gaussdb/__init__.py
+distribution_path=./embedded/lib/python3.13/site-packages/datadog_gaussdb-1.0.0.dist-info
+EOF
+cat >"$VERSION_RUNTIME/version-manifest.txt" <<EOF
+agent $VERSION_EXPECTED
+datadog-agent $VERSION_EXPECTED
+EOF
+printf '{"build_version":"%s"}\n' "$VERSION_EXPECTED" >"$VERSION_RUNTIME/version-manifest.json"
+
+fixture_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+VERSION_BINARY_SHA="$(fixture_sha256 "$VERSION_RUNTIME/bin/agent/agent")"
+VERSION_TEXT_SHA="$(fixture_sha256 "$VERSION_RUNTIME/version-manifest.txt")"
+VERSION_JSON_SHA="$(fixture_sha256 "$VERSION_RUNTIME/version-manifest.json")"
+printf '%s\n' "$VERSION_OUTPUT" >"$VERSION_WORK/version-output"
+VERSION_OUTPUT_SHA="$(fixture_sha256 "$VERSION_WORK/version-output")"
+cat >"$VERSION_RUNTIME/provenance/build.txt" <<EOF
+product=dbdog-agent
+version=$VERSION_EXPECTED
+compiled_agent_version=$VERSION_EXPECTED
+architecture=aarch64
+install_prefix=$VERSION_RUNTIME
+agent_binary_sha256=$VERSION_BINARY_SHA
+agent_version_output_sha256=$VERSION_OUTPUT_SHA
+agent_version_manifest_text_sha256=$VERSION_TEXT_SHA
+agent_version_manifest_json_sha256=$VERSION_JSON_SHA
+EOF
+cat >"$VERSION_RUNTIME/provenance/agent-version.txt" <<EOF
+compiled_version=$VERSION_EXPECTED
+manifest_header_version=$VERSION_EXPECTED
+manifest_component_version=$VERSION_EXPECTED
+manifest_json_version=$VERSION_EXPECTED
+binary_path=./bin/agent/agent
+binary_sha256=$VERSION_BINARY_SHA
+version_output=$VERSION_OUTPUT
+version_output_sha256=$VERSION_OUTPUT_SHA
+version_manifest_text_path=./version-manifest.txt
+version_manifest_text_sha256=$VERSION_TEXT_SHA
+version_manifest_json_path=./version-manifest.json
+version_manifest_json_sha256=$VERSION_JSON_SHA
+EOF
+printf '%s\n' "$VERSION_EXPECTED" >"$VERSION_RUNTIME/.dbdog-release-version"
+printf '%s\n' "$VERSION_ARTIFACT_SHA" >"$VERSION_RUNTIME/.dbdog-artifact-sha256"
+
+run_version_contract() { # <validate|prepare>
+  AGENT_RUNTIME_DIR="$VERSION_RUNTIME" AGENT_RUN_DIR="$VERSION_RUNTIME/run" \
+    DBDOG_TIMEOUT_BIN="$FAKE_BIN/timeout" PATH="$VERSION_FAKE_BIN:$PATH" \
+    bash -c '
+      source "$1"
+      trap - EXIT
+      WORK_DIR="$2"
+      case "$3" in
+        validate) validate_runtime_tree "$AGENT_RUNTIME_DIR" "$4" ;;
+        prepare)
+          prepare_runtime "$2/not-used.tar.gz" "$4" "$5"
+          printf "RUNTIME_CHANGED=%s\n" "$RUNTIME_CHANGED"
+          ;;
+        *) exit 97 ;;
+      esac
+    ' bash "$INSTALL_SCRIPT" "$VERSION_WORK" "$1" "$VERSION_EXPECTED" "$VERSION_ARTIFACT_SHA"
+}
+
+expect_version_contract_failure() { # <说明> <validate|prepare>
+  local label="$1" action="$2"
+  if run_version_contract "$action" >"$VERSION_WORK/failure.out" 2>&1; then
+    fail "$label"
+  fi
+}
+
+run_version_contract validate || fail "合法 Agent runtime 版本合同被拒绝"
+SKIP_OUTPUT="$(run_version_contract prepare)" || fail "SHA 一致的合法 runtime 无法安全跳过"
+case "$SKIP_OUTPUT" in *'RUNTIME_CHANGED=0'*) ;; *) fail "合法 SHA-skip 没有保留 runtime" ;; esac
+
+write_fake_agent_version 7.79.0
+expect_version_contract_failure "staging 错误接受了 binary 7.79.0" validate
+expect_version_contract_failure "SHA-skip 错误接受了 binary 7.79.0" prepare
+write_fake_agent_version 7.81.0-dbdog.10
+expect_version_contract_failure "binary version 使用前缀伪装通过了精确 token 校验" validate
+write_fake_agent_version "$VERSION_EXPECTED"
+
+cp "$VERSION_RUNTIME/.dbdog-release-version" "$VERSION_WORK/release-version.good"
+printf '7.81.0-dbdog.2\n' >"$VERSION_RUNTIME/.dbdog-release-version"
+expect_version_contract_failure "SHA-skip 没有校验 release-version marker" prepare
+mv "$VERSION_WORK/release-version.good" "$VERSION_RUNTIME/.dbdog-release-version"
+
+cp "$VERSION_RUNTIME/provenance/build.txt" "$VERSION_WORK/build.good"
+sed "s/^compiled_agent_version=.*/compiled_agent_version=7.79.0/" \
+  "$VERSION_WORK/build.good" >"$VERSION_RUNTIME/provenance/build.txt"
+expect_version_contract_failure "错误接受了 build provenance 的 compiled_agent_version 漂移" validate
+mv "$VERSION_WORK/build.good" "$VERSION_RUNTIME/provenance/build.txt"
+
+cp "$VERSION_RUNTIME/provenance/agent-version.txt" "$VERSION_WORK/agent-version.good"
+sed "s/^compiled_version=.*/compiled_version=7.79.0/" \
+  "$VERSION_WORK/agent-version.good" >"$VERSION_RUNTIME/provenance/agent-version.txt"
+expect_version_contract_failure "错误接受了 agent-version.txt 的 compiled_version 漂移" validate
+mv "$VERSION_WORK/agent-version.good" "$VERSION_RUNTIME/provenance/agent-version.txt"
+
+cp "$VERSION_RUNTIME/version-manifest.txt" "$VERSION_WORK/version-manifest.good"
+sed "s/^agent .*/agent 7.79.0/" "$VERSION_WORK/version-manifest.good" \
+  >"$VERSION_RUNTIME/version-manifest.txt"
+expect_version_contract_failure "错误接受了 version-manifest.txt 版本漂移" validate
+mv "$VERSION_WORK/version-manifest.good" "$VERSION_RUNTIME/version-manifest.txt"
+
+cp "$VERSION_RUNTIME/version-manifest.json" "$VERSION_WORK/version-manifest-json.good"
+printf '%s\n' '{"build_version":"7.79.0"}' >"$VERSION_RUNTIME/version-manifest.json"
+expect_version_contract_failure "错误接受了 version-manifest.json build_version 漂移" validate
+mv "$VERSION_WORK/version-manifest-json.good" "$VERSION_RUNTIME/version-manifest.json"
+
+PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+[ "$(printf '%s\n' "$PREPARE_BODY" | grep -c 'validate_runtime_tree')" -eq 2 ] || \
+  fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
+pass "staging 与 SHA-skip 均精确绑定 marker、binary version 和三层 provenance/manifest"
+
+printf 'ALL PASS: 13 agent install contract groups\n'
