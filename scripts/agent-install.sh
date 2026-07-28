@@ -11,12 +11,7 @@ source "$SCRIPT_DIR/lib.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/agent-lib.sh"
 
-AGENT_UNITS=(
-  dbdog-agent-sysprobe.service
-  dbdog-agent.service
-  dbdog-agent-trace.service
-  dbdog-agent-process.service
-)
+AGENT_UNITS=("${AGENT_SYSTEMD_UNITS[@]}")
 
 WORK_DIR=""
 RUNTIME_STAGE=""
@@ -157,8 +152,8 @@ require_root_host() {
   [ "$arch" = aarch64 ] || [ "$arch" = arm64 ] || die "dbdog-agent 产物仅支持 aarch64，当前为 $arch"
   [ -d /run/systemd/system ] || die "当前主机不是运行中的 systemd 环境"
   local command
-  for command in awk bash cat chmod chown cmp cp curl env file find grep hostname install ldd \
-    mktemp mv od readlink rm runuser sed sort systemctl tar timeout tr; do
+  for command in awk bash cat chmod chown cmp cp curl env file find grep head hostname install ldd \
+    mktemp mv od readlink rm runuser sed sort stat systemctl tar timeout tr; do
     command -v "$command" >/dev/null 2>&1 || die "缺少安装依赖命令: $command"
   done
   [ -x /usr/bin/timeout ] || die "systemd 单元需要 /usr/bin/timeout"
@@ -1018,11 +1013,288 @@ wait_socket() { # <path> <seconds>
   return 1
 }
 
+capture_agent_unit_snapshot() { # <output> <require nonzero pid: 0|1>; unit<TAB>MainPID<TAB>NRestarts
+  local output="$1" require_pid="$2" unit state pid restarts
+  : >"$output"
+  chmod 0600 "$output"
+  for unit in "${AGENT_UNITS[@]}"; do
+    state="$(systemctl show "$unit" --no-pager -p MainPID -p NRestarts)" || return 1
+    pid="$(awk -F= '$1 == "MainPID" { print $2; exit }' <<<"$state")"
+    restarts="$(awk -F= '$1 == "NRestarts" { print $2; exit }' <<<"$state")"
+    case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+    if [ "$require_pid" -eq 1 ] && [ "$pid" -eq 0 ]; then return 1; fi
+    case "$restarts" in '' | *[!0-9]*) return 1 ;; esac
+    printf '%s\t%s\t%s\n' "$unit" "$pid" "$restarts" >>"$output"
+  done
+}
+
+verify_agent_stability_window() { # <pre-start snapshot> <all-active snapshot> <diagnostic output>
+  local baseline="$1" active="$2" output="$3" after unit baseline_pid baseline_restarts
+  local line active_pid active_restarts after_pid after_restarts restart_delta
+  local elapsed=0 step=5 unstable=0
+  after="$(mktemp "$WORK_DIR/agent-units-after.XXXXXX")"
+  : >"$output"
+  chmod 0600 "$output"
+  printf 'stability_window_seconds=35\n' >>"$output"
+  while [ "$elapsed" -lt 35 ]; do
+    sleep "$step"
+    elapsed=$((elapsed + step))
+    for unit in "${AGENT_UNITS[@]}"; do
+      if ! systemctl is-active --quiet "$unit"; then
+        printf 'unit became inactive at +%ss: %s\n' "$elapsed" "$unit" >>"$output"
+        systemctl show "$unit" --no-pager -p ActiveState -p SubState -p MainPID \
+          -p NRestarts -p Result -p ExecMainCode -p ExecMainStatus >>"$output" 2>&1 || true
+        return 1
+      fi
+    done
+  done
+  capture_agent_unit_snapshot "$after" 1 || {
+    printf 'cannot capture final MainPID/NRestarts snapshot\n' >>"$output"
+    return 1
+  }
+  while IFS=$'\t' read -r unit baseline_pid baseline_restarts; do
+    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$after")"
+    if [ -z "$line" ]; then
+      printf 'unit missing from final snapshot: %s\n' "$unit" >>"$output"
+      unstable=1
+      continue
+    fi
+    IFS=$'\t' read -r _ after_pid after_restarts <<<"$line"
+    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$active")"
+    if [ -z "$line" ]; then
+      printf 'unit missing from all-active snapshot: %s\n' "$unit" >>"$output"
+      unstable=1
+      continue
+    fi
+    IFS=$'\t' read -r _ active_pid active_restarts <<<"$line"
+    restart_delta=$((after_restarts - baseline_restarts))
+    printf '%s baseline_pid=%s active_pid=%s after_pid=%s baseline_restarts=%s active_restarts=%s after_restarts=%s restart_delta=%s\n' \
+      "$unit" "$baseline_pid" "$active_pid" "$after_pid" "$baseline_restarts" \
+      "$active_restarts" "$after_restarts" "$restart_delta" >>"$output"
+    if [ "$active_pid" != "$after_pid" ] || [ "$restart_delta" -ne 0 ]; then
+      unstable=1
+    fi
+  done <"$baseline"
+  [ "$unstable" -eq 0 ]
+}
+
+agent_log_file_identity() { # <regular non-symlink file>; dev<TAB>inode<TAB>size
+  local file="$1" identity dev inode size
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  if identity="$(stat -Lc '%d %i %s' -- "$file" 2>/dev/null)"; then
+    :
+  elif identity="$(stat -f '%d %i %z' "$file" 2>/dev/null)"; then
+    # BSD stat is used only by the local shell contract tests; production is Linux.
+    :
+  else
+    return 1
+  fi
+  read -r dev inode size <<<"$identity"
+  case "$dev:$inode:$size" in *[!0-9:]* | :* | *::* | *:) return 1 ;; esac
+  printf '%s\t%s\t%s\n' "$dev" "$inode" "$size"
+}
+
+agent_log_prefix_tail_signature() { # <file> <prefix size>; SHA-256 of the prefix's final <=4KiB
+  local file="$1" prefix_size="$2" sample_size=4096 sample_offset signature
+  case "$prefix_size" in '' | *[!0-9]*) return 1 ;; esac
+  if [ "$prefix_size" -eq 0 ]; then
+    printf '%s\n' empty
+    return 0
+  fi
+  if [ "$prefix_size" -lt "$sample_size" ]; then sample_size="$prefix_size"; fi
+  sample_offset=$((prefix_size - sample_size))
+  signature="$(od -An -v -j "$sample_offset" -N "$sample_size" -tx1 "$file" 2>/dev/null \
+    | tr -d '[:space:]' | agent_sha256_stdin)" || return 1
+  [ "${#signature}" -eq 64 ] || return 1
+  case "$signature" in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s\n' "$signature"
+}
+
+capture_agent_log_cursor() { # <output>; state<TAB>dev<TAB>inode<TAB>size<TAB>prefix-boundary-sha256
+  local output="$1" log_file="$AGENT_LOG_DIR/agent.log" identity dev inode size signature
+  : >"$output"
+  chmod 0600 "$output"
+  if [ ! -e "$log_file" ]; then
+    printf 'missing\n' >"$output"
+    return 0
+  fi
+  identity="$(agent_log_file_identity "$log_file")" || return 1
+  IFS=$'\t' read -r dev inode size <<<"$identity"
+  signature="$(agent_log_prefix_tail_signature "$log_file" "$size")" || return 1
+  printf 'present\t%s\t%s\t%s\t%s\n' "$dev" "$inode" "$size" "$signature" >"$output"
+}
+
+append_agent_log_copytruncate_window() { # <dev> <inode> <size> <signature> <current log> <output>
+  local old_dev="$1" old_inode="$2" old_size="$3" old_signature="$4"
+  local log_file="$5" output="$6" candidate identity dev inode size signature start_byte
+  local found_candidate=0 selected_candidate=""
+  # copytruncate keeps agent.log's inode but copies the pre-truncate contents to
+  # a different inode. Match that candidate by the cursor boundary SHA, append
+  # its post-cursor bytes, then append the current file from byte zero.
+  while IFS= read -r -d '' candidate; do
+    identity="$(agent_log_file_identity "$candidate")" || continue
+    IFS=$'\t' read -r dev inode size <<<"$identity"
+    [ "$dev:$inode" != "$old_dev:$old_inode" ] || continue
+    [ "$size" -ge "$old_size" ] || continue
+    signature="$(agent_log_prefix_tail_signature "$candidate" "$old_size")" || continue
+    [ "$signature" = "$old_signature" ] || continue
+    found_candidate=$((found_candidate + 1))
+    selected_candidate="$candidate"
+  done < <(find "$AGENT_LOG_DIR" -xdev -type f -print0 2>/dev/null)
+  if [ "$found_candidate" -ne 1 ]; then
+    {
+      printf 'agent.log cursor_continuity=false: copytruncate rotation candidate count=%s (required=1)\n' \
+        "$found_candidate"
+      # 旧代际无法唯一证明时不能把验收当作完整，但当前 inode 的内容仍是
+      # 本次启动后可见的有用证据；保留它，避免错误报告只剩一条 continuity 提示。
+      printf 'agent.log copytruncate current inode contents follow (old generation unproven)\n'
+      cat "$log_file"
+    } >>"$output"
+    return 1
+  fi
+  start_byte=$((old_size + 1))
+  {
+    printf 'agent.log copytruncate candidate=%s\n' "$selected_candidate"
+    tail -c "+$start_byte" "$selected_candidate"
+    printf 'agent.log copytruncate current inode full contents follow\n'
+    cat "$log_file"
+  } >>"$output"
+}
+
+append_agent_log_from_cursor() { # <cursor> <output>; append only bytes created in this validation window
+  local cursor="$1" output="$2" log_file="$AGENT_LOG_DIR/agent.log"
+  local state old_dev old_inode old_size old_signature identity current_dev current_inode current_size
+  local current_signature candidate candidate_identity candidate_dev candidate_inode candidate_size
+  local start_byte found_old=0
+  IFS=$'\t' read -r state old_dev old_inode old_size old_signature <"$cursor" || return 1
+  if [ "$state" = missing ]; then
+    if [ -e "$log_file" ]; then
+      agent_log_file_identity "$log_file" >/dev/null || return 1
+      printf 'agent.log cursor_mode=created_after_validation_start\n' >>"$output"
+      cat "$log_file" >>"$output"
+    else
+      printf 'agent.log does not exist\n' >>"$output"
+    fi
+    return 0
+  fi
+  [ "$state" = present ] || return 1
+  case "$old_dev:$old_inode:$old_size" in *[!0-9:]* | :* | *::* | *:) return 1 ;; esac
+  [ -n "$old_signature" ] || return 1
+
+  if [ ! -e "$log_file" ]; then
+    printf 'agent.log disappeared after validation start\n' >>"$output"
+    return 1
+  fi
+  identity="$(agent_log_file_identity "$log_file")" || return 1
+  IFS=$'\t' read -r current_dev current_inode current_size <<<"$identity"
+
+  if [ "$current_dev:$current_inode" = "$old_dev:$old_inode" ]; then
+    if [ "$current_size" -lt "$old_size" ]; then
+      printf 'agent.log cursor_mode=copytruncate current_size=%s previous_size=%s\n' \
+        "$current_size" "$old_size" >>"$output"
+      append_agent_log_copytruncate_window "$old_dev" "$old_inode" "$old_size" \
+        "$old_signature" "$log_file" "$output"
+      return
+    fi
+    current_signature="$(agent_log_prefix_tail_signature "$log_file" "$old_size")" || return 1
+    if [ "$current_signature" != "$old_signature" ]; then
+      # copytruncate can regrow past the old byte offset before validation ends.
+      printf 'agent.log cursor_mode=copytruncate_regrown current_size=%s previous_size=%s\n' \
+        "$current_size" "$old_size" >>"$output"
+      append_agent_log_copytruncate_window "$old_dev" "$old_inode" "$old_size" \
+        "$old_signature" "$log_file" "$output"
+      return
+    fi
+    printf 'agent.log cursor_mode=same_inode_append\n' >>"$output"
+    start_byte=$((old_size + 1))
+    tail -c "+$start_byte" "$log_file" >>"$output"
+    return 0
+  fi
+
+  # rename/create rotation: finish the old inode from its original byte cursor,
+  # then read the replacement agent.log from byte zero. Never apply the old
+  # offset to the replacement inode.
+  while IFS= read -r -d '' candidate; do
+    candidate_identity="$(agent_log_file_identity "$candidate")" || continue
+    IFS=$'\t' read -r candidate_dev candidate_inode candidate_size <<<"$candidate_identity"
+    [ "$candidate_dev:$candidate_inode" = "$old_dev:$old_inode" ] || continue
+    found_old=1
+    [ "$candidate_size" -ge "$old_size" ] || return 1
+    current_signature="$(agent_log_prefix_tail_signature "$candidate" "$old_size")" || return 1
+    [ "$current_signature" = "$old_signature" ] || return 1
+    printf 'agent.log cursor_mode=rename_create old_inode_path=%s\n' "$candidate" >>"$output"
+    start_byte=$((old_size + 1))
+    tail -c "+$start_byte" "$candidate" >>"$output"
+    break
+  done < <(find "$AGENT_LOG_DIR" -xdev -type f -inum "$old_inode" -print0 2>/dev/null)
+  if [ "$found_old" -ne 1 ]; then
+    printf 'agent.log old inode unavailable after rename/create rotation: dev=%s inode=%s\n' \
+      "$old_dev" "$old_inode" >>"$output"
+    return 1
+  fi
+  printf 'agent.log replacement inode full contents follow\n' >>"$output"
+  cat "$log_file" >>"$output"
+}
+
+append_agent_validation_logs() { # <start epoch> <agent.log cursor> <output>
+  local since="$1" log_cursor="$2" output="$3" unit journal_tmp journal_rc journal_bytes journal_lines
+  local -a journal_args=() pipeline_status=()
+  : >"$output"
+  chmod 0600 "$output"
+  for unit in "${AGENT_UNITS[@]}"; do journal_args+=(-u "$unit"); done
+  printf '===== systemd journal since validation start =====\n' >>"$output"
+  command -v journalctl >/dev/null 2>&1 || {
+    printf 'journal_complete=false reason=journalctl_missing\n' >>"$output"
+    return 1
+  }
+  journal_tmp="$(mktemp "$WORK_DIR/agent-validation-journal.XXXXXX")"
+  set +o pipefail
+  journalctl "${journal_args[@]}" --since "@$since" -n 1001 -o short-iso \
+    --no-pager 2>&1 | head -c 1048577 >"$journal_tmp"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -o pipefail
+  journal_rc="${pipeline_status[0]}"
+  journal_bytes="$(agent_log_file_identity "$journal_tmp" | awk -F'\t' '{ print $3 }')" || return 1
+  journal_lines="$(awk 'END { print NR + 0 }' "$journal_tmp")"
+  cat "$journal_tmp" >>"$output"
+  rm -f -- "$journal_tmp"
+  case "$journal_rc" in 0 | 141) ;; *)
+    printf 'journal_complete=false reason=journalctl_exit_%s\n' "$journal_rc" >>"$output"
+    return 1
+    ;;
+  esac
+  if [ "$journal_bytes" -gt 1048576 ] || [ "$journal_lines" -gt 1000 ]; then
+    printf 'journal_complete=false reason=bounded_output_exceeded lines=%s bytes=%s\n' \
+      "$journal_lines" "$journal_bytes" >>"$output"
+    return 1
+  fi
+  printf 'journal_complete=true lines=%s bytes=%s\n' "$journal_lines" "$journal_bytes" >>"$output"
+  printf '\n===== new agent.log bytes since validation start =====\n' >>"$output"
+  append_agent_log_from_cursor "$log_cursor" "$output"
+}
+
+agent_validation_has_known_runtime_error() { # <file>...
+  local pattern
+  pattern="$(agent_known_runtime_error_pattern)"
+  grep -Eqi "$pattern" "$@"
+}
+
 start_and_verify() {
   local unit health_out="$AGENT_LOG_DIR/install-agent-health.log"
   local config_out="$AGENT_LOG_DIR/install-configcheck.log"
   local config_attempt="$WORK_DIR/configcheck-attempt.out"
   local check_out="$AGENT_LOG_DIR/install-gaussdb-check.log"
+  local stability_out="$AGENT_LOG_DIR/install-agent-stability.log"
+  local validation_out="$AGENT_LOG_DIR/install-agent-validation.log"
+  local baseline_snapshot="$WORK_DIR/agent-units-pre-start.snapshot"
+  local active_snapshot="$WORK_DIR/agent-units-all-active.snapshot"
+  local agent_log_cursor="$WORK_DIR/agent-log.cursor"
+  local validation_start
+  validation_start="$(date +%s)"
+  capture_agent_log_cursor "$agent_log_cursor" || \
+    die "无法记录 Agent 启动前 agent.log 的 dev/inode/size 游标，本次安装会回滚"
+  capture_agent_unit_snapshot "$baseline_snapshot" 0 || \
+    die "无法记录 Agent 启动前 NRestarts 基线，本次安装会回滚"
   systemctl start dbdog-agent-sysprobe.service
   wait_active dbdog-agent-sysprobe.service 60 || die "system-probe 未能启动"
   wait_socket "$AGENT_RUN_DIR/sysprobe.sock" 90 || die "system-probe socket 未就绪"
@@ -1031,6 +1303,8 @@ start_and_verify() {
   systemctl start dbdog-agent-trace.service dbdog-agent-process.service
   wait_active dbdog-agent-trace.service 90 || die "trace-agent 未能启动"
   wait_active dbdog-agent-process.service 90 || die "process-agent 未能启动"
+  capture_agent_unit_snapshot "$active_snapshot" 1 || \
+    die "无法记录四个 Agent 单元全部 active 后的 PID/NRestarts，本次安装会回滚"
 
   local ready=0 i
   # configcheck 通过 Core command API 取配置，不是离线 YAML parser。即使 systemd
@@ -1089,6 +1363,15 @@ start_and_verify() {
   for unit in "${AGENT_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" || die "验收时服务已退出: $unit"
   done
+  if ! verify_agent_stability_window "$baseline_snapshot" "$active_snapshot" "$stability_out"; then
+    append_agent_validation_logs "$validation_start" "$agent_log_cursor" "$validation_out" || true
+    die "Agent 在本次启动/验收及随后 35 秒稳定窗（至少两个 15s 采集周期）内发生退出/重启；查看 ${stability_out} 和 ${validation_out}，并运行 sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent；本次安装会回滚"
+  fi
+  append_agent_validation_logs "$validation_start" "$agent_log_cursor" "$validation_out" || \
+    die "无法生成 Agent 验收日志差量；查看 ${validation_out}，本次安装会回滚"
+  if agent_validation_has_known_runtime_error "$check_out" "$validation_out"; then
+    die "Agent 验收发现已知 GaussDB SQL/metadata 错误或 system-probe EventMonitor panic；查看 ${check_out} 和 ${validation_out}，并运行 sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent；请修复/升级 Agent，不要手工修改生产库绕过"
+  fi
 }
 
 main() {
@@ -1142,6 +1425,7 @@ main() {
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"
   log "日常状态: systemctl status dbdog-agent dbdog-agent-process dbdog-agent-trace dbdog-agent-sysprobe"
+  log "一键诊断: sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

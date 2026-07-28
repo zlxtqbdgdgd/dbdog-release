@@ -1,14 +1,77 @@
 # dbdog-agent build controls
 
-This directory tracks the small, exact controls for the pinned Kylin V10
-AArch64 build. The active control generation is v12, the active attempt is
-`/home/dbdog/work/dbdog-agent-4c39489b-build3`, and the current release version
-authority is exactly `7.81.0-dbdog.1`.
+This directory tracks the exact Kylin V10 AArch64 controls. The active
+generation is v13/v2 and produces `7.81.0-dbdog.3` from the fresh attempt
+`/home/dbdog/work/dbdog-agent-62ad2979-build1`.
 
-Toolchains, source archives, Go modules, Ruby gems, Bazel repositories,
-Omnibus downloads, and compiled tools are not stored here. Persistent inputs
-remain below `/home/dbdog/cache/dbdog-agent` and are verified by the v7 base
-manifest, the active v12 control overlay, and the dependency seal.
+## Active v13/v2 authority
+
+- release Agent source:
+  `62ad29793b02139448b76bc85fc406491a08bf58`
+- generated system-probe output origin:
+  `4c39489b8c0b7fb7a46af88062fb9aadf2c08264`
+- immutable Omnibus integrations-core source:
+  `7a4247599b029f1aca10d2cb63491d535fbd502f`
+- post-Omnibus GaussDB source:
+  `d725d9847379ff919b60a2f35e1f41af001e6054`
+- GaussDB package: `datadog-gaussdb==1.0.1`
+- wheel SHA-256:
+  `c7ee1aa1521e1715845423b8f61268e7765c41a0ee8fd5337e638ab7816a9e1f`
+- base manifest and dependency seal: the historical
+  `4c39489b...-7a424759...-aarch64-kylin10-v7` authority, unchanged
+- active overlay:
+  `control-overlays/62ad29793b02139448b76bc85fc406491a08bf58-7a4247599b029f1aca10d2cb63491d535fbd502f-aarch64-kylin10-v7-omnibus-kylin-platform-v13`
+
+The old v7 manifest, v10 seal, v12 overlay, v1 finalizer, and v1 wrapper remain
+immutable historical controls. v13 records both
+`agent_git_sha=62ad2979...` and
+`generated_outputs_origin_agent_sha=4c39489b...`; it does not relabel the old
+seal. Exactly 69 generated eBPF/Rust/bindata handoff files are copied
+byte-for-byte from the sealed origin. The main
+`embedded/bin/system-probe` is never reused: Omnibus removes any prior copy
+and Go-builds it from the release Agent source. The v2 finalizer executes
+`system-probe version`, requires `7.81.0-dbdog.3` plus the release commit,
+records its binary/output hashes, and repeats that gate after archive
+extraction.
+
+The GaussDB wheel is built from a clean archive of the exact Core commit with
+`SOURCE_DATE_EPOCH` set to that commit time. Two independent builds must be
+byte-identical. The generated wheel is not committed to Core; provision it as
+`root:root` mode `0444` at
+`/home/dbdog/cache/dbdog-agent/sources/python/datadog_gaussdb-1.0.1-py3-none-any.whl`.
+
+Install the v13 overlay directory as `root:root` mode `0555`, its runner as
+`0555`, and its three data files as `0444`. Install
+`finalize-agent-runtime-v2.sh` and
+`run-finalize-agent-runtime-v2.sh` as `root:root` mode `0555` under
+`/home/dbdog/cache/dbdog-agent/controls/`. The new build directory is
+`dbdog:dbdog` mode `0775`; `/opt/dbdog-agent` must be an empty canonical
+`dbdog:dbdog` mode `0755` directory before the fresh runner starts. Create
+`locks/dbdog-agent-62ad2979-aarch64-kylin10.pipeline.lock` as a regular
+`root:dbdog` mode `0644` file.
+
+Before seed or Omnibus mutation, the recipe measures the successful historical
+build3 and finalized-runtime trees, calculates conservative block and inode
+requirements for the new build, staged runtime, and two-pass v2 finalization,
+then fails closed if capacity is insufficient. It reuses the immutable cache
+in place and never deletes old attempts, seals, or caches. On failure it lists
+only exact current-v13 unpublished work or stale v2 finalizer work as
+manual-review cleanup candidates.
+
+After the Omnibus handoff, finalize interactively:
+
+```bash
+sudo /home/dbdog/cache/dbdog-agent/controls/run-finalize-agent-runtime-v2.sh \
+  7.81.0-dbdog.3
+```
+
+The canonical artifact is under
+`/home/dbdog/work/dbdog-agent-62ad2979-build1/out/`.
+
+## Historical v12 record
+
+The following material is retained as the v12 build record. Any use of
+“active” or “current” below refers to that historical generation, not v13.
 
 ## Pinned identities and their roles
 
@@ -208,7 +271,20 @@ group-readable and group-writable files, and group `rwx` plus setgid
 directories. Permission normalization is limited to `bazel/disk` and must not
 mutate the immutable dependency authorities.
 
-## Current SHA-256 values
+## Active v13/v2 SHA-256 values
+
+```text
+c995773922ed242471e42e1e6e35460b48a7498bc531b7e028107d7b1321086d  omnibus-kylin-platform-v13/run-agent-omnibus.sh
+b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe  omnibus-kylin-platform-v13/agent-build-kylin-platform.patch
+a06c295420edd7232438df2700c1a890c9b0bdd37269fd4cfd38fb4e2fb4e592  omnibus-kylin-platform-v13/CONTROL-INFO
+5491492ab454603d92a6f4de31fd1c13f47e34362eedcdf2f47e3b58cbc5a4d0  omnibus-kylin-platform-v13/CONTROL.sha256
+c7ee1aa1521e1715845423b8f61268e7765c41a0ee8fd5337e638ab7816a9e1f  external sources/python/datadog_gaussdb-1.0.1-py3-none-any.whl
+5ba96a0b279e4ba4ce848fbcf5b62fa012d8ad349c91e61f9ad29201ae3d8b17  finalize-agent-runtime-v2.sh
+a0e46466bd0727390a957139e08e282aca97e31d882fea9f97c348d5ac91eeda  run-finalize-agent-runtime-v2.sh
+67aa7fae0d0df5820abbdb6eb0d1e7a08545d3c7a26144835412622d84693f93  ../recipes/dbdog-agent.sh
+```
+
+## Historical v10-v12 SHA-256 values
 
 The first four v10 entries identify the dependency seal. The v11 entries are
 retained as history; the following v12 and root-control entries identify the

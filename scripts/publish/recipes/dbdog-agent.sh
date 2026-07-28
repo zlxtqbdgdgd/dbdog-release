@@ -2,7 +2,7 @@
 # 配方：固定输入的 Kylin V10 AArch64 dbdog-agent Omnibus 运行时。
 # 输入 env（由 publish.sh 提供）：MODULE VERSION SHA CORE_SHA ARCH。
 #
-# 本配方消费已经持久化并校验过的 v7 manifest、v12 control overlay、固定
+# 本配方消费已经持久化并校验过的 v7 manifest、v13 control overlay、固定
 # patchelf 工具和 post-build dependency seal；不会重新解析版本或另建一次性
 # 依赖目录。当前 seal
 # 明确是 partial closure，不等于“任意新机器离线一键重放”。新构建机必须先迁移
@@ -43,31 +43,34 @@ for input_name in MODULE VERSION SHA CORE_SHA ARCH; do
 done
 readonly MODULE VERSION SHA CORE_SHA ARCH
 
-readonly PINNED_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
+readonly PINNED_AGENT_SHA=62ad29793b02139448b76bc85fc406491a08bf58
+readonly SEALED_ORIGIN_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
 readonly PINNED_OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
-readonly PINNED_INTEGRATION_CORE_SHA=662ad3974b950f67cf162fb273c180d08cc87a06
+readonly PINNED_INTEGRATION_CORE_SHA=d725d9847379ff919b60a2f35e1f41af001e6054
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly AGENT_REPO="$CACHE_ROOT/git/dbdog-agent.git"
 readonly CORE_REPO="$CACHE_ROOT/git/dbdog-agent-core.git"
 readonly SYSTEM_PROBE_SEED_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2
 readonly SEALED_SYSTEM_PROBE_SOURCE_PREFIX=/home/dbdog/work/dbdog-agent-4c39489b-build1/src/
-readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3
+readonly CAPACITY_REFERENCE_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3
+readonly CAPACITY_REFERENCE_RUNTIME_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2/finalized-runtime-7.81.1-dbdog.3
+readonly BUILD_DIR=/home/dbdog/work/dbdog-agent-62ad2979-build1
 readonly INSTALL_DIR=/opt/dbdog-agent
-readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build3/out
-readonly MANIFEST_REL="manifests/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7"
+readonly OUTPUT_DIR=/home/dbdog/work/dbdog-agent-62ad2979-build1/out
+readonly MANIFEST_REL="manifests/$SEALED_ORIGIN_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7"
 readonly MANIFEST_DIR="$CACHE_ROOT/$MANIFEST_REL"
 readonly INPUTS_MANIFEST_SHA256=e050cda2067907527b5ff4d3991320d75a2cc8b1f68e078531c1b5fae502ef79
 readonly RUBY_CACHE_MANIFEST_SHA256=29539b716e760e178b3a11ce07256e39438dbb5f1008898590ce355eda823c45
-readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v12"
+readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v13"
 readonly OVERLAY_DIR="$CACHE_ROOT/$OVERLAY_REL"
 readonly RUNNER="$OVERLAY_DIR/run-agent-omnibus.sh"
-readonly RUNNER_SHA256=82c0514179d586f569e7287cbad28893ac4b9009e5fc3b61300d33085d0fbcc6
+readonly RUNNER_SHA256=c995773922ed242471e42e1e6e35460b48a7498bc531b7e028107d7b1321086d
 readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly CONTROL_INFO_SHA256=3febbbe8331078aa8b9f12592ef95731b5913bc066faecc8bc8e786ba53ecc1a
-readonly CONTROL_MANIFEST_SHA256=0c01d4833beb9391fd411bcae4ca23208d6ad73e3e5935f549a9a3b5e24c2ff4
-# dependency seal 是在 v10 构建依赖闭包上生成的；v12 只校正显式版本输入，
+readonly CONTROL_INFO_SHA256=a06c295420edd7232438df2700c1a890c9b0bdd37269fd4cfd38fb4e2fb4e592
+readonly CONTROL_MANIFEST_SHA256=5491492ab454603d92a6f4de31fd1c13f47e34362eedcdf2f47e3b58cbc5a4d0
+# dependency seal 是在 v10 构建依赖闭包上生成的；v13 只校正显式版本输入，
 # 不重写也不冒充旧 seal 的控制元数据。
-readonly SEAL_OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
+readonly SEAL_OVERLAY_REL="control-overlays/$SEALED_ORIGIN_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v10"
 readonly SEAL_RUNNER_SHA256=abc76d6a8546c17dd90a24f7eacf982339104fc44e0da87bb8462fc73780a812
 readonly SEAL_CONTROL_INFO_SHA256=6f9cbfd956792d68c2b512159d6cdb19df07a5d0433e682e06e6bf7e3c95264a
 readonly SEAL_CONTROL_MANIFEST_SHA256=f1cefa64ce393e7025c1b8822899e3ea856a000bba5372ad1ffd0b910886e7ac
@@ -91,11 +94,11 @@ readonly SEALED_HANDOFF_DIR="$SEAL_DIR/handoffs"
 readonly SEALED_SYSTEM_PROBE_MARKER_SHA256=7019303658b85efde4df1c5c2a1d2ac2b5f456ad51ef261fa3b79fafd829d429
 readonly SEALED_SYSTEM_PROBE_ASSETS_SHA256=a70cdbaa3632dffaee82ed7fa66feb2df7bc7dad594ca75823302601bb1ef16d
 readonly SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073cf88b9510bde5f22bc1d84b3688f52
-readonly BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256=8b67ad9503d58431d46e058b9b15f8e5477a02a7c9c764524e77fcd0fd24437f
-readonly BUILD3_SYSTEM_PROBE_MARKER_SHA256=04e6ea2758be07035dd35cc42457941c9c861739d51ad946609e63a4db1d588e
-readonly FRESH_SEED_MARKER="$BUILD_DIR/.v12-system-probe-seed"
-readonly FRESH_SEED_PROGRESS="$BUILD_DIR/.v12-system-probe-seed.in-progress"
-readonly PIPELINE_LOCK="$CACHE_ROOT/locks/dbdog-agent-4c39489b-aarch64-kylin10.pipeline.lock"
+readonly RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=7ea1f502bfe9ed2c40089d1ecc3c554fe382e946f72029e9630b4943dceecc02
+readonly RELEASE_SYSTEM_PROBE_MARKER_SHA256=bc45c1f60977b7dff248494af7fb6607011aed837372819b5bab8f0c438e457f
+readonly FRESH_SEED_MARKER="$BUILD_DIR/.v13-system-probe-seed"
+readonly FRESH_SEED_PROGRESS="$BUILD_DIR/.v13-system-probe-seed.in-progress"
+readonly PIPELINE_LOCK="$CACHE_ROOT/locks/dbdog-agent-62ad2979-aarch64-kylin10.pipeline.lock"
 readonly PREPARED_GO_WORK_SUM_SHA256=b7b9e2672075a3563d4327751bb42ca630f824e8f50b88d625c947e5e33a61de
 readonly PREPARED_BUNDLE_CONFIG_SHA256=ef55e48e7e17fc28cca7dfe8d54ae0ba5faff4bb23e02970f97da079a3c43e7e
 readonly PREPARED_GEMFILE_LOCK_SHA256=aac25290049ce954c2296f9e1c1694205eaa886c46c27f7d9a5b085ba9582d99
@@ -108,15 +111,15 @@ readonly -a BASE_PATCH_NAMES=(
   agent-build-clang-runtime.patch
   agent-build-omnibus-repro.patch
 )
-readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v1.sh"
-readonly FINALIZER_SHA256=968bdc937041b2aacef7173afc4dbe0b68ab063a5374211b29f987c450438e82
-readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v1.sh"
-readonly FINALIZER_WRAPPER_SHA256=9d97177db1fe5ddf4ac2559eade9395c62408a169c69cd783fcd3bac6d967ac5
+readonly FINALIZER="$CACHE_ROOT/controls/finalize-agent-runtime-v2.sh"
+readonly FINALIZER_SHA256=5ba96a0b279e4ba4ce848fbcf5b62fa012d8ad349c91e61f9ad29201ae3d8b17
+readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v2.sh"
+readonly FINALIZER_WRAPPER_SHA256=a0e46466bd0727390a957139e08e282aca97e31d882fea9f97c348d5ac91eeda
 readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
-readonly GAUSSDB_INTEGRATION_VERSION=1.0.0
-readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.0-py3-none-any.whl
+readonly GAUSSDB_INTEGRATION_VERSION=1.0.1
+readonly GAUSSDB_WHEEL_REL=sources/python/datadog_gaussdb-1.0.1-py3-none-any.whl
 readonly GAUSSDB_WHEEL="$CACHE_ROOT/$GAUSSDB_WHEEL_REL"
-readonly GAUSSDB_WHEEL_SHA256=06fd5eea7acd51a0ebf519be58a2700f1ca4142a13b0668cb7f5e66ef022f7f6
+readonly GAUSSDB_WHEEL_SHA256=c7ee1aa1521e1715845423b8f61268e7765c41a0ee8fd5337e638ab7816a9e1f
 readonly BUILDER_IDENTITY=kylin-v10-tercel-native-aarch64-v7
 readonly ARCHIVE_RECIPE=gnu_tar_sorted_fixed_mtime_root_owner_gzip_n_two_pass_delete_second_before_extract
 
@@ -125,7 +128,7 @@ for frozen_sha_name in \
   TRACKED_SEAL_CONTROL_SHA256 FINALIZER_SHA256 FINALIZER_WRAPPER_SHA256; do
   frozen_sha=${!frozen_sha_name}
   [[ $frozen_sha =~ ^[0-9a-f]{64}$ && $frozen_sha != "$UNFROZEN_SHA256" ]] || \
-    die "$frozen_sha_name 尚未冻结为 v12 控制文件的真实 SHA-256"
+    die "$frozen_sha_name 尚未冻结为 v13 控制文件的真实 SHA-256"
 done
 unset frozen_sha_name frozen_sha
 
@@ -135,12 +138,12 @@ unset frozen_sha_name frozen_sha
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || die 'SHA 必须是完整的小写 40 位提交 SHA'
 [[ $CORE_SHA =~ ^[0-9a-f]{40}$ ]] || die 'CORE_SHA 必须是完整的小写 40 位提交 SHA'
 [[ $SHA == "$PINNED_AGENT_SHA" ]] || \
-  die "SHA 不属于当前 v7 seal；需为新提交生成新的 manifest/overlay/seal/配方"
+  die "SHA 必须是固定的 Agent release source $PINNED_AGENT_SHA"
 [[ $CORE_SHA == "$PINNED_INTEGRATION_CORE_SHA" ]] || \
   die "CORE_SHA 必须是固定的 GaussDB integration 源提交 $PINNED_INTEGRATION_CORE_SHA"
 [[ $ARCH == aarch64 ]] || die "ARCH 必须是 aarch64，实际为 $ARCH"
 
-for required_tool in awk bash chmod cmp cp find flock git grep id install mkdir mktemp mv python3 readlink rm rmdir sha256sum sort stat tar uname; do
+for required_tool in awk bash chmod cmp cp df du find flock git grep id install mkdir mktemp mv python3 readlink rm rmdir sha256sum sort stat tar uname wc; do
   command -v "$required_tool" >/dev/null 2>&1 || die "构建机缺少工具: $required_tool"
 done
 [[ $(id -un) == dbdog ]] || die 'Omnibus 配方必须由 dbdog 构建用户运行'
@@ -192,22 +195,117 @@ read_exact_field() {
   awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print }' "$file"
 }
 
+measure_reference_tree() {
+  local label=$1 path=$2 allocated apparent nodes payload
+
+  [[ -d $path && ! -L $path ]] || die "$label 不是实际目录: $path"
+  [[ $(readlink -e -- "$path") == "$path" ]] || die "$label 不是 canonical 路径: $path"
+  allocated=$(du -sxB1 -- "$path" |
+    awk 'NR == 1 { print $1; rows++ } END { exit(rows == 1 ? 0 : 1) }') ||
+    die "无法测量 $label 的 allocated bytes"
+  apparent=$(du --apparent-size -sxB1 -- "$path" |
+    awk 'NR == 1 { print $1; rows++ } END { exit(rows == 1 ? 0 : 1) }') ||
+    die "无法测量 $label 的 apparent bytes"
+  nodes=$(find "$path" -xdev -mindepth 1 -printf '1\n' | awk 'END { print NR + 0 }')
+  [[ $allocated =~ ^[0-9]+$ && $apparent =~ ^[0-9]+$ && $nodes =~ ^[0-9]+$ ]] ||
+    die "$label 容量样本不是纯数字"
+  ((nodes > 0)) || die "$label 是空目录，不能作为容量估算样本"
+  if ((apparent > allocated)); then
+    payload=$apparent
+  else
+    payload=$allocated
+  fi
+  printf '%s\t%s\n' "$payload" "$nodes"
+}
+
+report_reclaimable_non_authority() {
+  local candidate allocated nodes scratch_root
+
+  log '容量门禁未通过；本配方不会自动删除任何历史 attempt、seal 或 cache'
+  if [[ -d $BUILD_DIR && ! -L $BUILD_DIR ]] &&
+    [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]] &&
+    [[ -n $(find "$BUILD_DIR" -xdev -mindepth 1 -print -quit) ]]; then
+    allocated=$(du -sxB1 -- "$BUILD_DIR" | awk 'NR == 1 { print $1 }')
+    nodes=$(find "$BUILD_DIR" -xdev -mindepth 1 -printf '1\n' | awk 'END { print NR + 0 }')
+    log "仅供人工审计的非权威候选: $BUILD_DIR allocated_bytes=$allocated nodes=$nodes reason=current_unpublished_v13_attempt"
+  fi
+
+  scratch_root="/var/lib/dbdog-agent-finalize/$(basename -- "$BUILD_DIR").$PINNED_AGENT_SHA"
+  if [[ -d $scratch_root && ! -L $scratch_root ]]; then
+    while IFS= read -r candidate; do
+      allocated=$(du -sxB1 -- "$candidate" | awk 'NR == 1 { print $1 }')
+      nodes=$(find "$candidate" -xdev -mindepth 1 -printf '1\n' | awk 'END { print NR + 0 }')
+      log "仅供人工审计的非权威候选: $candidate allocated_bytes=$allocated nodes=$nodes reason=stale_v2_finalizer_work"
+    done < <(
+      find "$scratch_root" -xdev -mindepth 1 -maxdepth 1 -type d \
+        -name "work.$PINNED_AGENT_SHA.*" -print
+    )
+  fi
+}
+
+preflight_fresh_build_capacity() {
+  local reference_build reference_runtime build_payload build_nodes runtime_payload runtime_nodes
+  local build_bound archive_bound extract_bound finalizer_peak reserve required_blocks required_inodes
+  local capacity capacity_path available_blocks available_inodes available_mib required_mib
+
+  reference_build=$(measure_reference_tree 'historical successful build capacity sample' "$CAPACITY_REFERENCE_BUILD_DIR")
+  IFS=$'\t' read -r build_payload build_nodes <<<"$reference_build"
+  reference_runtime=$(measure_reference_tree 'historical finalized runtime capacity sample' "$CAPACITY_REFERENCE_RUNTIME_DIR")
+  IFS=$'\t' read -r runtime_payload runtime_nodes <<<"$reference_runtime"
+
+  for capacity_path in "$CAPACITY_REFERENCE_BUILD_DIR" "$CAPACITY_REFERENCE_RUNTIME_DIR" "$INSTALL_DIR" /var/lib; do
+    [[ $(stat -c '%d' -- "$capacity_path") == "$(stat -c '%d' -- "$BUILD_DIR")" ]] ||
+      die "容量样本、build/install/finalizer scratch 不在同一文件系统: $capacity_path"
+  done
+
+  # The immutable cache is reused in place. Budget only a new attempt-local
+  # build tree, the staged runtime, and the v2 finalizer's two-pass
+  # archive/extraction peak. A 25% build-growth margin and fixed 2 GiB reserve
+  # keep this gate fail-closed without deleting historical evidence.
+  build_bound=$((build_payload + build_payload / 4 + 512 * 1024 * 1024))
+  archive_bound=$((runtime_payload + runtime_nodes * 1024 + 64 * 1024 * 1024))
+  extract_bound=$((runtime_payload + 64 * 1024 * 1024))
+  if ((2 * archive_bound > archive_bound + extract_bound)); then
+    finalizer_peak=$((2 * archive_bound))
+  else
+    finalizer_peak=$((archive_bound + extract_bound))
+  fi
+  reserve=$((2 * 1024 * 1024 * 1024))
+  required_blocks=$((build_bound + runtime_payload + finalizer_peak + reserve))
+  required_inodes=$((build_nodes + build_nodes / 4 + 2 * runtime_nodes + 8192))
+  capacity=$(df -B1 --output=avail,iavail -- "$BUILD_DIR" |
+    awk 'NR == 2 { print $1, $2; rows++ } END { exit(rows == 1 ? 0 : 1) }') ||
+    die '无法读取 v13 build 文件系统容量'
+  read -r available_blocks available_inodes <<<"$capacity"
+  [[ $available_blocks =~ ^[0-9]+$ && $available_inodes =~ ^[0-9]+$ ]] ||
+    die "v13 build 文件系统容量不是纯数字: $capacity"
+  available_mib=$((available_blocks / 1024 / 1024))
+  required_mib=$((required_blocks / 1024 / 1024))
+  if ((available_blocks < required_blocks || available_inodes < required_inodes)); then
+    report_reclaimable_non_authority
+    die "v13 fresh build 容量不足: available=${available_blocks}B (${available_mib}MiB)/${available_inodes} inodes, conservative_required=${required_blocks}B (${required_mib}MiB)/${required_inodes} inodes, historical_build=${build_payload}B/${build_nodes}, historical_runtime=${runtime_payload}B/${runtime_nodes}, reserve=${reserve}B"
+  fi
+  log "v13 fresh build 容量门禁通过: available=${available_mib}MiB/$available_inodes inodes required=${required_mib}MiB/$required_inodes inodes"
+}
+
 write_expected_system_probe_marker() {
   local destination=$1
   printf '%s\n' \
     "manifest_rel=$MANIFEST_REL" \
     "agent_sha=$PINNED_AGENT_SHA" \
+    "generated_outputs_origin_agent_sha=$SEALED_ORIGIN_AGENT_SHA" \
     "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
     "assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
-    "outputs_manifest_sha256=$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    "outputs_manifest_sha256=$RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256" \
     >"$destination"
 }
 
 write_expected_fresh_seed_marker() {
   local destination=$1
   printf '%s\n' \
-    'format=dbdog-agent-v12-system-probe-seed-v1' \
+    'format=dbdog-agent-v13-system-probe-seed-v1' \
     "agent_sha=$PINNED_AGENT_SHA" \
+    "generated_outputs_origin_agent_sha=$SEALED_ORIGIN_AGENT_SHA" \
     "agent_repository=$AGENT_REPO" \
     "seed_build_dir=$SYSTEM_PROBE_SEED_BUILD_DIR" \
     "sealed_source_prefix=$SEALED_SYSTEM_PROBE_SOURCE_PREFIX" \
@@ -215,7 +313,7 @@ write_expected_fresh_seed_marker() {
     "sealed_marker_sha256=$SEALED_SYSTEM_PROBE_MARKER_SHA256" \
     "sealed_assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
     "sealed_outputs_manifest_sha256=$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256" \
-    "target_outputs_manifest_sha256=$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" \
+    "target_outputs_manifest_sha256=$RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256" \
     >"$destination"
 }
 
@@ -232,7 +330,7 @@ verify_fresh_seed_source_tree() (
       die "fresh seed source 错误继承构建输出: $excluded"
   done
 
-  patch_index=$(mktemp /tmp/.dbdog-agent-v12-seed-index.XXXXXX)
+  patch_index=$(mktemp /tmp/.dbdog-agent-v13-seed-index.XXXXXX)
   rm -f -- "$patch_index"
   trap 'rm -f -- "$patch_index"' EXIT
   cd "$source_dir"
@@ -252,49 +350,49 @@ verify_fresh_system_probe_seed() (
   local outputs_manifest="$assets_dir/SYSTEM-PROBE-OUTPUTS.sha256"
 
   [[ -f $FRESH_SEED_MARKER && ! -L $FRESH_SEED_MARKER ]] || \
-    die 'build3 fresh seed 缺少原子完成标记'
-  expected=$(mktemp /tmp/.dbdog-agent-v12-seed-marker-verify.XXXXXX)
+    die 'v13 release fresh seed 缺少原子完成标记'
+  expected=$(mktemp /tmp/.dbdog-agent-v13-seed-marker-verify.XXXXXX)
   trap 'rm -f -- "$expected"' EXIT
   write_expected_fresh_seed_marker "$expected"
-  cmp -s -- "$expected" "$FRESH_SEED_MARKER" || die 'build3 fresh seed 完成标记与固定输入不一致'
+  cmp -s -- "$expected" "$FRESH_SEED_MARKER" || die 'v13 release fresh seed 完成标记与固定输入不一致'
 
   [[ -d $source_dir && ! -L $source_dir && $(readlink -e -- "$source_dir") == "$source_dir" ]] || \
-    die 'build3 fresh seed source 不是 canonical 实际目录'
+    die 'v13 release fresh seed source 不是 canonical 实际目录'
   [[ -d $assets_dir && ! -L $assets_dir && $(readlink -e -- "$assets_dir") == "$assets_dir" ]] || \
-    die 'build3 fresh seed assets 不是 canonical 实际目录'
+    die 'v13 release fresh seed assets 不是 canonical 实际目录'
   for patch_name in "${BASE_PATCH_NAMES[@]}"; do
     [[ -f $BUILD_DIR/$patch_name && ! -L $BUILD_DIR/$patch_name ]] || \
-      die "build3 fresh seed 缺少 base patch: $patch_name"
+      die "v13 release fresh seed 缺少 base patch: $patch_name"
     cmp -s -- "$BUILD_DIR/$patch_name" "$MANIFEST_DIR/controls/$patch_name" || \
-      die "build3 fresh seed base patch 不属于 immutable manifest: $patch_name"
+      die "v13 release fresh seed base patch 不属于 immutable manifest: $patch_name"
   done
 
   expected_inventory=$'SHA256SUMS\nSYSTEM-PROBE-OUTPUTS.sha256\nclang-bpf\nllc-bpf\nminimized-btfs.tar.xz'
   actual_inventory=$(find "$assets_dir" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-  [[ $actual_inventory == "$expected_inventory" ]] || die 'build3 fresh seed assets 不是固定五文件集合'
+  [[ $actual_inventory == "$expected_inventory" ]] || die 'v13 release fresh seed assets 不是固定五文件集合'
   printf '%s  %s\n' "$SEALED_SYSTEM_PROBE_ASSETS_SHA256" "$assets_dir/SHA256SUMS" | \
-    sha256sum -c - >/dev/null || die 'build3 system-probe assets manifest 不匹配'
-  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" "$outputs_manifest" | \
-    sha256sum -c - >/dev/null || die 'build3 relocated system-probe outputs manifest 不匹配'
+    sha256sum -c - >/dev/null || die 'v13 release system-probe assets manifest 不匹配'
+  printf '%s  %s\n' "$RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256" "$outputs_manifest" | \
+    sha256sum -c - >/dev/null || die 'v13 release relocated system-probe outputs manifest 不匹配'
   (cd "$assets_dir" && sha256sum -c SHA256SUMS >/dev/null) || \
-    die 'build3 system-probe tool assets 校验失败'
+    die 'v13 release system-probe tool assets 校验失败'
   (cd "$source_dir" && sha256sum -c "$outputs_manifest" >/dev/null) || \
-    die 'build3 的 69 个 system-probe 输出校验失败'
+    die 'v13 release 的 69 个 system-probe 输出校验失败'
 
-  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_MARKER_SHA256" "$BUILD_DIR/system-probe.success" | \
-    sha256sum -c - >/dev/null || die 'build3 system-probe success marker SHA-256 不匹配'
+  printf '%s  %s\n' "$RELEASE_SYSTEM_PROBE_MARKER_SHA256" "$BUILD_DIR/system-probe.success" | \
+    sha256sum -c - >/dev/null || die 'v13 release system-probe success marker SHA-256 不匹配'
   write_expected_system_probe_marker "$expected"
   cmp -s -- "$expected" "$BUILD_DIR/system-probe.success" || \
-    die 'build3 system-probe success marker 内容不匹配'
+    die 'v13 release system-probe success marker 内容不匹配'
 
   printf '%s  %s\n' "$PREPARED_GO_WORK_SUM_SHA256" "$source_dir/go.work.sum" | \
-    sha256sum -c - >/dev/null || die 'build3 go.work.sum 不匹配'
+    sha256sum -c - >/dev/null || die 'v13 release go.work.sum 不匹配'
   printf '%s  %s\n' "$PREPARED_BUNDLE_CONFIG_SHA256" "$source_dir/omnibus/.bundle/config" | \
-    sha256sum -c - >/dev/null || die 'build3 Omnibus bundle config 不匹配'
+    sha256sum -c - >/dev/null || die 'v13 release Omnibus bundle config 不匹配'
   printf '%s  %s\n' "$PREPARED_GEMFILE_LOCK_SHA256" "$source_dir/omnibus/Gemfile.lock" | \
-    sha256sum -c - >/dev/null || die 'build3 Omnibus Gemfile.lock 不匹配'
+    sha256sum -c - >/dev/null || die 'v13 release Omnibus Gemfile.lock 不匹配'
   printf '%s  %s\n' "$PREPARED_USER_BAZELRC_SHA256" "$source_dir/user.bazelrc" | \
-    sha256sum -c - >/dev/null || die 'build3 user.bazelrc 不匹配'
+    sha256sum -c - >/dev/null || die 'v13 release user.bazelrc 不匹配'
   verify_fresh_seed_source_tree "$source_dir"
 )
 
@@ -308,11 +406,11 @@ verify_sealed_system_probe_authority() {
   require_root_control 'sealed system-probe outputs manifest' \
     "$SEALED_HANDOFF_DIR/system-probe-outputs.sha256" 444 "$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256"
 
-  expected=$(mktemp /tmp/.dbdog-agent-v12-sealed-marker-verify.XXXXXX)
+  expected=$(mktemp /tmp/.dbdog-agent-v13-sealed-marker-verify.XXXXXX)
   trap 'rm -f -- "$expected"' RETURN
   printf '%s\n' \
     "manifest_rel=$MANIFEST_REL" \
-    "agent_sha=$PINNED_AGENT_SHA" \
+    "agent_sha=$SEALED_ORIGIN_AGENT_SHA" \
     "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
     "assets_manifest_sha256=$SEALED_SYSTEM_PROBE_ASSETS_SHA256" \
     "outputs_manifest_sha256=$SEALED_SYSTEM_PROBE_OUTPUTS_SHA256" \
@@ -323,8 +421,8 @@ verify_sealed_system_probe_authority() {
   trap - RETURN
 
   # build2 is a byte source only while preparing the first seed. Once the
-  # atomically completed build3 seed exists, later runner/artifact reuse is
-  # verified from build3 plus the immutable seal and must not depend on keeping
+  # atomically completed v13 release seed exists, later runner/artifact reuse is
+  # verified from that release attempt plus the immutable seal and must not depend on keeping
   # an obsolete mutable build attempt forever.
   if [[ -f $FRESH_SEED_MARKER && ! -L $FRESH_SEED_MARKER ]]; then
     return
@@ -358,9 +456,9 @@ write_relocated_system_probe_outputs_manifest() {
       }
       END { if (count != 69) exit 12 }
     ' "$SEALED_HANDOFF_DIR/system-probe-outputs.sha256" >"$destination" || \
-    die '无法把 sealed system-probe outputs 严格迁移到 build3'
-  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_OUTPUTS_SHA256" "$destination" | \
-    sha256sum -c - >/dev/null || die 'relocated build3 system-probe outputs manifest 不确定'
+    die '无法把 sealed system-probe outputs 严格迁移到 v13 release attempt'
+  printf '%s  %s\n' "$RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256" "$destination" | \
+    sha256sum -c - >/dev/null || die 'relocated v13 release system-probe outputs manifest 不确定'
 }
 
 clean_incomplete_fresh_seed() {
@@ -369,7 +467,7 @@ clean_incomplete_fresh_seed() {
     name=${node##*/}
     allowed=0
     case $name in
-      .v12-system-probe-seed.in-progress | .v12-system-probe-seed.tmp.* | \
+      .v13-system-probe-seed.in-progress | .v13-system-probe-seed.tmp.* | \
       src | exact-system-probe-assets | system-probe.success)
         allowed=1
         ;;
@@ -377,7 +475,7 @@ clean_incomplete_fresh_seed() {
     for patch_name in "${BASE_PATCH_NAMES[@]}"; do
       [[ $name == "$patch_name" ]] && allowed=1
     done
-    ((allowed == 1)) || die "build3 在 seed 完成前出现非预期节点，拒绝清理: $node"
+    ((allowed == 1)) || die "v13 release attempt 在 seed 完成前出现非预期节点，拒绝清理: $node"
   done < <(find "$BUILD_DIR" -xdev -mindepth 1 -maxdepth 1 -print)
 
   rm -rf -- "$BUILD_DIR/src" "$BUILD_DIR/exact-system-probe-assets"
@@ -388,7 +486,7 @@ clean_incomplete_fresh_seed() {
   while IFS= read -r node; do
     rm -rf -- "$node"
   done < <(find "$BUILD_DIR" -xdev -mindepth 1 -maxdepth 1 \
-    -name '.v12-system-probe-seed.tmp.*' -print)
+    -name '.v13-system-probe-seed.tmp.*' -print)
 }
 
 prepare_fresh_system_probe_seed() {
@@ -397,34 +495,34 @@ prepare_fresh_system_probe_seed() {
 
   if [[ -e $FRESH_SEED_MARKER || -L $FRESH_SEED_MARKER ]]; then
     [[ ! -e $FRESH_SEED_PROGRESS && ! -L $FRESH_SEED_PROGRESS ]] || \
-      die 'build3 同时存在 seed complete 与 in-progress 标记'
+      die 'v13 release attempt 同时存在 seed complete 与 in-progress 标记'
     verify_fresh_system_probe_seed
     return
   fi
 
   if [[ -e $FRESH_SEED_PROGRESS || -L $FRESH_SEED_PROGRESS ]]; then
     [[ -f $FRESH_SEED_PROGRESS && ! -L $FRESH_SEED_PROGRESS ]] || \
-      die 'build3 seed in-progress 标记不是普通文件'
-    marker_tmp=$(mktemp /tmp/.dbdog-agent-v12-seed-marker.XXXXXX)
+      die 'v13 release seed in-progress 标记不是普通文件'
+    marker_tmp=$(mktemp /tmp/.dbdog-agent-v13-seed-marker.XXXXXX)
     write_expected_fresh_seed_marker "$marker_tmp"
     cmp -s -- "$marker_tmp" "$FRESH_SEED_PROGRESS" || \
-      die 'build3 seed in-progress 标记不属于当前固定输入'
+      die 'v13 release seed in-progress 标记不属于当前固定输入'
     rm -f -- "$marker_tmp"
-    log '发现可识别的 build3 seed 中断状态；仅清理该 seed 的固定节点后重新准备'
+    log '发现可识别的 v13 release seed 中断状态；仅清理该 seed 的固定节点后重新准备'
     clean_incomplete_fresh_seed
   else
     if find "$BUILD_DIR" -mindepth 1 -print -quit | grep -q .; then
-      die 'build3 不是空目录且没有可信 seed 状态标记，拒绝猜测或覆盖'
+      die 'v13 release attempt 不是空目录且没有可信 seed 状态标记，拒绝猜测或覆盖'
     fi
-    # The temporary marker lives beside build3, not inside it. A power loss
+    # The temporary marker lives beside the release attempt, not inside it. A power loss
     # before the rename therefore cannot turn an otherwise empty attempt into
     # an unrecognizable non-empty directory; rename remains same-filesystem.
-    marker_tmp=$(mktemp "${BUILD_DIR%/*}/.dbdog-agent-build3-seed-marker.XXXXXX")
+    marker_tmp=$(mktemp "${BUILD_DIR%/*}/.dbdog-agent-v13-seed-marker.XXXXXX")
     write_expected_fresh_seed_marker "$marker_tmp"
     mv -- "$marker_tmp" "$FRESH_SEED_PROGRESS"
   fi
 
-  seed_stage=$(mktemp -d "$BUILD_DIR/.v12-system-probe-seed.tmp.XXXXXX")
+  seed_stage=$(mktemp -d "$BUILD_DIR/.v13-system-probe-seed.tmp.XXXXXX")
   trap 'if [[ -n ${seed_stage:-} && -e $seed_stage ]]; then rm -rf -- "$seed_stage"; fi' RETURN
 
   /usr/bin/env -i HOME=/home/dbdog PATH=/usr/bin:/bin LANG=C LC_ALL=C \
@@ -490,8 +588,8 @@ prepare_fresh_system_probe_seed() {
   done <"$SEALED_HANDOFF_DIR/system-probe-outputs.sha256"
 
   write_expected_system_probe_marker "$seed_stage/system-probe.success"
-  printf '%s  %s\n' "$BUILD3_SYSTEM_PROBE_MARKER_SHA256" "$seed_stage/system-probe.success" | \
-    sha256sum -c - >/dev/null || die 'build3 system-probe marker 生成结果不确定'
+  printf '%s  %s\n' "$RELEASE_SYSTEM_PROBE_MARKER_SHA256" "$seed_stage/system-probe.success" | \
+    sha256sum -c - >/dev/null || die 'v13 release system-probe marker 生成结果不确定'
   verify_fresh_seed_source_tree "$seed_stage/src"
 
   mv -- "$seed_stage/src" "$BUILD_DIR/src"
@@ -505,7 +603,7 @@ prepare_fresh_system_probe_seed() {
   mv -- "$FRESH_SEED_PROGRESS" "$FRESH_SEED_MARKER"
   verify_fresh_system_probe_seed
   trap - RETURN
-  log 'build3 fresh seed 已由固定 Git source + sealed 69 项 system-probe handoff 自动准备并验证'
+  log 'v13 release fresh seed 已由固定 Git source + sealed 69 项 system-probe handoff 自动准备并验证'
 }
 
 verify_persistent_controls() {
@@ -521,22 +619,22 @@ verify_persistent_controls() {
   (cd "$CACHE_ROOT" && sha256sum -c "$MANIFEST_REL/RUBY-BUNDLE-CACHE.sha256" >/dev/null) || \
     die 'v7 Ruby 持久化缓存校验失败'
 
-  require_root_readonly_dir 'v12 control overlay' "$OVERLAY_DIR"
+  require_root_readonly_dir 'v13 control overlay' "$OVERLAY_DIR"
   expected_inventory=$'CONTROL-INFO\nCONTROL.sha256\nagent-build-kylin-platform.patch\nrun-agent-omnibus.sh'
   overlay_inventory=$(find "$OVERLAY_DIR" -xdev -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v12 control overlay 文件集合不匹配'
+  [[ $overlay_inventory == "$expected_inventory" ]] || die 'v13 control overlay 文件集合不匹配'
   printf '%s  %s\n' "$CONTROL_MANIFEST_SHA256" "$OVERLAY_DIR/CONTROL.sha256" | \
-    sha256sum -c - >/dev/null || die 'v12 CONTROL.sha256 自身不匹配'
+    sha256sum -c - >/dev/null || die 'v13 CONTROL.sha256 自身不匹配'
   cmp -s -- "$OVERLAY_DIR/CONTROL.sha256" <(
     printf '%s  %s\n' \
       "$RUNNER_SHA256" "$OVERLAY_REL/run-agent-omnibus.sh" \
       "$PLATFORM_PATCH_SHA256" "$OVERLAY_REL/agent-build-kylin-platform.patch" \
       "$CONTROL_INFO_SHA256" "$OVERLAY_REL/CONTROL-INFO" \
       "$PATCHELF_SHA256" "$PATCHELF_REL"
-  ) || die 'v12 CONTROL.sha256 必须精确包含固定顺序的四行清单'
+  ) || die 'v13 CONTROL.sha256 必须精确包含固定顺序的四行清单'
   (cd "$CACHE_ROOT" && sha256sum -c "$OVERLAY_REL/CONTROL.sha256" >/dev/null) || \
-    die 'v12 control overlay 或固定 patchelf 内容校验失败'
-  require_root_control 'v12 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
+    die 'v13 control overlay 或固定 patchelf 内容校验失败'
+  require_root_control 'v13 Omnibus runner' "$RUNNER" 555 "$RUNNER_SHA256"
 }
 
 verify_patchelf_tool() (
@@ -649,7 +747,7 @@ verify_dependency_seal_metadata() {
   require_exact_field "$SEAL_DIR/SEAL-INFO" platform_patch_sha256 "$PLATFORM_PATCH_SHA256"
   require_exact_field "$SEAL_DIR/SEAL-INFO" control_info_sha256 "$SEAL_CONTROL_INFO_SHA256"
   require_exact_field "$SEAL_DIR/SEAL-INFO" control_manifest_sha256 "$SEAL_CONTROL_MANIFEST_SHA256"
-  require_exact_field "$SEAL_DIR/SEAL-INFO" dbdog_agent_commit "$PINNED_AGENT_SHA"
+  require_exact_field "$SEAL_DIR/SEAL-INFO" dbdog_agent_commit "$SEALED_ORIGIN_AGENT_SHA"
   require_exact_field "$SEAL_DIR/SEAL-INFO" integrations_core_commit "$PINNED_OMNIBUS_CORE_SHA"
   require_exact_field "$SEAL_DIR/SEAL-INFO" patchelf_version "$PATCHELF_VERSION"
   require_exact_field "$SEAL_DIR/SEAL-INFO" patchelf_rel "$PATCHELF_REL"
@@ -677,6 +775,7 @@ write_expected_omnibus_marker() {
   printf '%s\n' \
     "manifest_rel=$MANIFEST_REL" \
     "agent_sha=$PINNED_AGENT_SHA" \
+    "generated_outputs_origin_agent_sha=$SEALED_ORIGIN_AGENT_SHA" \
     "core_sha=$PINNED_OMNIBUS_CORE_SHA" \
     'omnibus_ruby_sha=5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749' \
     "control_overlay_rel=$OVERLAY_REL" \
@@ -696,7 +795,7 @@ verify_live_omnibus_handoff() {
   write_expected_omnibus_marker "$expected"
   if ! cmp -s -- "$expected" "$BUILD_DIR/omnibus.success"; then
     rm -f -- "$expected"
-    die 'omnibus.success 与固定 v7/v12 handoff 不匹配'
+    die 'omnibus.success 与固定 v7/v13 handoff 不匹配'
   fi
   rm -f -- "$expected"
 }
@@ -709,10 +808,14 @@ require_archive_member() {
 
 verify_canonical_artifact() (
   local artifact=$1 sidecar=$2 artifact_name member duplicate actual_sha work list
-  local build_info marker expected_marker gaussdb_info agent_version_info manifest_text manifest_json
+  local build_info marker expected_marker gaussdb_info agent_version_info system_probe_version_info
+  local manifest_text manifest_json
   local agent_version_output expected_agent_version_prefix
   local agent_binary_sha version_output_sha manifest_text_sha manifest_json_sha
   local actual_agent_binary_sha actual_version_output_sha actual_manifest_text_sha actual_manifest_json_sha
+  local system_probe_version_output expected_system_probe_version_prefix
+  local system_probe_binary_sha system_probe_version_output_sha
+  local actual_system_probe_binary_sha actual_system_probe_version_output_sha
   local manifest_header_version manifest_component_version manifest_json_version
   artifact_name=${artifact##*/}
   [[ -f $artifact && ! -L $artifact ]] || die "canonical 产物不是实际文件: $artifact"
@@ -755,8 +858,10 @@ verify_canonical_artifact() (
   require_archive_member "$list" './provenance/glibc-requirements.tsv'
   require_archive_member "$list" './provenance/agent-data-plane.txt'
   require_archive_member "$list" './provenance/agent-version.txt'
+  require_archive_member "$list" './provenance/system-probe-version.txt'
   require_archive_member "$list" './provenance/gaussdb.txt'
   require_archive_member "$list" './bin/agent/agent'
+  require_archive_member "$list" './embedded/bin/system-probe'
   require_archive_member "$list" './version-manifest.txt'
   require_archive_member "$list" './version-manifest.json'
 
@@ -764,21 +869,25 @@ verify_canonical_artifact() (
   marker=$work/omnibus.success
   gaussdb_info=$work/gaussdb.txt
   agent_version_info=$work/agent-version.txt
+  system_probe_version_info=$work/system-probe-version.txt
   manifest_text=$work/version-manifest.txt
   manifest_json=$work/version-manifest.json
   tar -xOzf "$artifact" ./provenance/build.txt >"$build_info" || die '无法读取产物 build provenance'
   tar -xOzf "$artifact" ./provenance/omnibus.success >"$marker" || die '无法读取产物 Omnibus provenance'
   tar -xOzf "$artifact" ./provenance/gaussdb.txt >"$gaussdb_info" || die '无法读取 GaussDB integration provenance'
   tar -xOzf "$artifact" ./provenance/agent-version.txt >"$agent_version_info" || die '无法读取 Agent version provenance'
+  tar -xOzf "$artifact" ./provenance/system-probe-version.txt >"$system_probe_version_info" ||
+    die '无法读取 system-probe version provenance'
   tar -xOzf "$artifact" ./version-manifest.txt >"$manifest_text" || die '无法读取 Omnibus version-manifest.txt'
   tar -xOzf "$artifact" ./version-manifest.json >"$manifest_json" || die '无法读取 Omnibus version-manifest.json'
-  require_exact_field "$build_info" format_version 1
+  require_exact_field "$build_info" format_version 2
   require_exact_field "$build_info" product dbdog-agent
   require_exact_field "$build_info" version "$VERSION"
   require_exact_field "$build_info" compiled_agent_version "$VERSION"
   require_exact_field "$build_info" architecture aarch64
   require_exact_field "$build_info" install_prefix "$INSTALL_DIR"
   require_exact_field "$build_info" agent_git_sha "$PINNED_AGENT_SHA"
+  require_exact_field "$build_info" generated_outputs_origin_agent_sha "$SEALED_ORIGIN_AGENT_SHA"
   require_exact_field "$build_info" omnibus_integrations_core_git_sha "$PINNED_OMNIBUS_CORE_SHA"
   require_exact_field "$build_info" integrations_core_git_sha "$PINNED_INTEGRATION_CORE_SHA"
   require_exact_field "$build_info" manifest_rel "$MANIFEST_REL"
@@ -811,7 +920,7 @@ verify_canonical_artifact() (
   require_exact_field "$gaussdb_info" module_path \
     ./embedded/lib/python3.13/site-packages/datadog_checks/gaussdb/__init__.py
   require_exact_field "$gaussdb_info" distribution_path \
-    ./embedded/lib/python3.13/site-packages/datadog_gaussdb-1.0.0.dist-info
+    ./embedded/lib/python3.13/site-packages/datadog_gaussdb-1.0.1.dist-info
   require_exact_field "$gaussdb_info" import_version "$GAUSSDB_INTEGRATION_VERSION"
   require_exact_field "$gaussdb_info" distribution_version "$GAUSSDB_INTEGRATION_VERSION"
 
@@ -847,6 +956,34 @@ verify_canonical_artifact() (
   require_exact_field "$build_info" agent_version_output_sha256 "$version_output_sha"
   require_exact_field "$build_info" agent_version_manifest_text_sha256 "$manifest_text_sha"
   require_exact_field "$build_info" agent_version_manifest_json_sha256 "$manifest_json_sha"
+  require_exact_field "$system_probe_version_info" compiled_version "$VERSION"
+  require_exact_field "$system_probe_version_info" compiled_commit "${PINNED_AGENT_SHA:0:10}"
+  require_exact_field "$system_probe_version_info" agent_git_sha "$PINNED_AGENT_SHA"
+  require_exact_field "$system_probe_version_info" binary_path ./embedded/bin/system-probe
+  system_probe_version_output=$(read_exact_field "$system_probe_version_info" version_output)
+  expected_system_probe_version_prefix="System Probe $VERSION - Commit: ${PINNED_AGENT_SHA:0:10} - Serialization version: "
+  case "$system_probe_version_output" in
+    "$expected_system_probe_version_prefix"*' - Go version: go'*) ;;
+    *) die "产物 system-probe version 输出没有绑定 VERSION/Agent SHA: $system_probe_version_output" ;;
+  esac
+  system_probe_binary_sha=$(read_exact_field "$system_probe_version_info" binary_sha256)
+  system_probe_version_output_sha=$(read_exact_field "$system_probe_version_info" version_output_sha256)
+  for actual_sha in "$system_probe_binary_sha" "$system_probe_version_output_sha"; do
+    [[ $actual_sha =~ ^[0-9a-f]{64}$ ]] ||
+      die "system-probe version provenance 含无效 SHA-256: $actual_sha"
+  done
+  actual_system_probe_binary_sha=$(
+    tar -xOzf "$artifact" ./embedded/bin/system-probe | sha256sum | awk '{ print $1 }'
+  )
+  actual_system_probe_version_output_sha=$(
+    printf '%s\n' "$system_probe_version_output" | sha256sum | awk '{ print $1 }'
+  )
+  [[ $actual_system_probe_binary_sha == "$system_probe_binary_sha" ]] ||
+    die 'system-probe binary SHA-256 与 version provenance 不一致'
+  [[ $actual_system_probe_version_output_sha == "$system_probe_version_output_sha" ]] ||
+    die 'system-probe version 输出 SHA-256 与 provenance 不一致'
+  require_exact_field "$build_info" system_probe_binary_sha256 "$system_probe_binary_sha"
+  require_exact_field "$build_info" system_probe_version_output_sha256 "$system_probe_version_output_sha"
   manifest_header_version=$(
     awk 'NR == 1 && NF == 2 && $1 == "agent" { print $2; found++ }
       END { exit(found == 1 ? 0 : 1) }' "$manifest_text"
@@ -930,24 +1067,27 @@ fi
 
 runner_executed=0
 if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; then
-  # resume/adopt 仅属于历史 build1 的一次性恢复合同。build3 若根据共享的
+  # resume/adopt 仅属于历史 build1 的一次性恢复合同。v13 release attempt 若根据共享的
   # /opt/dbdog-agent 状态猜测续跑模式，会被 runner 拒绝，也可能把旧 attempt 当成
-  # 当前输入。v12 因此只允许显式 fresh；管理员需先把上一轮 runtime 移到其历史
+  # 当前输入。v13 因此只允许显式 fresh；管理员需先把上一轮 runtime 移到其历史
   # build 目录并准备一个 canonical、dbdog-owned 的空 install root。
   [[ -d $INSTALL_DIR && ! -L $INSTALL_DIR ]] || \
-    die "v12 fresh install root 不是实际目录: $INSTALL_DIR"
+    die "v13 fresh install root 不是实际目录: $INSTALL_DIR"
   [[ $(readlink -e -- "$INSTALL_DIR") == "$INSTALL_DIR" ]] || \
-    die 'v12 fresh install root 路径发生解析'
+    die 'v13 fresh install root 路径发生解析'
   [[ $(stat -c '%u:%g:%a' -- "$INSTALL_DIR") == 1001:1001:755 ]] || \
-    die 'v12 fresh install root 必须是 dbdog:dbdog mode 0755'
+    die 'v13 fresh install root 必须是 dbdog:dbdog mode 0755'
   if find "$INSTALL_DIR" -mindepth 1 -print -quit | grep -q .; then
-    die 'v12/build3 只接受空的 /opt/dbdog-agent；请先把旧 runtime 完整移入其历史 build 目录，禁止删除依赖 cache'
+    die 'v13 release attempt 只接受空的 /opt/dbdog-agent；请先把旧 runtime 完整移入其历史 build 目录，禁止删除依赖 cache'
   fi
-  log '未发现成功 handoff；在同一 pipeline lock 内自动准备 build3 seed 并调用固定 v12 fresh runner'
+  log '未发现成功 handoff；在同一 pipeline lock 内先做容量门禁，再准备 seed 并调用固定 v13 fresh runner'
   (
     [[ -f $PIPELINE_LOCK && ! -L $PIPELINE_LOCK ]] || die '固定 pipeline lock 不是普通文件'
+    [[ $(stat -c '%U:%G:%a' -- "$PIPELINE_LOCK") == root:dbdog:644 ]] ||
+      die '固定 pipeline lock 必须是 root:dbdog mode 0644'
     exec {pipeline_lock_fd}<"$PIPELINE_LOCK"
     /usr/bin/flock -n "$pipeline_lock_fd" || die '另一个 Agent 构建/seed 正持有固定 pipeline lock'
+    preflight_fresh_build_capacity
     prepare_fresh_system_probe_seed
     /usr/bin/env -i \
       HOME=/home/dbdog \
@@ -959,7 +1099,7 @@ if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; the
       LC_ALL=C.UTF-8 \
       DBDOG_PACKAGE_VERSION="$VERSION" \
       "$RUNNER" --dbdog-agent-pipeline-lock-held "$BUILD_DIR" >&2
-  ) || die '固定 v12 Omnibus fresh seed/runner 失败'
+  ) || die '固定 v13 Omnibus fresh seed/runner 失败'
   runner_executed=1
 fi
 verify_live_omnibus_handoff

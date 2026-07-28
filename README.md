@@ -168,6 +168,14 @@ Web/MCP 升级还会自动补齐缺失或空的本机 OAuth/public URL，迁移�
 服务管理：`./scripts/dbdogctl start|stop|restart|status [服务|all]`。机器重启后当前仍需
 手动执行 `./scripts/dbdogctl start all`。
 
+需要让内网大模型做一次全机巡检或故障取证时，手工执行
+`./scripts/collect-diagnostics.sh`（Agent 主机用 `sudo`）。它自动识别全家桶/Agent 角色，
+生成 mode `0600` 的内网脱敏报告和无原始日志的 issue-card；同目录游标记录最后成功时间及普通日志
+inode/offset，下一次手工运行从该水位增量扫描。大 journal 会按安全时间子窗口逐次排空，轮转/截断
+可识别，采集失败不推进游标。本功能不会创建定时任务。
+完整的内网模型提示词、覆盖模块、结果语义和外传边界见
+[内网大模型诊断采集指引](docs/internal-ai-diagnostics.md)。
+
 ## GaussDB 主机 agent
 
 前提：麒麟 V10 / aarch64、GaussDB 正在运行、dbdog-server 已可从该主机直连，并已从
@@ -208,6 +216,8 @@ GaussDB。可在创建前判定的 mode、字面 HBA 和已有账号认证问题
 已有用户在安装变更前、
 新用户在创建后，安装器都会读取服务端当前生效的协议认证请求，必须得到 MD5 challenge；因此磁盘
 文件已改但尚未 reload、规则顺序被其他认证方式遮蔽等情况也不会误报成功。
+安装失败会恢复 Agent runtime、配置和 systemd 单元；已幂等创建或升级的 `dbdog` 监控用户、
+权限与兼容对象按数据库迁移的只前进语义保留，重跑正常升级会复用，不做破坏性数据库回滚。
 
 如果旧环境中的 `dbdog` 用户是在 `password_encryption_type=2/3` 下创建的，仅把参数改为 `1` 不会
 补出 MD5 凭证。安装器不会擅自替已有数据库账号改密：应由 DBA 在 mode `1` 已生效后按安全流程为
@@ -241,7 +251,8 @@ GaussDB。可在创建前判定的 mode、字面 HBA 和已有账号认证问题
   validate、Remote Config trust root、四服务 active、forwarder health 和真实
   `agent check gaussdb` 全部通过才返回成功，否则恢复上一套 runtime/config/unit。
 
-Agent 包里的 `1.0.0` 是 **GaussDB integration 自身的首版版本**，不是被监控 GaussDB 的服务端版本，
+Agent 包里的 `datadog-gaussdb` 版本（以 `manifest.tsv` 对应 Agent 产物为准）是
+**GaussDB integration 自身的版本**，不是被监控 GaussDB 的服务端版本，
 两者没有版本绑定关系。
 日常采集由该 integration 通过 psycopg `ConnectionPool` 和包内 libpq 完成，服务端版本则在
 运行期执行 `SHOW SERVER_VERSION` / `SELECT version()` 识别。安装器不会因为目标 GaussDB
@@ -262,6 +273,12 @@ git pull --ff-only
 sudo ./scripts/upgrade.sh dbdog-agent
 ```
 
+升级或排障后统一运行 `sudo ./scripts/dbdogctl diagnose dbdog-agent`；它汇总宿主内核/页大小、
+安全范围内的采集周期、四服务当前状态与重启增量、近期日志及 Agent status/check。结论中的
+`healthy` 表示当前检查，`diagnostic_complete` 表示证据是否采全，
+`historical_or_recent_evidence_findings` 只表示发现历史或近期线索；历史 `NRestarts` 非零不能
+单独证明当前仍在 crash，必须结合本次诊断的 `restart_delta`、PID 和当前错误判断。
+
 新版 `check-upgrade.sh --pull` 除了比较 Agent 二进制版本和产物 SHA，还比较 Agent 专属安装器合约
 指纹；因此只更新安装、认证前置校验或配置逻辑而无需重编二进制时，也会明确提示执行上面同一条正常升级
 命令，不会因为 manifest 版本未变化而误报“已是最新”。但从不具备该机制的旧 release 首次过渡到
@@ -278,11 +295,13 @@ fail closed。对应 manifest 文件名的 Agent tarball 可预置到目标机�
 显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`（仅安装期 gsql 管理 socket）、
 `DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、
 `DBDOG_GAUSSDB_DEPLOYMENT`、`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的
-特殊部署。正常集中式安装不需要这些覆盖。上一套 root/config 会保留在安装输出给出的
+特殊部署。正常集中式安装不需要这些覆盖。上一套 runtime/config 会保留在安装输出给出的
 `.dbdog-agent-before-*` 目录。安装验收诊断均为 root `0600` 文件：配置检查在
 `/var/log/dbdog-agent/install-configcheck.log`，forwarder health 在
 `/var/log/dbdog-agent/install-agent-health.log`，数据库 check 在
-`/var/log/dbdog-agent/install-gaussdb-check.log`。
+`/var/log/dbdog-agent/install-gaussdb-check.log`，跨两个采集周期的 PID/NRestarts 证据在
+`/var/log/dbdog-agent/install-agent-stability.log`，本次启动后的有界日志差量在
+`/var/log/dbdog-agent/install-agent-validation.log`。
 
 ## 公网：发布（维护者）
 

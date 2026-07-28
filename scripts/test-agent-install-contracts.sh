@@ -332,6 +332,45 @@ for expected in \
 done
 grep -Fq 'network_config:' "$CONF/system-probe.yaml" || fail "NPM 未启用"
 grep -Fq 'service_monitoring_config:' "$CONF/system-probe.yaml" || fail "USM 未启用"
+if grep -Eq '^[[:space:]]+enable_event_stream:[[:space:]]*false([[:space:]]|$)' \
+  "$CONF/system-probe.yaml"; then
+  fail "修复后的 Agent 仍被全局关闭 USM process event stream"
+fi
+if grep -Eq '^[[:space:]]+network_process:[[:space:]]*$' "$CONF/system-probe.yaml"; then
+  fail "修复后的 Agent 仍被全局关闭 NPM process cache/container DNS"
+fi
+grep -Fq 'runtime_security_config:' "$CONF/system-probe.yaml" || \
+  fail "没有显式关闭当前产品未启用的 CWS/FIM"
+[ "$(grep -c 'enabled: true' "$CONF/system-probe.yaml")" -ge 3 ] || \
+  fail "误关了 NPM/USM"
+
+LEGACY_SYSTEM_PROBE="$TEST_ROOT/legacy-system-probe.yaml"
+cat >"$LEGACY_SYSTEM_PROBE" <<'EOF'
+service_monitoring_config:
+  enable_event_stream: false
+event_monitoring_config:
+  network_process:
+    enabled: false
+EOF
+agent_render_system_probe_yaml "$LEGACY_SYSTEM_PROBE"
+if grep -Eq 'enable_event_stream:[[:space:]]*false|network_process:' \
+  "$LEGACY_SYSTEM_PROBE"; then
+  fail "配置刷新错误保留了旧版 EventMonitor 全局降级项"
+fi
+RENDER_STATE_BODY="$(awk '/^render_install_state\(\)/ { scan=1 } /^cutover\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+CUTOVER_CONFIG_BODY="$(awk '/^cutover\(\)/ { scan=1 } /^wait_active\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+ROLLBACK_CONFIG_BODY="$(awk '/^rollback_install\(\)/ { scan=1 } /^on_exit\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'agent_render_system_probe_yaml "$CONFIG_STAGE/system-probe.yaml"' \
+  <<<"$RENDER_STATE_BODY" || fail "升级没有重新生成完整 system-probe 配置"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'mv -- "$CONFIG_STAGE" "$AGENT_CONFIG_DIR"' <<<"$CUTOVER_CONFIG_BODY" || \
+  fail "成功升级没有用新生成的配置目录整体替换旧配置"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'mv -- "$OLD_CONFIG" "$AGENT_CONFIG_DIR"' <<<"$ROLLBACK_CONFIG_BODY" || \
+  fail "失败回滚没有恢复与旧 runtime 配套的旧配置"
+pass "成功升级会清除旧版 EventMonitor false；失败升级仍事务性恢复原配置"
+
 grep -Fq 'dbm: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "GaussDB DBM 未启用"
 grep -Fq 'collect_activity_metrics: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "activity 未启用"
 grep -Fq "password: 'pa''ss: #1'" "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "密码 YAML 转义错误"
@@ -349,7 +388,14 @@ pass "外网已验证功能集默认开启，机器事实与秘密在安装时�
 
 for check in cpu disk file_handle io load memory network process system_core uptime gaussdb; do
   [ -f "$CONF/conf.d/$check.d/conf.yaml" ] || fail "缺少默认 check: $check"
+  grep -Fq 'min_collection_interval: 15' "$CONF/conf.d/$check.d/conf.yaml" || \
+    fail "默认 check 没有显式声明 15s Agent 采集 cadence: $check"
 done
+grep -Fq 'max_relations: 300' "$CONF/conf.d/gaussdb.d/conf.yaml" || \
+  fail "GaussDB 没有显式声明 schema 已支持的默认 relation 上限"
+if grep -R -Fq 'collect_core_metrics: false' "$CONF/conf.d"; then
+  fail "没有运行时证据却擅自关闭了逐核 CPU 指标"
+fi
 [ "$(find "$UNITS" -type f -name 'dbdog-agent*.service' | wc -l | tr -d ' ')" = 4 ] || \
   fail "没有生成四个 Agent systemd 单元"
 grep -Fq "$AGENT_RUNTIME_DIR/embedded/bin/process-agent" "$UNITS/dbdog-agent-process.service" || \
@@ -426,6 +472,170 @@ SUCCESS_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'INSTALL_SUCCEEDED=1' | hea
   fail "安装器 marker 没有在完整验收后、成功提交前统一写入"
 [ "$(printf '%s\n' "$MAIN_BODY" | grep -c 'write_installer_contract_marker')" -eq 1 ] || \
   fail "main 没有让新旧 runtime 共用唯一的验收后 marker 写入路径"
+VERIFY_BODY="$(awk '/^start_and_verify\(\)/ { scan=1 } /^main\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+STABILITY_BODY="$(awk '/^verify_agent_stability_window\(\)/ { scan=1 } /^append_agent_validation_logs\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+SNAPSHOT_BODY="$(awk '/^capture_agent_unit_snapshot\(\)/ { scan=1 } /^verify_agent_stability_window\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+VALIDATION_LOG_BODY="$(awk '/^append_agent_validation_logs\(\)/ { scan=1 } /^agent_validation_has_known_runtime_error\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+LOG_CURSOR_BODY="$(awk '/^agent_log_file_identity\(\)/ { scan=1 } /^append_agent_validation_logs\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'verify_agent_stability_window "$baseline_snapshot" "$active_snapshot" "$stability_out"' <<<"$VERIFY_BODY" || \
+  fail "升级验收没有进入跨采集周期稳定窗口"
+grep -Fq 'elapsed" -lt 35' <<<"$STABILITY_BODY" || \
+  fail "稳定窗口没有覆盖至少两个完整 15s 采集周期并保留余量"
+for field in MainPID NRestarts require_pid; do
+  grep -Fq "$field" <<<"$SNAPSHOT_BODY" || fail "unit snapshot 缺少字段: $field"
+done
+for field in baseline_pid active_pid after_pid baseline_restarts active_restarts \
+  after_restarts restart_delta; do
+  grep -Fq "$field" <<<"$STABILITY_BODY" || fail "稳定窗口缺少全程进程/重启证据字段: $field"
+done
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq '"$restart_delta" -ne 0' <<<"$STABILITY_BODY" || \
+  fail "稳定窗口没有按启动前基线比较 NRestarts 增量"
+BASELINE_LINE="$(grep -n -m1 'capture_agent_unit_snapshot.*baseline_snapshot.* 0' <<<"$VERIFY_BODY" | cut -d: -f1)"
+LOG_CURSOR_LINE="$(grep -n -m1 'capture_agent_log_cursor.*agent_log_cursor' <<<"$VERIFY_BODY" | cut -d: -f1)"
+FIRST_START_LINE="$(grep -n -m1 'systemctl start dbdog-agent-sysprobe' <<<"$VERIFY_BODY" | cut -d: -f1)"
+ACTIVE_LINE="$(grep -n -m1 'capture_agent_unit_snapshot.*active_snapshot.* 1' <<<"$VERIFY_BODY" | cut -d: -f1)"
+CONFIGCHECK_LINE="$(grep -n -m1 'bin/agent/agent.*configcheck' <<<"$VERIFY_BODY" | cut -d: -f1)"
+[ -n "$BASELINE_LINE" ] && [ "$BASELINE_LINE" -lt "$FIRST_START_LINE" ] || \
+  fail "NRestarts baseline 没有在任一 Agent unit 启动前记录"
+[ -n "$LOG_CURSOR_LINE" ] && [ "$LOG_CURSOR_LINE" -lt "$FIRST_START_LINE" ] || \
+  fail "agent.log dev/inode/size 游标没有在任一 Agent unit 启动前记录"
+[ -n "$ACTIVE_LINE" ] && [ "$ACTIVE_LINE" -lt "$CONFIGCHECK_LINE" ] || \
+  fail "四 unit active 后 PID snapshot 没有覆盖后续全部验收"
+# baseline_restarts 可以是 109 等任意历史值；只有 final-baseline 的 delta 非零才失败。
+if grep -Eq 'baseline_restarts.*(==|!=|-eq|-ne)[[:space:]]*0' <<<"$STABILITY_BODY"; then
+  fail "稳定窗口错误地把升级前已有的历史 NRestarts 当成当前失败"
+fi
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq -- '--since "@$since"' <<<"$VALIDATION_LOG_BODY" || \
+  fail "升级验收 journal 没有从本次启动时刻开始截取"
+for field in old_dev old_inode old_size current_dev current_inode current_size; do
+  grep -Fq "$field" <<<"$LOG_CURSOR_BODY" || fail "agent.log cursor 缺少身份字段: $field"
+done
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'tail -c "+$start_byte"' <<<"$LOG_CURSOR_BODY" || \
+  fail "升级验收 agent.log 没有按同一 inode 的启动前字节 offset 截取新增内容"
+grep -Fq 'cursor_mode=rename_create' <<<"$LOG_CURSOR_BODY" || \
+  fail "升级验收没有区分 rename/create 日志轮转"
+grep -Fq 'cursor_mode=copytruncate' <<<"$LOG_CURSOR_BODY" || \
+  fail "升级验收没有区分 copytruncate 日志轮转"
+grep -Fq 'prefix_tail_signature' <<<"$LOG_CURSOR_BODY" || \
+  fail "升级验收无法识别同 inode 截断后快速重长超过旧 offset"
+
+LOG_CURSOR_ROOT="$TEST_ROOT/log-cursor"
+mkdir -p "$LOG_CURSOR_ROOT/log"
+# shellcheck disable=SC2016 # 子 shell 脚本中的变量由被测运行环境展开。
+if ! env AGENT_LOG_DIR="$LOG_CURSOR_ROOT/log" bash -c '
+  set -euo pipefail
+  source "$1"
+  trap - EXIT INT TERM HUP
+  root="$2"
+  log="$AGENT_LOG_DIR/agent.log"
+  cursor="$root/cursor"
+
+  printf "historic-normal\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  printf "normal-new\n" >>"$log"
+  append_agent_log_from_cursor "$cursor" "$root/normal.out"
+  grep -Fq "cursor_mode=same_inode_append" "$root/normal.out"
+  grep -Fq "normal-new" "$root/normal.out"
+  ! grep -Fq "historic-normal" "$root/normal.out"
+
+  printf "historic-rotate\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  printf "old-inode-new\n" >>"$log"
+  mv "$log" "$AGENT_LOG_DIR/agent.log.1"
+  printf "replacement-new\n" >"$log"
+  append_agent_log_from_cursor "$cursor" "$root/rename.out"
+  grep -Fq "cursor_mode=rename_create" "$root/rename.out"
+  grep -Fq "old-inode-new" "$root/rename.out"
+  grep -Fq "replacement-new" "$root/rename.out"
+  ! grep -Fq "historic-rotate" "$root/rename.out"
+
+  printf "historic-copytruncate-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  printf "copytruncate-before-rotate\n" >>"$log"
+  cp "$log" "$AGENT_LOG_DIR/agent.log.2"
+  : >"$log"
+  printf "copytruncate-after-rotate\n" >"$log"
+  append_agent_log_from_cursor "$cursor" "$root/copytruncate.out"
+  grep -Fq "cursor_mode=copytruncate" "$root/copytruncate.out"
+  grep -Fq "copytruncate-before-rotate" "$root/copytruncate.out"
+  grep -Fq "copytruncate-after-rotate" "$root/copytruncate.out"
+  ! grep -Fq "historic-copytruncate" "$root/copytruncate.out"
+
+  printf "historic-regrow\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  printf "regrown-before-rotate\n" >>"$log"
+  cp "$log" "$AGENT_LOG_DIR/agent.log.3"
+  : >"$log"
+  printf "copytruncate-regrown-new-content-longer-than-before\n" >"$log"
+  append_agent_log_from_cursor "$cursor" "$root/regrown.out"
+  grep -Fq "cursor_mode=copytruncate_regrown" "$root/regrown.out"
+  grep -Fq "regrown-before-rotate" "$root/regrown.out"
+  grep -Fq "copytruncate-regrown-new-content" "$root/regrown.out"
+  ! grep -Fq "historic-regrow" "$root/regrown.out"
+
+  printf "historic-unprovable\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  : >"$log"
+  printf "unprovable-current-new\n" >"$log"
+  if append_agent_log_from_cursor "$cursor" "$root/unprovable.out"; then
+    exit 91
+  fi
+  grep -Fq "unprovable-current-new" "$root/unprovable.out"
+  grep -Fq "cursor_continuity=false" "$root/unprovable.out"
+
+  printf "historic-ambiguous-copytruncate-xxxxxxxxxxxxxxxx\n" >"$log"
+  capture_agent_log_cursor "$cursor"
+  printf "ambiguous-before-rotate\n" >>"$log"
+  cp "$log" "$AGENT_LOG_DIR/agent.log.ambiguous.1"
+  cp "$log" "$AGENT_LOG_DIR/agent.log.ambiguous.2"
+  : >"$log"
+  printf "ambiguous-current\n" >"$log"
+  if append_agent_log_from_cursor "$cursor" "$root/ambiguous.out"; then
+    exit 92
+  fi
+  grep -Fq "copytruncate rotation candidate count=" "$root/ambiguous.out"
+  grep -Fq "(required=1)" "$root/ambiguous.out"
+' bash "$INSTALL_SCRIPT" "$LOG_CURSOR_ROOT"; then
+  fail "agent.log dev/inode/size cursor 的追加/轮转合同失败"
+fi
+pass "agent.log 游标在 append、rename/create、copytruncate 与截断后重长场景均不漏读新日志"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'agent_validation_has_known_runtime_error "$check_out" "$validation_out"' <<<"$VERIFY_BODY" || \
+  fail "升级验收没有同时扫描本次 check 输出和本次启动日志差量"
+for pattern in 'Function age\(xid32\) does not exist' \
+  'operator does not exist:' 'Unable to collect statement metrics due to an error' \
+  'GaussDB query scope failed:' 'error:query-scope-' 'database-metadata' \
+  'preventSegmentMajorPageFault'; do
+  grep -Fq "$pattern" "$SCRIPTS_DIR/agent-lib.sh" || fail "已知运行错误合同缺少: $pattern"
+done
+KNOWN_PATTERN="$(agent_known_runtime_error_pattern)"
+for category in undefined-function programming-error database-error; do
+  printf 'GaussDB query scope failed: scope=replication category=%s query_sha256=%064d\n' \
+    "$category" 0 | grep -Eq "$KNOWN_PATTERN" || \
+    fail "升级验收不识别 Core 安全 query-scope 错误类别: $category"
+  printf 'metric tag error:query-scope-%s,scope:replication\n' "$category" \
+    | grep -Eq "$KNOWN_PATTERN" || fail "升级验收不识别 query-scope 指标 tag: $category"
+done
+if printf '%s\n' 'GaussDB query scope failed: scope=replication category=feature-not-supported' \
+    | grep -Eq "$KNOWN_PATTERN"; then
+  fail "升级验收错误地把可降级 feature-not-supported 当作致命 SQL 故障"
+fi
+grep -Fq -- '-n 1001' <<<"$VALIDATION_LOG_BODY" || \
+  fail "升级验收 journal 没有用额外一行识别截断"
+grep -Fq 'head -c 1048577' <<<"$VALIDATION_LOG_BODY" || \
+  fail "升级验收 journal 没有字节硬上限"
+grep -Fq 'journal_complete=false' <<<"$VALIDATION_LOG_BODY" || \
+  fail "升级验收 journal 缺失/截断没有 fail closed"
+grep -Fq 'dbdogctl diagnose dbdog-agent' <<<"$VERIFY_BODY" || \
+  fail "升级验收失败没有给出正式 Agent 诊断入口"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq '一键诊断: sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent' <<<"$MAIN_BODY" || \
+  fail "升级成功输出没有给出正式 Agent 诊断入口"
+pass "从启动前到跨两个采集周期结束核对 PID/NRestarts，并只扫描本次新增日志中的已知 SQL/metadata 错误"
 PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^write_installer_contract_marker\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 # shellcheck disable=SC2016 # 静态检查安装脚本中的字面量变量引用。
 if printf '%s\n' "$PREPARE_BODY" \
@@ -918,4 +1128,4 @@ PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
 pass "staging 与 SHA-skip 精确绑定版本身份，且 Agent version 只加载候选 runtime 私有库"
 
-printf 'ALL PASS: 18 agent install contract groups\n'
+printf 'ALL PASS: 21 agent install contract groups\n'

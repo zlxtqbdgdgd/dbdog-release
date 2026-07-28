@@ -8,6 +8,32 @@ AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
 # shellcheck disable=SC2034 # 由 source 本文件的 agent-install.sh/check-upgrade.sh 使用。
 AGENT_INSTALLER_CONTRACT_MARKER=".dbdog-installer-contract-sha256"
+# shellcheck disable=SC2034 # 由 source 本文件的安装器与 dbdogctl 使用。
+AGENT_SYSTEMD_UNITS=(
+  dbdog-agent-sysprobe.service
+  dbdog-agent.service
+  dbdog-agent-trace.service
+  dbdog-agent-process.service
+)
+
+# 诊断输出可能来自 journal 或 Agent CLI，两者都不是我们能完全约束的
+# 文本。这里只保留定位所需的错误和时序信息，统一遮掉常见凭证形态。
+agent_redact_diagnostic_stream() {
+  sed -E \
+    -e "s#(([Pp][Rr][Oo][Xx][Yy]-)?[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][\"']?[[:space:]]*[:=][[:space:]]*).*#\\1<redacted>#g" \
+    -e "s#(([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd])([[:space:]]*=[[:space:]]*|[[:space:]]+))(\"[^\"]*\"|'[^']*'|[^[:space:],;]+)#\\1<redacted>#g" \
+    -e "s#(([Ii][Dd][Ee][Nn][Tt][Ii][Ff][Ii][Ee][Dd][[:space:]]+[Bb][Yy][[:space:]]+))(\"[^\"]*\"|'[^']*'|[^[:space:],;]+)#\\1<redacted>#g" \
+    -e "s#([A-Za-z][A-Za-z0-9+.-]*://[^:/@[:space:]]+:)[^@/[:space:]]+@#\\1<redacted>@#g" \
+    -e "s#([Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+)[A-Za-z0-9._~+/=-]+#\\1<redacted>#g" \
+    -e "s#(([\"']?)([Pp][Aa][Ss][Ss][Ww]([Oo][Rr])?[Dd]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Cc][Ll][Ii][Ee][Nn][Tt][_-]?[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])[\"']?[[:space:]]*[:=][[:space:]]*)(\"[^\"]*\"|'[^']*'|[^[:space:],;]+)#\\1<redacted>#g" \
+    -e "s#(--([Pp][Aa][Ss][Ss][Ww]([Oo][Rr])?[Dd]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Cc][Ll][Ii][Ee][Nn][Tt][_-]?[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])[[:space:]]+)(\"[^\"]*\"|'[^']*'|[^[:space:],;]+)#\\1<redacted>#g"
+}
+
+agent_known_runtime_error_pattern() {
+  # 返回单行 ERE，供安装验收和诊断入口共用；不用泛化的
+  # "error" 匹配，避免把 status 中的历史计数器误判为当前失败。
+  printf '%s\n' 'Function age\(xid32\) does not exist|operator does not exist:[[:space:]]*text[[:space:]]*=[[:space:]]*record|GaussDB query scope failed:.*category=(undefined-function|programming-error|database-error)([[:space:]]|$)|error:query-scope-(undefined-function|programming-error|database-error)([[:space:],]|$)|Unable to collect statement metrics due to an error|job:database-metadata[^]]*\][[:space:]]+Job loop (database error|crash)|database-metadata.*Job loop (database error|crash)|panic: runtime error: index out of range \[65536\] with length 28672|preventSegmentMajorPageFault'
+}
 
 agent_sha256_file() { # <文件>
   if command -v sha256sum >/dev/null 2>&1; then
@@ -803,6 +829,11 @@ service_monitoring_config:
     enabled: true
   redis:
     enabled: true
+
+# 当前产品未启用 CWS/FIM，保持明确关闭。
+runtime_security_config:
+  enabled: false
+  fim_enabled: false
 EOF
 }
 
@@ -812,7 +843,12 @@ agent_render_checks() { # <conf.d> <db_password> <db_user> <db_name> <env>
   for check in cpu disk file_handle io load memory network system_core uptime; do
     dir="$confd/$check.d"
     install -d -m 0755 "$dir"
-    printf 'init_config:\ninstances:\n  - {}\n' >"$dir/conf.yaml"
+    cat >"$dir/conf.yaml" <<'EOF'
+init_config:
+instances:
+  # Agent 采集 cadence；前端查询 bucket/rollup 需独立选择。
+  - min_collection_interval: 15
+EOF
   done
 
   dir="$confd/process.d"
@@ -821,6 +857,8 @@ agent_render_checks() { # <conf.d> <db_password> <db_user> <db_name> <env>
 init_config:
 instances:
   - name: gaussdb
+    # Agent 采集 cadence；前端查询 bucket/rollup 需独立选择。
+    min_collection_interval: 15
     search_string: ['gaussdb']
     exact_match: false
     collect_children: true
@@ -840,6 +878,9 @@ EOF
   for port in "${AGENT_GAUSS_PORTS[@]}"; do
     cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
+    # Agent 采集 cadence；不是前端查询 bucket，也不改变 DBM 子任务自己的周期。
+    min_collection_interval: 15
+    max_relations: 300
     database_identifier:
       template: '\$resolved_hostname:\$port'
     service: gaussdb
