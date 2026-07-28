@@ -23,6 +23,30 @@ REPO_ROOT="${REPO_ROOT:-/home/z1/dbdog/repo}"
 BUILD_WORK="${BUILD_WORK:-/home/z1/dbdog-release-build}"
 TOOL_PATH="${TOOL_PATH:-}"
 
+# 大产物上传容易跨过 gh 默认的短 HTTP 超时。调用者仍可显式覆盖，但不接受
+# gh 无法解释的值，避免发布跑到上传阶段才以模糊错误退出。
+GH_HTTP_TIMEOUT="${GH_HTTP_TIMEOUT:-120}"
+case "$GH_HTTP_TIMEOUT" in
+  '' | 0 | *[!0-9]*) die "GH_HTTP_TIMEOUT 必须是正整数秒: $GH_HTTP_TIMEOUT" ;;
+esac
+[ "$GH_HTTP_TIMEOUT" -gt 0 ] || die "GH_HTTP_TIMEOUT 必须大于 0: $GH_HTTP_TIMEOUT"
+export GH_HTTP_TIMEOUT
+
+# 上传只在已经证明同名资产不存在时重试。该参数主要用于合同测试把等待置零；
+# 正常发布保持有限次数和短暂退避，绝不重新进入构建阶段。
+PUBLISH_UPLOAD_MAX_ATTEMPTS="${PUBLISH_UPLOAD_MAX_ATTEMPTS:-3}"
+PUBLISH_UPLOAD_RETRY_DELAY_SECONDS="${PUBLISH_UPLOAD_RETRY_DELAY_SECONDS:-5}"
+case "$PUBLISH_UPLOAD_MAX_ATTEMPTS" in
+  '' | 0 | *[!0-9]*)
+    die "PUBLISH_UPLOAD_MAX_ATTEMPTS 必须是正整数: $PUBLISH_UPLOAD_MAX_ATTEMPTS" ;;
+esac
+[ "$PUBLISH_UPLOAD_MAX_ATTEMPTS" -gt 0 ] \
+  || die "PUBLISH_UPLOAD_MAX_ATTEMPTS 必须大于 0: $PUBLISH_UPLOAD_MAX_ATTEMPTS"
+case "$PUBLISH_UPLOAD_RETRY_DELAY_SECONDS" in
+  '' | *[!0-9]*)
+    die "PUBLISH_UPLOAD_RETRY_DELAY_SECONDS 必须是非负整数: $PUBLISH_UPLOAD_RETRY_DELAY_SECONDS" ;;
+esac
+
 # Agent 的版本前缀和实际出货源码都只能来自 Agent 仓中已提交、已推送的发布基线。
 # 这里故意不保留环境变量或 release.json/current_milestone fallback，避免构建者本机配置
 # 把同一份源码打成不同版本，或把尚未钉住的 HEAD 悄悄带入产物。
@@ -281,6 +305,106 @@ ensure_bucket() {
     --notes "所有模块产物的唯一存放桶。版本语义只看 manifest.tsv / README 版本表，不看本页。"
 }
 
+inspect_release_asset() { # <asset name> <expected size> <expected sha256>；设置 RELEASE_ASSET_*
+  local asset_name="$1" expected_size="$2" expected_sha="$3"
+  local rows count remote_size remote_digest remote_sha
+
+  case "$asset_name" in
+    '' | *[!A-Za-z0-9._-]*)
+      die "待上传产物名含不安全字符: $asset_name" ;;
+  esac
+  case "$expected_size" in
+    '' | *[!0-9]*) die "待上传产物大小非法: $expected_size" ;;
+  esac
+  [ "${#expected_sha}" -eq 64 ] || die "待上传产物 SHA-256 长度非法: $expected_sha"
+  case "$expected_sha" in
+    *[!0-9a-f]*) die "待上传产物 SHA-256 非法: $expected_sha" ;;
+  esac
+
+  # 一次读取完整资产清单，再按精确名称筛选。不要把资产名插入 jq 表达式，
+  # 也不要使用 --clobber；任何同名歧义都必须 fail closed。
+  if ! rows="$(gh api "repos/$REPO/releases/tags/$BUCKET_TAG" \
+      --jq '.assets[] | [.name, (.size | tostring), (.digest // "")] | @tsv')"; then
+    RELEASE_ASSET_STATE="query-failed"
+    RELEASE_ASSET_DETAIL="无法读取产物桶资产元数据"
+    return 1
+  fi
+  count="$(printf '%s\n' "$rows" | awk -F '\t' -v name="$asset_name" \
+    '$1 == name { count++ } END { print count + 0 }')"
+
+  RELEASE_ASSET_STATE="absent"
+  RELEASE_ASSET_DETAIL="远端不存在同名资产"
+  [ "$count" -gt 0 ] || return 0
+  if [ "$count" -ne 1 ]; then
+    RELEASE_ASSET_STATE="conflict"
+    RELEASE_ASSET_DETAIL="远端出现 $count 个同名资产，无法唯一核验"
+    return 0
+  fi
+
+  remote_size="$(printf '%s\n' "$rows" | awk -F '\t' -v name="$asset_name" \
+    '$1 == name { print $2; exit }')"
+  remote_digest="$(printf '%s\n' "$rows" | awk -F '\t' -v name="$asset_name" \
+    '$1 == name { print $3; exit }')"
+  case "$remote_digest" in
+    sha256:*) remote_sha="${remote_digest#sha256:}" ;;
+    *) remote_sha="" ;;
+  esac
+
+  if [ "$remote_size" = "$expected_size" ] && [ "$remote_sha" = "$expected_sha" ]; then
+    RELEASE_ASSET_STATE="identical"
+    RELEASE_ASSET_DETAIL="远端 size/SHA-256 与本地一致"
+  else
+    RELEASE_ASSET_STATE="conflict"
+    RELEASE_ASSET_DETAIL="远端 size=${remote_size:-unknown}, digest=${remote_digest:-unknown}；本地 size=$expected_size, digest=sha256:$expected_sha"
+  fi
+}
+
+upload_release_asset() { # <module> <local file> <asset name> <sha256>
+  local module="$1" local_file="$2" asset_name="$3" expected_sha="$4"
+  local expected_size attempt=1
+
+  [ -f "$local_file" ] && [ ! -L "$local_file" ] \
+    || die "[$module] 待上传产物不存在或不是普通文件: $local_file"
+  expected_size="$(wc -c <"$local_file" | tr -d '[:space:]')"
+
+  # 发布开始前已有同名资产仍按版本冲突处理；只有本次上传返回失败后的
+  # 不确定状态，才允许通过远端 size + digest 证明其实已经成功。
+  inspect_release_asset "$asset_name" "$expected_size" "$expected_sha" \
+    || die "[$module] 无法读取产物桶资产元数据，拒绝上传"
+  [ "$RELEASE_ASSET_STATE" = "absent" ] \
+    || die "[$module] 产物桶已存在同名文件，拒绝覆盖: ${asset_name}（${RELEASE_ASSET_DETAIL}）"
+
+  while [ "$attempt" -le "$PUBLISH_UPLOAD_MAX_ATTEMPTS" ]; do
+    log "[$module] 上传产物桶（第 $attempt/$PUBLISH_UPLOAD_MAX_ATTEMPTS 次）"
+    if gh release upload "$BUCKET_TAG" "$local_file" -R "$REPO"; then
+      return 0
+    fi
+
+    warn "[$module] 上传命令失败；先核验远端同名资产，再决定是否重试"
+    inspect_release_asset "$asset_name" "$expected_size" "$expected_sha" \
+      || die "[$module] 上传失败且无法确认远端状态，拒绝盲目重试"
+    case "$RELEASE_ASSET_STATE" in
+      identical)
+        log "[$module] 上传响应虽失败，但 ${RELEASE_ASSET_DETAIL}，按成功继续"
+        return 0
+        ;;
+      conflict)
+        die "[$module] 上传失败后发现同名资产不一致，拒绝覆盖: ${asset_name}（${RELEASE_ASSET_DETAIL}）"
+        ;;
+      absent)
+        if [ "$attempt" -ge "$PUBLISH_UPLOAD_MAX_ATTEMPTS" ]; then
+          die "[$module] 上传已失败 $attempt 次，且远端仍无同名资产"
+        fi
+        if [ "$PUBLISH_UPLOAD_RETRY_DELAY_SECONDS" -gt 0 ]; then
+          sleep "$PUBLISH_UPLOAD_RETRY_DELAY_SECONDS"
+        fi
+        attempt=$((attempt + 1))
+        ;;
+      *) die "[$module] 未知远端资产状态: $RELEASE_ASSET_STATE" ;;
+    esac
+  done
+}
+
 update_manifest_row() { # <module> <version> <artifact> <sha256> <source_sha>
   awk -F'\t' -v OFS='\t' -v m="$1" -v v="$2" -v a="$3" -v h="$4" -v s="$5" \
     '!/^#/ && $1==m { $5=v; $6=a; $7=h; $8=s } { print }' \
@@ -422,15 +546,7 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   fi
 
   ensure_bucket
-  local existing_assets
-  existing_assets="$(gh release view "$BUCKET_TAG" -R "$REPO" \
-    --json assets --jq '.assets[].name')" \
-    || die "[$m] 无法读取产物桶资产名"
-  if printf '%s\n' "$existing_assets" | grep -Fqx -- "$BUILT_ARTIFACT"; then
-    die "[$m] 产物桶已存在同名文件，拒绝覆盖: $BUILT_ARTIFACT（请增加版本或 -dbdog.N revision）"
-  fi
-  log "[$m] 上传产物桶"
-  gh release upload "$BUCKET_TAG" "$SCRATCH/$BUILT_ARTIFACT" -R "$REPO"
+  upload_release_asset "$m" "$SCRATCH/$BUILT_ARTIFACT" "$BUILT_ARTIFACT" "$BUILT_SHA256"
 
   local srcsha="-"
   if [ "$kind" = "first-party" ]; then
