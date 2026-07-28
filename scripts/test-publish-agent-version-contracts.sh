@@ -171,4 +171,19 @@ if grep -Fq 'AGENT_BASE_VERSION' "$SCRIPTS_DIR/publish/publish.sh"; then
 fi
 pass '构建输入只使用基线源码锚，且不存在本机版本前缀 fallback'
 
-printf 'ALL PASS: 8 Agent publish policy contract tests\n'
+grep -Fq 'if ! recipe_stdout="$(ssh "$BUILD_HOST"' "$SCRIPTS_DIR/publish/publish.sh" || \
+  fail 'publish.sh 没有在截取结果行前保留远端 recipe 退出状态'
+if grep -Fq 'bash -s <"$recipe" | tail -n1' "$SCRIPTS_DIR/publish/publish.sh"; then
+  fail 'publish.sh 仍用 tail 成功状态掩盖远端 recipe 失败'
+fi
+awk '
+  /DBDOG_AGENT_CACHE_ROOT=.*\\$/ {
+    getline
+    if ($0 ~ /\/usr\/bin\/bash .*VERIFY\.sh/) found=1
+  }
+  END { exit(found ? 0 : 1) }
+' "$SCRIPTS_DIR/publish/recipes/dbdog-agent.sh" || \
+  fail 'dependency seal env 命令仍可能被续行中的注释截断并污染 stdout'
+pass '远端 recipe 失败状态不会被 tail 掩盖，seal 校验不会向结果通道泄漏环境'
+
+printf 'ALL PASS: 9 Agent publish policy contract tests\n'

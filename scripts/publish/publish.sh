@@ -367,10 +367,13 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
     || die "[$m] 构建机架构是 $build_arch，不能发布为 $ARCH"
 
   log "[$m] 构建于 $BUILD_HOST ..."
-  local out
-  out="$(ssh "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
+  local out recipe_stdout
+  if ! recipe_stdout="$(ssh "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
         ARCH="$ARCH" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
-        PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}" bash -s <"$recipe" | tail -n1)"
+        PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}" bash -s <"$recipe")"; then
+    die "[$m] 远端构建配方执行失败"
+  fi
+  out="$(printf '%s\n' "$recipe_stdout" | tail -n1)"
   BUILT_VERSION="${out%%$'\t'*}"
   local rpath="${out#*$'\t'}"
   [ -n "$BUILT_VERSION" ] && [ "$rpath" != "$out" ] || die "[$m] 配方输出不合约定（应为 版本<TAB>产物路径）: $out"

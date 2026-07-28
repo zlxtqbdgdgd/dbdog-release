@@ -659,14 +659,14 @@ verify_dependency_seal_metadata() {
   require_exact_field "$SEAL_DIR/SEAL-INFO" system_reference_count 4
   require_exact_field "$SEAL_DIR/SEAL-INFO" selinux_system_reference_count 3
   require_exact_field "$SEAL_DIR/SEAL-INFO" closure_status partial-no-clean-host-offline-replay
+  # VERIFY.sh checks tens of thousands of objects. Keep failures and its
+  # summary on stderr, but suppress sha256sum's per-file `OK` stdout flood.
   /usr/bin/env -i \
     HOME=/home/dbdog \
     PATH=/usr/bin:/bin \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     DBDOG_AGENT_CACHE_ROOT="$CACHE_ROOT" \
-    # VERIFY.sh checks tens of thousands of objects. Keep failures and its
-    # summary on stderr, but suppress sha256sum's per-file `OK` stdout flood.
     /usr/bin/bash "$SEAL_DIR/VERIFY.sh" >/dev/null || \
       die '依赖 seal 或它引用的持久 cache 校验失败；不允许回退到重新下载'
   log '依赖 seal 校验通过（其 portability 声明仍为 partial，不冒充 clean-host 离线闭包）'
