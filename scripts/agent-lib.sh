@@ -33,7 +33,14 @@ agent_installer_contract_fingerprint() { # <scripts 目录>；覆盖 Agent 专�
   local scripts="$1" relative path digest payload=""
   for relative in lib.sh agent-install.sh agent-lib.sh agent/init-gaussdb-perdb.sql; do
     path="$scripts/$relative"
-    [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] || return 1
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      printf 'Agent 安装器合约缺少文件: %s\n' "$path" >&2
+      return 1
+    fi
+    if [ ! -f "$path" ] || [ -L "$path" ] || [ ! -r "$path" ]; then
+      printf 'Agent 安装器合约文件必须是可读普通文件且不能是符号链接: %s\n' "$path" >&2
+      return 1
+    fi
     digest="$(agent_sha256_file "$path")" || return 1
     [ "${#digest}" -eq 64 ] || return 1
     case "$digest" in *[!0-9a-f]*) return 1 ;; esac
@@ -336,6 +343,48 @@ agent_cmdline_facts() { # <pid>；设置 AGENT_CMD_DATA_DIR / AGENT_CMD_PORT
   done <"$root/$pid/cmdline"
 }
 
+agent_gauss_main_data_dir() { # <pid>；只接受由 postmaster.pid 正向证明的实例主进程
+  local pid="$1" root="${DBDOG_PROC_ROOT:-/proc}" data cwd exe state recorded_pid candidate
+  local candidates=()
+  [ -r "$root/$pid/comm" ] || return 1
+  [ "$(tr -d '\r\n' <"$root/$pid/comm")" = gaussdb ] || return 1
+  [ -L "$root/$pid/exe" ] || return 1
+  exe="$(readlink -f "$root/$pid/exe" 2>/dev/null || true)"
+  [ "${exe##*/}" = gaussdb ] || return 1
+  if [ -r "$root/$pid/status" ]; then
+    state="$(awk '/^State:/ { print $2; exit }' "$root/$pid/status")"
+    [ "$state" != Z ] || return 1
+  fi
+
+  agent_cmdline_facts "$pid"
+  data="$AGENT_CMD_DATA_DIR"
+  [ -n "$data" ] || data="$(agent_proc_env "$pid" PGDATA 2>/dev/null || true)"
+  cwd="$(readlink -f "$root/$pid/cwd" 2>/dev/null || true)"
+  if [ -z "$data" ]; then
+    # 少数启动器既不保留 -D 也不导出 PGDATA；PostgreSQL/GaussDB 主进程通常
+    # chdir 到实例目录。cwd 仍必须通过同一个 postmaster.pid PID 合同，不能单独采信。
+    [ -z "$cwd" ] || candidates+=("$cwd")
+  else
+    case "$data" in
+      /*) candidates+=("$data") ;;
+      *)
+        # postmaster 启动后通常已经 chdir(PGDATA)，但 cmdline 仍保留启动时的
+        # 相对 -D；也兼容尚未 chdir、cwd 仍是其父目录的实现。两者都必须再过 pidfile。
+        if [ -n "$cwd" ]; then candidates+=("$cwd" "$cwd/$data"); fi
+        ;;
+    esac
+  fi
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [ -d "$candidate" ] && [ -r "$candidate/postmaster.pid" ] || continue
+    recorded_pid="$(awk 'NR == 1 { print $1; exit }' "$candidate/postmaster.pid")"
+    [ "$recorded_pid" = "$pid" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
 agent_owner_home() { # <uid>
   local uid="$1" entry
   if command -v getent >/dev/null 2>&1; then
@@ -366,6 +415,8 @@ agent_find_gauss_pids() { # 设置 AGENT_GAUSS_PIDS
     [ -r "$root/$requested/comm" ] || die "找不到指定 GaussDB PID: $requested"
     comm="$(tr -d '\r\n' <"$root/$requested/comm")"
     [ "$comm" = gaussdb ] || die "指定 PID ${requested} 不是 gaussdb（comm=${comm}）"
+    agent_gauss_main_data_dir "$requested" >/dev/null || \
+      die "指定 PID ${requested} 不是可验证的 GaussDB 实例主进程（需由 PGDATA/postmaster.pid 记录该 PID）"
     AGENT_GAUSS_PIDS+=("$requested")
     return
   fi
@@ -374,6 +425,7 @@ agent_find_gauss_pids() { # 设置 AGENT_GAUSS_PIDS
     comm="$(tr -d '\r\n' <"$path")"
     [ "$comm" = gaussdb ] || continue
     pid="${path%/comm}"; pid="${pid##*/}"
+    agent_gauss_main_data_dir "$pid" >/dev/null || continue
     AGENT_GAUSS_PIDS+=("$pid")
   done
 }
@@ -420,17 +472,14 @@ agent_detect_gaussdb() {
   agent_find_gauss_pids
 
   if [ "${#AGENT_GAUSS_PIDS[@]}" -eq 0 ]; then
-    port="${DBDOG_GAUSSDB_PORT:-}"
-    [ -n "$port" ] || port="$(agent_existing_gauss_scalar "$old_conf" port 2>/dev/null || true)"
-    agent_valid_port "$port" || die "未发现运行中的 gaussdb 进程，也没有可复用/显式指定的端口"
-    AGENT_GAUSS_PORTS+=("$port")
+    die "未发现可由 PGDATA/postmaster.pid 验证的运行中 GaussDB 实例主进程"
   fi
 
   for pid in ${AGENT_GAUSS_PIDS[@]+"${AGENT_GAUSS_PIDS[@]}"}; do
     owner_home=""
     owner=""
+    data="$(agent_gauss_main_data_dir "$pid")" || continue
     agent_cmdline_facts "$pid"
-    data="$AGENT_CMD_DATA_DIR"
     port="$AGENT_CMD_PORT"
     env_port="$(agent_proc_env "$pid" PGPORT 2>/dev/null || true)"
     env_home="$(agent_proc_env "$pid" GAUSSHOME 2>/dev/null || true)"
@@ -526,8 +575,7 @@ agent_detect_gaussdb() {
     [ -x "$gsql" ] || gsql="$(agent_find_in_path "$env_path" gsql 2>/dev/null || true)"
     [ -n "$gsql" ] || die "目标 GaussDB 客户端环境中找不到可执行 gsql"
 
-    # GaussDB 可能让多个后端进程都使用 comm=gaussdb；安装事实按 socket+端口去重，
-    # 不能把每个 backend 误当成一个数据库实例重复初始化。
+    # 主进程已由 PGDATA/postmaster.pid 正向验证；这里仍对重复实例事实做防御性去重。
     mapped=0
     for ((map_index=0; map_index<${#AGENT_GAUSS_PID_PORTS[@]}; map_index++)); do
       [ "${AGENT_GAUSS_PID_PORTS[$map_index]}" = "$port" ] || continue
@@ -560,6 +608,9 @@ agent_detect_gaussdb() {
 
     [ -n "$env_log" ] && agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/*/gaussdb-*.log"
   done
+
+  [ "${#AGENT_GAUSS_PID_PORTS[@]}" -gt 0 ] || \
+    die "GaussDB 主进程在事实探测期间退出或改变，未得到可安装实例"
 
   # 日常采集固定使用 127.0.0.1:port；两个实例若端口相同，即使管理 socket
   # 不同，也无法被该 TCP endpoint 唯一区分，必须在渲染配置前 fail closed。

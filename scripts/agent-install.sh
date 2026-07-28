@@ -44,6 +44,7 @@ usage() {
 
 可选覆盖（正常情况下自动发现或使用稳定默认值）：
   DBDOG_GAUSSDB_MONITOR_PASSWORD         默认首次生成、升级保留
+  DBDOG_GAUSSDB_PID                      极特殊场景显式指定实例主进程 PID
   DBDOG_GAUSSDB_ENV_FILE                 显式 GaussDB 客户端环境文件（绝对路径）
   DBDOG_GAUSSDB_PGHOST                   仅安装期 gsql 使用的本地 Unix socket 目录
   DBDOG_GAUSSDB_LD_LIBRARY_PATH           显式 gsql 动态库搜索路径
@@ -422,25 +423,8 @@ agent_hba_has_required_tcp_md5() { # <HBA 文件>
   ' "$1"
 }
 
-agent_hba_has_dbdog_trust() { # <HBA 文件>
-  awk '
-    /^[[:space:]]*#/ { next }
-    {
-      kind=tolower($1); user=$3
-      method=(kind == "local" ? tolower($4) : tolower($5))
-      gsub(/^"|"$/, "", user)
-      count=split(user, users, ",")
-      for (i=1; i<=count; i++) {
-        gsub(/^"|"$/, "", users[i])
-        if ((users[i] == "dbdog" || users[i] == "all") && method == "trust") found=1
-      }
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$1"
-}
-
 preflight_gaussdb_clients() {
-  local index count gsql ldd_bin out value mode hba
+  local index count gsql ldd_bin out value mode hba exists
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
   log "预检目标 GaussDB 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
@@ -480,10 +464,23 @@ preflight_gaussdb_clients() {
       "GaussDB 前置条件不满足：SHOW password_encryption_type 当前为 ${mode}，必须由 DBA 按数据库规范配置为 1 并确认生效；dbdog 安装器不会修改 postgresql.conf"
     hba="$(agent_gaussdb_hba_file "$index")" || \
       die "无法在预检阶段确定 GaussDB HBA 文件（实例索引 ${index}）"
-    ! agent_hba_has_dbdog_trust "$hba" || die \
-      "GaussDB HBA 含 dbdog trust 规则；请 DBA 删除该规则并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
     agent_hba_has_required_tcp_md5 "$hba" || die \
-      "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 添加并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+      "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 把它放在可能匹配 dbdog 的宽泛规则之前并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+    exists="$(agent_gsql "$index" -c \
+      "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
+      | awk 'NF { value=$0 } END { print value }')" || \
+      die "无法在预检阶段判断 GaussDB 监控用户是否存在（实例索引 ${index}）"
+    case "$exists" in
+      0)
+        # 不存在的角色可能按服务端全局密码策略收到防枚举用的模拟 challenge，
+        # 不能拿它推断新账号创建后的 verifier。CREATE 后会立即做 code=5 + 真实 libpq 验收。
+        ;;
+      1)
+        agent_active_auth_is_md5 "$index" || die \
+          "GaussDB 当前生效的本机 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序、用户凭证与 reload 状态（实例索引 ${index}）"
+        ;;
+      *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
+    esac
   done
 }
 
@@ -599,7 +596,7 @@ print("active authentication method: MD5")
 PY
   then
     [ ! -s "$out" ] || sed -n '1,80p' "$out" >&2
-    warn "实例索引 ${index} 当前生效的 127.0.0.1 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序并确认配置已重新加载"
+    warn "实例索引 ${index} 当前生效的 127.0.0.1 TCP 首匹配认证不是 MD5 code=5；请 DBA 核对 HBA 顺序并确认配置已重新加载"
     return 1
   fi
 }
@@ -623,6 +620,7 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
         reset=1
         ;;
       1)
+        agent_active_auth_is_md5 "$index" || return 1
         password_status=0
         agent_monitor_password_works "$index" "$password" || password_status=$?
         case "$password_status" in
@@ -630,7 +628,7 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
             printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
             ;;
           2)
-            warn "实例索引 ${index} 已存在 dbdog 用户，但已保存密码无法经 127.0.0.1 TCP + MD5 登录；安装器不会擅自重置已有数据库账号，请核对 /etc/dbdog-agent 配置或由 DBA 处理后重跑"
+            warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier，或 Agent 保存密码不匹配。mode=1 不会转换旧凭证，安装器不会擅自改密"
             return 1
             ;;
           *)
@@ -644,12 +642,12 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
     chmod 0600 "$sql" || return 1
     agent_gsql "$index" <"$sql" || return 1
     if [ "$reset" -eq 1 ]; then
+      agent_active_auth_is_md5 "$index" || return 1
       if ! agent_monitor_password_works "$index" "$password"; then
         warn "实例索引 ${index} 已设置 dbdog 密码，但标准 libpq 仍无法经 127.0.0.1 TCP + MD5 登录"
         return 1
       fi
     fi
-    agent_active_auth_is_md5 "$index" || return 1
     reset=0
   done
 }
@@ -753,7 +751,7 @@ validate_runtime_tree() { # <目录> <manifest version>
   local integration_info="$1/provenance/gaussdb.txt" module_path distribution_path
   local version_info="$1/provenance/agent-version.txt"
   local manifest_text="$1/version-manifest.txt" manifest_json="$1/version-manifest.json"
-  local env_bin timeout_bin version_output version_rc=0 label reported_version separator details
+  local env_bin timeout_bin runtime_ld version_output version_rc=0 label reported_version separator details
   local json_version build_binary_sha version_binary_sha build_text_sha version_text_sha
   local build_json_sha version_json_sha build_output_sha version_output_sha actual_output_sha value
   [ -f "$tree/.install_root" ] || die "Agent runtime 缺少 .install_root"
@@ -792,15 +790,20 @@ validate_runtime_tree() { # <目录> <manifest version>
     case "$resolved" in "$tree" | "$tree"/*) ;; *) die "Agent runtime 符号链接越界: $link" ;; esac
   done < <(find "$tree" -type l -print0)
 
-  # 必须执行即将切换的那一个 binary；空环境避免误用同机官方 Agent、用户 PATH 或
-  # LD_LIBRARY_PATH。麒麟构建的稳定格式为 `Agent <release> - Commit: ...`，其中
+  # 必须执行即将切换的那一个 binary；空环境只注入候选 tree 的私有库目录，避免误用
+  # 同机官方 Agent、用户 PATH 或旧 runtime 的 LD_LIBRARY_PATH。麒麟构建的稳定格式为
+  # `Agent <release> - Commit: ...`，其中
   # version token 必须完整相等，不能用前缀匹配让 .3 接受 .30/7.79 等版本。
   env_bin="$(command -v env 2>/dev/null || true)"
   timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
   [ -n "$env_bin" ] && [ -x "$timeout_bin" ] || \
     die "缺少 Agent version 最小环境所需的 env/timeout"
+  [ -d "$tree/embedded/lib" ] || die "Agent runtime 缺少私有动态库目录: embedded/lib"
+  runtime_ld="$tree/embedded/lib"
+  [ ! -d "$tree/embedded/lib64" ] || runtime_ld="$runtime_ld:$tree/embedded/lib64"
   version_output="$("$timeout_bin" --kill-after=2 30 "$env_bin" -i \
-    PATH=/usr/bin:/bin LANG=C LC_ALL=C "$tree/bin/agent/agent" version 2>&1)" || version_rc=$?
+    LD_LIBRARY_PATH="$runtime_ld" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    "$tree/bin/agent/agent" version 2>&1)" || version_rc=$?
   [ "$version_rc" -eq 0 ] || \
     die "Agent binary version 执行失败（rc=$version_rc）: ${version_output:-无输出}"
   case "$version_output" in
@@ -1067,6 +1070,14 @@ start_and_verify() {
   done
   if [ "$ready" -ne 1 ]; then
     systemctl status dbdog-agent.service --no-pager >>"$health_out" 2>&1 || true
+    if command -v journalctl >/dev/null 2>&1; then
+      printf '\n===== recent dbdog-agent journal =====\n' >>"$health_out"
+      journalctl -u dbdog-agent.service -n 200 --no-pager >>"$health_out" 2>&1 || true
+    fi
+    if grep -Eqi '(^|[^0-9])413([^0-9]|$)|payload too large|单批事件数超过上限|请求体超过摄入上限' \
+      "$health_out"; then
+      die "Agent forwarder 收到摄入端 413；延长等待不能修复协议拒绝，请升级/检查 dbdog-server 摄入合同。详情留在 ${health_out}"
+    fi
     die "Agent forwarder health 未在 60 秒内就绪；详情留在 ${health_out}"
   fi
 

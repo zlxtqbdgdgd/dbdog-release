@@ -197,10 +197,16 @@ host all dbdog 127.0.0.1/32 md5         # pg_hba.conf 中必须存在
 ```
 
 `password_encryption_type=1` 决定新建监控用户时同时保存 SHA256 与 MD5 凭证，HBA 的 `md5` 才决定
-这次 TCP 连接采用 MD5 认证；两个配置缺一不可。HBA 中不能存在任何 `dbdog ... trust` 规则。
+这次 TCP 连接采用 MD5 认证；两个配置缺一不可。HBA 使用首条匹配规则且不会回退，`user=all`
+同样会匹配 `dbdog`，因此精确 MD5 规则必须放在可能匹配它的宽泛规则之前。安装器不会仅凭文件中
+出现过 `trust` 就误判：精确规则之后、不影响该 TCP endpoint 的规则可以存在。已有监控用户会在
+变更前验证实际握手；全新用户因服务端可能返回防枚举用的模拟 challenge，则在创建后立即要求
+PostgreSQL MD5 AuthenticationRequest code `5`，随后再用随包 libpq 登录。
 安装器只读检查这两项，不会修改 `postgresql.conf`、`pg_hba.conf`，也不会替 DBA reload/restart
-GaussDB。前置条件不满足会在创建用户和切换 Agent 配置前直接失败，并输出应处理的准确配置。
-创建/确认用户后，安装器还会读取服务端当前生效的协议认证请求，必须得到 MD5 challenge；因此磁盘
+GaussDB。可在创建前判定的 mode、字面 HBA 和已有账号认证问题会提前失败；新用户的生效认证只能
+在创建后验证，失败时 Agent 安装事务会回滚；已创建的监控用户会保留，重跑自动复用同一份凭证。
+已有用户在安装变更前、
+新用户在创建后，安装器都会读取服务端当前生效的协议认证请求，必须得到 MD5 challenge；因此磁盘
 文件已改但尚未 reload、规则顺序被其他认证方式遮蔽等情况也不会误报成功。
 
 如果旧环境中的 `dbdog` 用户是在 `password_encryption_type=2/3` 下创建的，仅把参数改为 `1` 不会
@@ -214,14 +220,16 @@ GaussDB。前置条件不满足会在创建用户和切换 Agent 配置前直接
 - 下载并校验 manifest 产物，确认它确实包含 GaussDB integration、编译后的
   `psycopg_c`/私有 `libpq` 和五个核心二进制；
 - 从运行中的 `gaussdb` 进程、`/proc/<pid>/environ`、`postmaster.pid` 与配置发现实际端口、
-  Unix socket、`GAUSSHOME`、`PGDATA`、`GAUSSLOG`、`PATH` 与 `LD_LIBRARY_PATH`。运行进程环境
-  优先；同时在清空的环境中，以数据库 OS 用户权限和硬超时加载 `.profile`、`.bash_profile`、
+  Unix socket、`GAUSSHOME`、`PGDATA`、`GAUSSLOG`、`PATH` 与 `LD_LIBRARY_PATH`。只接受
+  `PGDATA/postmaster.pid` 第一行能反向确认 PID 的实例主进程，自动忽略同名的 backend、
+  fenced UDF 与辅助进程。运行进程环境优先；同时在清空的环境中，以数据库 OS 用户权限和
+  硬超时加载 `.profile`、`.bash_profile`、
   `.bashrc`，以及 `MPPDB_ENV_SEPARATE_PATH`、`gauss_env_file`/`gsql_env.sh` 等常见环境文件，
   最终只把 gsql 启动所需的白名单变量交给 root 安装器；
 - 用发现出的同一套客户端环境和目标 Unix socket，依次执行 `ldd gsql`、`gsql --version` 和
   本地 `SELECT 1` 预检；这个 socket 只属于安装期管理通道，不会写进日常采集配置；
-- 只读核对 `password_encryption_type=1`、本机 `dbdog` TCP MD5 HBA 规则及不存在
-  `dbdog trust`；用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备。用户不存在时
+- 只读核对 `password_encryption_type=1` 及精确的本机 `dbdog` TCP MD5 HBA 规则存在，并以实际
+  握手确认该 TCP endpoint 当前生效认证为 MD5；用目标机实际 `$GAUSSHOME/bin/gsql` 做一次性、幂等的安装准备。用户不存在时
   创建随机密码的 `dbdog` MONADMIN，用户已存在时只验证已保存密码而不擅自改密；随后创建
   `dbdog.statements`/`dbdog.activity`/explain 兼容对象；最后以协议握手确认当前生效认证确为 MD5，
   并用包内实际 psycopg/libpq 完成 `127.0.0.1` TCP 登录验证。`gsql` 不参与日常采集；
@@ -237,7 +245,10 @@ Agent 包里的 `1.0.0` 是 **GaussDB integration 自身的首版版本**，不�
 两者没有版本绑定关系。
 日常采集由该 integration 通过 psycopg `ConnectionPool` 和包内 libpq 完成，服务端版本则在
 运行期执行 `SHOW SERVER_VERSION` / `SELECT version()` 识别。安装器不会因为目标 GaussDB
-版本字符串变化而拒装；若新版本真实改变了协议或系统视图，末尾 check 会 fail closed，此时应
+版本字符串（包括 505/507）做猜测式门禁，而是直接验证当前连接是否返回 PostgreSQL MD5
+AuthenticationRequest code `5`，再用随包 libpq 实际登录。若看到 SASL 不兼容，说明当前首匹配
+认证并非这条已验证的 MD5 合同，而不能据此推断整个 GaussDB 版本不受支持。若新版本真实改变了
+协议或系统视图，末尾 check 会 fail closed，此时应
 升级 integration，而不是换成 `gsql` 短连接采集或绑定目标机客户端库。Agent 产物也显式
 禁止夹带 `gsql`/`gaussdb` 服务端二进制，安装期需要时只使用目标机当前版本自己的 gsql。
 
@@ -257,6 +268,12 @@ sudo ./scripts/upgrade.sh dbdog-agent
 本版本时，旧 checker 进程无法在运行中获得新判断逻辑；本次必须按上面的两条命令先独立
 `git pull --ff-only`，再直接执行正常的 `upgrade.sh dbdog-agent`。之后 checker 会在 pull 到新脚本时
 自动重新执行最新逻辑。
+
+目标机不能访问 GitHub 时，应从可联网机器同步同一个 commit 的完整 `dbdog-release` checkout；
+不要只挑拣 `agent-install.sh` 等几个文件。`manifest.tsv`、整个 `scripts/`（包括
+`scripts/agent/init-gaussdb-perdb.sql`）共同组成安装事务和内容指纹，缺失会明确报出具体路径并
+fail closed。对应 manifest 文件名的 Agent tarball 可预置到目标机有效 `DBDOG_HOME/cache/`
+（默认是执行安装命令用户的 `~/dbdog/cache/`），安装器仍会校验 SHA-256 后才使用。
 
 显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`（仅安装期 gsql 管理 socket）、
 `DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、

@@ -32,6 +32,17 @@ FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
 printf 'unrelated\n' >"$FINGERPRINT_ROOT/README.md"
 [ "$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" = "$FINGERPRINT_1" ] || \
   fail "无关文件错误改变了 Agent 安装器合约指纹"
+mv "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql" \
+  "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql.missing"
+if agent_installer_contract_fingerprint "$FINGERPRINT_ROOT" \
+  >"$TEST_ROOT/fingerprint-missing-sql.out" 2>"$TEST_ROOT/fingerprint-missing-sql.err"; then
+  fail "安装器合约指纹错误接受了缺失的 GaussDB 初始化 SQL"
+fi
+grep -Fq "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql" \
+  "$TEST_ROOT/fingerprint-missing-sql.err" || \
+  fail "初始化 SQL 缺失时 stderr 没有列出具体路径"
+mv "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql.missing" \
+  "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
 printf 'lib-v2\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
 FINGERPRINT_2="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
   fail "安装器合约变更后无法重新计算指纹"
@@ -54,7 +65,8 @@ FAKE_BIN="$TEST_ROOT/fake-bin"
 mkdir -p "$PROC/$PID" "$DATA" "$GAUSSLOG/gs_log/dn_6001" \
   "$GAUSSHOME/bin" "$GAUSSHOME/lib/libsimsearch" "$SOCKET_DIR" "$OWNER_HOME" "$FAKE_BIN"
 printf '#!/bin/sh\nexit 0\n' >"$GAUSSHOME/bin/gsql"
-chmod 0755 "$GAUSSHOME/bin/gsql"
+printf '#!/bin/sh\nexit 0\n' >"$GAUSSHOME/bin/gaussdb"
+chmod 0755 "$GAUSSHOME/bin/gsql" "$GAUSSHOME/bin/gaussdb"
 cat >"$FAKE_BIN/timeout" <<'EOF'
 #!/bin/sh
 case "$1" in --kill-after=*) shift ;; esac
@@ -77,20 +89,53 @@ agent_owner_home() { printf '%s\n' "$DBDOG_TEST_OWNER_HOME"; }
 agent_owner_name() { id -un; }
 
 printf 'gaussdb\n' >"$PROC/$PID/comm"
-printf '%s\0-D\0%s\0' "$GAUSSHOME/bin/gaussdb" "$DATA" >"$PROC/$PID/cmdline"
+ln -s "$GAUSSHOME/bin/gaussdb" "$PROC/$PID/exe"
+ln -s "$DATA" "$PROC/$PID/cwd"
+# 覆盖真实 postmaster 行为：cmdline 保留启动时的相对 -D data，但进程已 chdir(PGDATA)。
+# 不能再机械拼成 <PGDATA>/data，也不能按安装器当前目录猜测。
+printf '%s\0-D\0data\0' "$GAUSSHOME/bin/gaussdb" >"$PROC/$PID/cmdline"
 printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=37001\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
   "$GAUSSHOME" "$GAUSSLOG" "$SOCKET_DIR" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
   >"$PROC/$PID/environ"
-printf 'Name:\tgaussdb\nUid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$PROC/$PID/status"
+printf 'Name:\tgaussdb\nState:\tS (sleeping)\nPPid:\t1\nUid:\t%s\t%s\t%s\t%s\n' \
+  "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$PROC/$PID/status"
 printf '4242\n%s\n0\n15432\n%s\n' "$DATA" "$SOCKET_DIR" >"$DATA/postmaster.pid"
 # 模拟同实例的另一个 gaussdb backend；安装事实必须按 socket+端口去重。
 mkdir -p "$PROC/4243"
 printf 'gaussdb\n' >"$PROC/4243/comm"
+ln -s "$GAUSSHOME/bin/gaussdb" "$PROC/4243/exe"
 printf 'gaussdb: dbdog postgres 127.0.0.1\0' >"$PROC/4243/cmdline"
 printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
   "$GAUSSHOME" "$GAUSSLOG" "$DATA" "$SOCKET_DIR" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
   >"$PROC/4243/environ"
 cp "$PROC/$PID/status" "$PROC/4243/status"
+
+# 数字更小的 fenced/UDF 与辅助进程会先于主进程被扫描。它们即使 comm/exe
+# 都是 gaussdb，也不能靠角色 cmdline 黑名单识别；必须因无法用 postmaster.pid
+# 正向证明自己是实例主进程而被跳过。
+FENCED_PID=4000
+AUX_PID=4001
+AUX_DATA="$TEST_ROOT/gauss/aux-data"
+AUX_SOCKET="$TEST_ROOT/gauss/aux-socket"
+AUX_LOG="$TEST_ROOT/gauss/aux-log"
+mkdir -p "$PROC/$FENCED_PID" "$PROC/$AUX_PID" "$AUX_DATA" "$AUX_SOCKET" "$AUX_LOG"
+for candidate in "$FENCED_PID" "$AUX_PID"; do
+  printf 'gaussdb\n' >"$PROC/$candidate/comm"
+  ln -s "$GAUSSHOME/bin/gaussdb" "$PROC/$candidate/exe"
+  printf 'Name:\tgaussdb\nState:\tS (sleeping)\nPPid:\t%s\nUid:\t%s\t%s\t%s\t%s\n' \
+    "$PID" "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$PROC/$candidate/status"
+done
+printf '%s\0--worker-mode\0fenced-udf\0' "$GAUSSHOME/bin/gaussdb" \
+  >"$PROC/$FENCED_PID/cmdline"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=19999\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$AUX_LOG" "$GAUSSHOME" >"$PROC/$FENCED_PID/environ"
+printf '%s\0-D\0%s\0--auxiliary\0' "$GAUSSHOME/bin/gaussdb" "$AUX_DATA" \
+  >"$PROC/$AUX_PID/cmdline"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=19998\0PGHOST=%s\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$AUX_LOG" "$AUX_DATA" "$AUX_SOCKET" "$GAUSSHOME" \
+  >"$PROC/$AUX_PID/environ"
+printf '9999\n%s\n0\n19998\n%s\n' "$AUX_DATA" "$AUX_SOCKET" \
+  >"$AUX_DATA/postmaster.pid"
 
 DBDOG_PROC_ROOT="$PROC"
 export DBDOG_PROC_ROOT
@@ -106,7 +151,23 @@ esac
 [ "${AGENT_GAUSS_LOG_GLOBS[*]}" = "$GAUSSLOG/gs_log/*/gaussdb-*.log" ] || \
   fail "没有从进程 GAUSSLOG 生成日志 glob"
 [ "$AGENT_GAUSS_DEPLOYMENT" = centralized ] || fail "单实例拓扑推断错误"
-pass "优先从目标机运行进程发现 GaussDB 端口、socket、客户端库与日志"
+[ "${AGENT_GAUSS_PID_SOURCE_PIDS[*]}" = "$PID" ] || \
+  fail "fenced/backend/辅助进程被错误当作 GaussDB 主实例"
+pass "优先从目标机主进程发现 GaussDB 事实，并跳过 fenced/backend/辅助进程"
+
+if (DBDOG_GAUSSDB_PID="$AUX_PID"; export DBDOG_GAUSSDB_PID; agent_detect_gaussdb) \
+  >"$TEST_ROOT/explicit-aux-pid.out" 2>&1; then
+  fail "显式指定的 GaussDB 辅助 PID 被错误接受为主实例"
+fi
+grep -Eq '主进程|主实例|postmaster\.pid' "$TEST_ROOT/explicit-aux-pid.out" || \
+  fail "显式辅助 PID 被拒绝时没有说明主进程身份校验失败"
+DBDOG_GAUSSDB_PID="$PID"
+export DBDOG_GAUSSDB_PID
+agent_detect_gaussdb || fail "显式指定真实 GaussDB 主 PID 失败"
+unset DBDOG_GAUSSDB_PID
+[ "${AGENT_GAUSS_PID_SOURCE_PIDS[*]}" = "$PID" ] || \
+  fail "显式主 PID 没有形成唯一实例事实"
+pass "显式 GaussDB PID 复用同一主进程身份合同"
 
 # 安装期 gsql 必须使用目标实例管理 socket：运行进程中残留 TCP PGHOST 时
 # 回退到 postmaster.pid；操作者也不能把这个管理通道误配成 TCP host。
@@ -131,6 +192,7 @@ DATA2="$TEST_ROOT/gauss/data2"
 SOCKET_DIR2="$TEST_ROOT/gauss/socket2"
 mkdir -p "$PROC/4244" "$DATA2" "$SOCKET_DIR2"
 printf 'gaussdb\n' >"$PROC/4244/comm"
+ln -s "$GAUSSHOME/bin/gaussdb" "$PROC/4244/exe"
 printf '%s\0-D\0%s\0' "$GAUSSHOME/bin/gaussdb" "$DATA2" >"$PROC/4244/cmdline"
 printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
   "$GAUSSHOME" "$GAUSSLOG" "$DATA2" "$SOCKET_DIR2" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
@@ -341,7 +403,16 @@ PREPARE_USER_BODY="$(awk '/^agent_prepare_gaussdb_user\(\)/ { scan=1 } /^bootstr
 grep -Fq "agent_monitor_password_works \"\$index\" \"\$password\"" <<<"$PREPARE_USER_BODY" || \
   fail "准备 dbdog 用户没有用真实正确密码做驱动登录探测"
 grep -Fq "agent_active_auth_is_md5 \"\$index\"" <<<"$PREPARE_USER_BODY" || \
-  fail "准备 dbdog 用户没有在正确密码探测外核对当前生效 MD5 认证"
+  fail "准备 dbdog 用户没有核对当前生效 MD5 认证"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+PREPARE_ACTIVE_LINE="$(grep -n -m1 'agent_active_auth_is_md5 "\$index"' \
+  <<<"$PREPARE_USER_BODY" | cut -d: -f1)"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+PREPARE_PASSWORD_LINE="$(grep -n -m1 'agent_monitor_password_works "\$index" "\$password"' \
+  <<<"$PREPARE_USER_BODY" | cut -d: -f1)"
+[ -n "$PREPARE_ACTIVE_LINE" ] && [ -n "$PREPARE_PASSWORD_LINE" ] \
+  && [ "$PREPARE_ACTIVE_LINE" -lt "$PREPARE_PASSWORD_LINE" ] || \
+  fail "准备 dbdog 用户没有先确认生效认证为 MD5 code=5、再提交正确密码 probe"
 MAIN_BODY="$(awk '/^main\(\)/ { scan=1 } scan { print }' "$INSTALL_SCRIPT")"
 PREFLIGHT_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'preflight_gaussdb_clients' | head -1 | cut -d: -f1)"
 CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  cutover$' | head -1 | cut -d: -f1)"
@@ -498,12 +569,12 @@ run_fake_gauss_action() { # <preflight|active-auth|ensure-user>
   ' bash "$INSTALL_SCRIPT" "$PREFLIGHT_ROOT" "$1"
 }
 
-assert_password_probe_precedes_active_md5() {
+assert_active_md5_precedes_password_probe() {
   local password_line active_line
   password_line="$(grep -n -m1 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" | cut -d: -f1)"
   active_line="$(grep -n -m1 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" | cut -d: -f1)"
-  [ -n "$password_line" ] && [ -n "$active_line" ] && [ "$password_line" -lt "$active_line" ] || \
-    fail "准备 dbdog 用户没有先验证真实正确密码、再验证当前生效 MD5 认证"
+  [ -n "$password_line" ] && [ -n "$active_line" ] && [ "$active_line" -lt "$password_line" ] || \
+    fail "准备 dbdog 用户没有先验证当前生效 MD5 code=5、再提交真实正确密码"
 }
 
 PREFLIGHT_OUTPUT="$(run_fake_gauss_action preflight)" || fail "模拟 gsql 精确预检失败"
@@ -511,6 +582,24 @@ printf '%s\n' "$PREFLIGHT_OUTPUT" | grep -Fqx 'PREFLIGHT=ok' || fail "合法认�
 grep -Fq "PGHOST=$PREFLIGHT_ROOT/socket" "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 PGHOST"
 grep -Fq "LD_LIBRARY_PATH=$PREFLIGHT_ROOT/lib:$PREFLIGHT_ROOT/lib/libsimsearch" \
   "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 LD_LIBRARY_PATH"
+grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "已有监控用户的 mutation 前预检没有验证当前生效 MD5 code=5"
+if grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls"; then
+  fail "只读预检错误提交了数据库密码"
+fi
+
+# 不存在的角色可能收到服务端防用户名枚举用的模拟 SASL challenge；新用户必须等
+# mode=1 下创建出真实 verifier 后再判断 code=5，不能在只读预检阶段误拒。
+printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
+touch "$PREFLIGHT_ROOT/bin/reject-active-md5"
+: >"$PREFLIGHT_ROOT/bin/calls"
+run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/fresh-user-preflight.out" 2>&1 || \
+  fail "全新监控用户被创建前的模拟认证 challenge 错误阻塞"
+if grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls"; then
+  fail "全新监控用户在 verifier 创建前被错误执行生效认证探测"
+fi
+rm -f -- "$PREFLIGHT_ROOT/bin/reject-active-md5"
+printf '1\n' >"$PREFLIGHT_ROOT/bin/exists"
 : >"$PREFLIGHT_ROOT/bin/calls"
 run_fake_gauss_action active-auth >/dev/null || fail "AuthenticationRequest code=5 主动握手探测失败"
 grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
@@ -522,6 +611,11 @@ touch "$PREFLIGHT_ROOT/bin/reject-active-md5"
 if run_fake_gauss_action active-auth >"$PREFLIGHT_ROOT/active-auth-rejected.out" 2>&1; then
   fail "非 MD5 的生效认证握手被错误接受"
 fi
+grep -Fq '不是 MD5' "$PREFLIGHT_ROOT/active-auth-rejected.out" || \
+  fail "非 MD5 认证失败没有明确指出生效认证类型不兼容"
+if grep -Eq '密码|摘要' "$PREFLIGHT_ROOT/active-auth-rejected.out"; then
+  fail "非 MD5 认证失败被错误归类为密码/摘要问题"
+fi
 rm -f -- "$PREFLIGHT_ROOT/bin/reject-active-md5"
 
 rm -f -- "$PREFLIGHT_ROOT/bin/stdin.sql" "$PREFLIGHT_ROOT/bin/reject-password"
@@ -529,8 +623,8 @@ rm -f -- "$PREFLIGHT_ROOT/bin/stdin.sql" "$PREFLIGHT_ROOT/bin/reject-password"
 run_fake_gauss_action ensure-user >/dev/null || fail "已有用户的保存密码真实 TCP 探测失败"
 grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" || fail "内嵌 psycopg 密码验收没有执行"
 grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
-  fail "已有用户正确密码探测后没有核对当前生效 MD5 认证"
-assert_password_probe_precedes_active_md5
+  fail "已有用户密码探测前没有核对当前生效 MD5 认证"
+assert_active_md5_precedes_password_probe
 grep -Fq ' 15432 postgres' "$PREFLIGHT_ROOT/bin/calls" || \
   fail "内嵌 psycopg 验收没有使用目标实例 TCP 端口"
 grep -Fqx 'ALTER USER dbdog WITH MONADMIN;' "$PREFLIGHT_ROOT/bin/stdin.sql" || \
@@ -543,6 +637,12 @@ touch "$PREFLIGHT_ROOT/bin/reject-password"
 rm -f -- "$PREFLIGHT_ROOT/bin/stdin.sql"
 if run_fake_gauss_action ensure-user >"$PREFLIGHT_ROOT/existing-password-rejected.out" 2>&1; then
   fail "已有用户保存密码被拒绝时安装器没有 fail closed"
+fi
+grep -Eq '(code=5|生效 MD5 challenge).*(密码|摘要|verifier)|(密码|摘要|verifier).*(code=5|MD5 challenge)' \
+  "$PREFLIGHT_ROOT/existing-password-rejected.out" || \
+  fail "MD5 code=5 后的登录拒绝没有明确归类为密码/摘要问题"
+if grep -Fq '不是 MD5' "$PREFLIGHT_ROOT/existing-password-rejected.out"; then
+  fail "MD5 code=5 后的密码/摘要失败被错误归类为非 MD5"
 fi
 if [ -f "$PREFLIGHT_ROOT/bin/stdin.sql" ] \
   && grep -Eq 'ALTER[[:space:]]+USER.*PASSWORD' "$PREFLIGHT_ROOT/bin/stdin.sql"; then
@@ -558,8 +658,8 @@ grep -Eq "^CREATE USER dbdog WITH MONADMIN PASSWORD '[^']+';$" \
 grep -Fq 'correct-password-probe' "$PREFLIGHT_ROOT/bin/calls" || \
   fail "首创 dbdog 用户后没有执行真实 TCP 驱动探测"
 grep -Fq 'active-md5-probe' "$PREFLIGHT_ROOT/bin/calls" || \
-  fail "首创 dbdog 用户正确密码探测后没有核对当前生效 MD5 认证"
-assert_password_probe_precedes_active_md5
+  fail "首创 dbdog 用户密码探测前没有核对当前生效 MD5 认证"
+assert_active_md5_precedes_password_probe
 printf '1\n' >"$PREFLIGHT_ROOT/bin/exists"
 
 for rejected_mode in 0 2 3 4; do
@@ -576,30 +676,38 @@ printf '1\n' >"$PREFLIGHT_ROOT/bin/mode"
 printf '%s\n' \
   'host all dbdog 127.0.0.1/32 md5' \
   'local all dbdog trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/local-trust.out" 2>&1; then
-  fail "预检错误接受了 dbdog local trust 规则"
-fi
+run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/local-trust.out" 2>&1 || \
+  fail "精确 TCP MD5 之后、与运行端点无关的 local trust 被错误拒绝"
 
 printf '%s\n' \
   'host all dbdog 127.0.0.1/32 md5' \
   'host all dbdog 127.0.0.1/32 trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/host-trust.out" 2>&1; then
-  fail "预检错误接受了 dbdog host trust 规则"
-fi
+run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/host-trust.out" 2>&1 || \
+  fail "精确 TCP MD5 之后不会生效的 host trust 被静态扫描错误拒绝"
 
 printf '%s\n' \
   'host all dbdog 127.0.0.1/32 md5' \
   'host all all 127.0.0.1/32 trust' >"$PREFLIGHT_ROOT/pg_hba.conf"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/broad-trust.out" 2>&1; then
-  fail "预检错误接受了实际覆盖 dbdog 的 all-user trust 规则"
+run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/broad-trust-after.out" 2>&1 || \
+  fail "精确 TCP MD5 之后不会生效的 all-user trust 被静态扫描错误拒绝"
+
+# 静态文件中即使存在精确 MD5，前面的宽泛 trust 仍会先匹配；真实握手才是
+# include/顺序解析后的最终事实。fake-python 的拒绝标记模拟服务端返回非 code=5。
+printf '%s\n' \
+  'host all all 127.0.0.1/32 trust' \
+  'host all dbdog 127.0.0.1/32 md5' >"$PREFLIGHT_ROOT/pg_hba.conf"
+touch "$PREFLIGHT_ROOT/bin/reject-active-md5"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/broad-trust-before.out" 2>&1; then
+  fail "预检错误接受了被前置宽泛规则覆盖的精确 MD5"
 fi
+rm -f -- "$PREFLIGHT_ROOT/bin/reject-active-md5"
 
 printf '# missing exact dbdog rule\nhost all all 127.0.0.1/32 md5\n' \
   >"$PREFLIGHT_ROOT/pg_hba.conf"
 if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/missing-md5.out" 2>&1; then
   fail "预检错误接受了缺少精确 dbdog TCP MD5 规则的 HBA"
 fi
-pass "只读前置合同与正确密码 probe 之外，再以最小 StartupMessage 验证生效认证为 MD5 code=5"
+pass "先用最小 StartupMessage 验证 MD5 code=5，再提交正确密码并区分失败类型"
 
 if [ -f "$RELEASE_DIR/../dbdog-agent-core/gaussdb/datadog_checks/gaussdb/connection_pool.py" ]; then
   grep -Fq 'ConnectionPool' \
@@ -668,6 +776,14 @@ write_fake_agent_version() { # <binary 自报版本>
   cat >"$VERSION_RUNTIME/bin/agent/agent" <<EOF
 #!/bin/sh
 [ "\${1:-}" = version ] || exit 64
+runtime_tree="\${0%/bin/agent/agent}"
+expected_ld="\$runtime_tree/embedded/lib"
+[ ! -d "\$runtime_tree/embedded/lib64" ] || expected_ld="\$expected_ld:\$runtime_tree/embedded/lib64"
+if [ "\${LD_LIBRARY_PATH-}" != "\$expected_ld" ]; then
+  printf 'unexpected runtime LD_LIBRARY_PATH: expected=%s actual=%s\n' \
+    "\$expected_ld" "\${LD_LIBRARY_PATH-<unset>}" >&2
+  exit 65
+fi
 printf '%s\n' 'Agent $1 - Commit: 4c39489b8c - Serialization version: v5.0.198 - Go version: go1.26.4'
 EOF
   chmod 0755 "$VERSION_RUNTIME/bin/agent/agent"
@@ -731,7 +847,7 @@ printf '%s\n' "$VERSION_EXPECTED" >"$VERSION_RUNTIME/.dbdog-release-version"
 printf '%s\n' "$VERSION_ARTIFACT_SHA" >"$VERSION_RUNTIME/.dbdog-artifact-sha256"
 
 run_version_contract() { # <validate|prepare>
-  AGENT_RUNTIME_DIR="$VERSION_RUNTIME" AGENT_RUN_DIR="$VERSION_RUNTIME/run" \
+  LD_LIBRARY_PATH=/evil AGENT_RUNTIME_DIR="$VERSION_RUNTIME" AGENT_RUN_DIR="$VERSION_RUNTIME/run" \
     DBDOG_TIMEOUT_BIN="$FAKE_BIN/timeout" PATH="$VERSION_FAKE_BIN:$PATH" \
     bash -c '
       source "$1"
@@ -755,7 +871,10 @@ expect_version_contract_failure() { # <说明> <validate|prepare>
   fi
 }
 
-run_version_contract validate || fail "合法 Agent runtime 版本合同被拒绝"
+run_version_contract validate || fail "合法 Agent runtime 版本合同被拒绝或继承了宿主动态库路径"
+mkdir -p "$VERSION_RUNTIME/embedded/lib64"
+run_version_contract validate || \
+  fail "Agent version 最小环境没有在存在时追加候选 runtime 的 embedded/lib64"
 SKIP_OUTPUT="$(run_version_contract prepare)" || fail "SHA 一致的合法 runtime 无法安全跳过"
 case "$SKIP_OUTPUT" in *'RUNTIME_CHANGED=0'*) ;; *) fail "合法 SHA-skip 没有保留 runtime" ;; esac
 
@@ -797,6 +916,6 @@ mv "$VERSION_WORK/version-manifest-json.good" "$VERSION_RUNTIME/version-manifest
 PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 [ "$(printf '%s\n' "$PREPARE_BODY" | grep -c 'validate_runtime_tree')" -eq 2 ] || \
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
-pass "staging 与 SHA-skip 均精确绑定版本/产物 identity、binary version 和三层 provenance/manifest"
+pass "staging 与 SHA-skip 精确绑定版本身份，且 Agent version 只加载候选 runtime 私有库"
 
-printf 'ALL PASS: 17 agent install contract groups\n'
+printf 'ALL PASS: 18 agent install contract groups\n'
