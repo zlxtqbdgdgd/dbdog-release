@@ -189,8 +189,10 @@ bash -c '
 ' bash "$SCRIPTS_DIR/agent-install.sh" "$HBA_TEST_ROOT" || \
   fail "HBA 标记校验或稀疏实例回滚合同失败"
 grep -Fq 'legacy_trust' "$SCRIPTS_DIR/agent-install.sh" || fail "没有自动迁移旧本机 dbdog trust HBA"
+grep -Fq 'print "local all dbdog trust"' "$SCRIPTS_DIR/agent-install.sh" || \
+  fail "安装器没有交付受管 Unix socket local trust HBA"
 grep -Fq 'install-hba-recovery.' "$SCRIPTS_DIR/agent-install.sh" || fail "HBA 恢复失败未持久化恢复材料"
-pass "HBA 改写拒绝残缺标记、迁移旧 trust，并按真实实例下标可靠回滚"
+pass "HBA 改写拒绝残缺标记、迁移旧 TCP trust、交付 socket 规则并按真实实例下标可靠回滚"
 
 CONF="$TEST_ROOT/rendered"
 UNITS="$TEST_ROOT/units"
@@ -222,6 +224,8 @@ grep -Fq 'service_monitoring_config:' "$CONF/system-probe.yaml" || fail "USM 未
 grep -Fq 'dbm: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "GaussDB DBM 未启用"
 grep -Fq 'collect_activity_metrics: true' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "activity 未启用"
 grep -Fq "password: 'pa''ss: #1'" "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "密码 YAML 转义错误"
+grep -Fq "host: '$SOCKET_DIR'" "$CONF/conf.d/gaussdb.d/conf.yaml" || \
+  fail "探测到的 Unix socket 没有落入 GaussDB 配置"
 grep -Fq 'port: 15432' "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "探测端口没有落入配置"
 grep -Fq "$GAUSSLOG/gs_log/*/gaussdb-*.log" "$CONF/conf.d/gaussdb.d/conf.yaml" || \
   fail "探测日志路径没有落入配置"
@@ -255,7 +259,7 @@ if grep -Eq 'host[[:space:]]+all[[:space:]]+dbdog.*[[:space:]]trust([[:space:]]|
   fail "安装器绝不能给 MONADMIN 安装 trust HBA"
 fi
 grep -Fq "SHOW password_encryption_type;" "$INSTALL_SCRIPT" || fail "没有预检认证模式"
-grep -Fq 'host all dbdog 127.0.0.1/32 md5' "$INSTALL_SCRIPT" || fail "缺少受管本机 MD5 HBA"
+grep -Fq 'local all dbdog trust' "$INSTALL_SCRIPT" || fail "缺少受管 Unix socket HBA"
 grep -Fq 'ALTER USER dbdog WITH MONADMIN;' "$INSTALL_SCRIPT" || fail "升级仍会重复设置未变化密码"
 grep -Fq 'install-configcheck.log' "$INSTALL_SCRIPT" || fail "configcheck 诊断没有持久化"
 grep -Fq 'for ((i=1; i<=8; i++))' "$INSTALL_SCRIPT" || fail "configcheck 没有 readiness 重试"
@@ -276,7 +280,7 @@ RECOVERED="$(PATH="$FAKE_BIN:$PATH" bash -c '
   latest_failed_agent_config
 ' bash "$INSTALL_SCRIPT" "$RECOVERY_BASE")" || fail "无法发现首装失败配置"
 [ "$RECOVERED" = "$RECOVERY_BASE.failed.20260727020202" ] || fail "没有选择最新首装失败配置"
-pass "认证模式 fail closed、禁止 trust、密码幂等与 configcheck 持久诊断均有流程门禁"
+pass "认证模式 fail closed、禁止 TCP trust、密码幂等与 configcheck 持久诊断均有流程门禁"
 
 PREFLIGHT_ROOT="$TEST_ROOT/preflight"
 mkdir -p "$PREFLIGHT_ROOT/bin" "$PREFLIGHT_ROOT/work"
@@ -308,6 +312,7 @@ EOF
 cat >"$PREFLIGHT_ROOT/bin/fake-python" <<'EOF'
 #!/bin/sh
 # agent_monitor_password_works 的合同替身：消费 stdin 中的 Python 程序并模拟成功登录。
+printf 'python-args=%s\n' "$*" >>"$(dirname "$0")/calls"
 cat >/dev/null
 exit 0
 EOF
@@ -354,20 +359,27 @@ grep -Fq "PGHOST=$PREFLIGHT_ROOT/socket" "$PREFLIGHT_ROOT/bin/calls" || fail "gs
 grep -Fq "LD_LIBRARY_PATH=$PREFLIGHT_ROOT/lib:$PREFLIGHT_ROOT/lib/libsimsearch" \
   "$PREFLIGHT_ROOT/bin/calls" || fail "gsql 未收到实例 LD_LIBRARY_PATH"
 run_fake_gauss_action set-password >/dev/null || fail "未变化密码的幂等路径失败"
+grep -Fq "$PREFLIGHT_ROOT/socket 15432 postgres" "$PREFLIGHT_ROOT/bin/calls" || \
+  fail "内嵌 psycopg 验收没有使用目标实例 Unix socket"
 grep -Fqx 'ALTER USER dbdog WITH MONADMIN;' "$PREFLIGHT_ROOT/bin/stdin.sql" || \
   fail "升级仍然重置了未变化的 GaussDB 密码"
 if grep -Fq PASSWORD "$PREFLIGHT_ROOT/bin/stdin.sql"; then fail "幂等升级 SQL 仍含 PASSWORD"; fi
 
 printf '2\n' >"$PREFLIGHT_ROOT/bin/mode"
 printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode2.out" 2>&1; then
+run_fake_gauss_action preflight >/dev/null || \
+  fail "Unix socket 认证路径错误拒绝了 GaussDB 默认 SHA256 密码模式"
+
+printf '3\n' >"$PREFLIGHT_ROOT/bin/mode"
+printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode3.out" 2>&1; then
   fail "需要创建/重置密码时错误接受了不兼容的认证模式"
 fi
-if ! grep -Fq 'password_encryption_type=2' "$PREFLIGHT_ROOT/mode2.out"; then
-  sed -n '1,80p' "$PREFLIGHT_ROOT/mode2.out" >&2
+if ! grep -Fq 'password_encryption_type=3' "$PREFLIGHT_ROOT/mode3.out"; then
+  sed -n '1,80p' "$PREFLIGHT_ROOT/mode3.out" >&2
   fail "认证不兼容没有给出清晰且非侵入式的错误"
 fi
-pass "真实命令形态完成 ldd/version/SELECT 预检、环境传递、幂等密码与认证 fail-closed"
+pass "真实命令形态完成 ldd/version/SELECT 预检、socket 环境传递、幂等密码与认证 fail-closed"
 
 if [ -f "$RELEASE_DIR/../dbdog-agent-core/gaussdb/datadog_checks/gaussdb/connection_pool.py" ]; then
   grep -Fq 'ConnectionPool' \

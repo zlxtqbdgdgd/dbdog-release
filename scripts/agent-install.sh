@@ -500,18 +500,18 @@ preflight_gaussdb_clients() {
     AGENT_GAUSS_PID_PASSWORD_MODES+=("$mode")
     AGENT_GAUSS_PID_USER_EXISTS+=("$exists")
 
-    # 已有用户稍后会先经受管 MD5 HBA 做真实密码探测，成功则不重置；只有
-    # 确定需要 CREATE 时，才在任何数据库 mutation 前要求兼容加密模式。
+    # 运行期通过受管 local trust + Unix socket 连接，密码加密模式不参与
+    # Agent 认证；这里只拒绝数据库返回未知值，避免错误环境下继续 mutation。
     if [ "$exists" = 0 ]; then
       case "$mode" in
-        0 | 1) ;;
-        *) die "当前 password_encryption_type=${mode}，无法为标准 libpq 生成 MD5 兼容凭证；请由 GaussDB DBA 评估后调整为 1 并重跑。安装器不会修改生产库全局参数" ;;
+        0 | 1 | 2) ;;
+        *) die "当前 password_encryption_type=${mode} 不在安装器支持范围 0/1/2；拒绝创建监控用户" ;;
       esac
     fi
   done
 }
 
-agent_monitor_password_works() { # 0=有效，2=明确密码拒绝，1=探测基础设施失败
+agent_monitor_password_works() { # 经受管 Unix socket 验证监控连接；0=有效，其他=失败
   local index="$1" password="$2" python password_file out attempt rc success=0 rejected=0
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
   python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
@@ -525,7 +525,8 @@ agent_monitor_password_works() { # 0=有效，2=明确密码拒绝，1=探测基
     rc=0
     "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
       PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_PORTS[$index]}" \
+      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_HOSTS[$index]}" \
+      "${AGENT_GAUSS_PID_PORTS[$index]}" \
       "$DBDOG_GAUSSDB_DBNAME" >"$out" 2>&1 <<'PY' || rc=$?
 import pathlib
 import sys
@@ -535,9 +536,9 @@ import psycopg
 password = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 try:
     with psycopg.connect(
-        host="127.0.0.1",
-        port=int(sys.argv[2]),
-        dbname=sys.argv[3],
+        host=sys.argv[2],
+        port=int(sys.argv[3]),
+        dbname=sys.argv[4],
         user="dbdog",
         password=password,
         connect_timeout=5,
@@ -557,8 +558,8 @@ except Exception as error:
 PY
     case "$rc" in
       0)
-      success=1
-      break
+        success=1
+        break
         ;;
       42)
         rejected=1
@@ -587,7 +588,7 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
       | awk 'NF { value=$0 } END { print value }')" || return 1
     case "$exists" in
       0)
-        case "$mode" in 0 | 1) ;; *) return 1 ;; esac
+        case "$mode" in 0 | 1 | 2) ;; *) return 1 ;; esac
         printf "CREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
         reset=1
         ;;
@@ -602,7 +603,7 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
             printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
             ;;
           2)
-          case "$mode" in 0 | 1) ;;
+          case "$mode" in 0 | 1 | 2) ;;
             *) warn "实例索引 ${index} 的现有 dbdog 密码不可用，且 password_encryption_type=${mode} 不允许安全重置"; return 1 ;;
           esac
           printf "ALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
@@ -680,7 +681,7 @@ agent_install_hba_rule() { # <进程索引>
   [ "$unsafe_trust" -eq 0 ] || \
     die "GaussDB HBA 含非受管的 dbdog trust 规则；拒绝在不明确其作用域时继续: $hba"
   [ "$legacy_trust" -eq 0 ] || \
-    warn "发现旧安装遗留的本机 dbdog trust HBA，将在同一事务中替换为受管 md5"
+    warn "发现旧安装遗留的本机 dbdog TCP trust HBA，将在同一事务中替换为受管 Unix socket 规则"
   backup="$WORK_DIR/pg_hba.$index.before"
   applied="$WORK_DIR/pg_hba.$index.applied"
   cp -a -- "$hba" "$backup"
@@ -689,7 +690,7 @@ agent_install_hba_rule() { # <进程索引>
     BEGIN {
       skip=0
       print "# dbdog-release BEGIN: local Agent monitor"
-      print "host all dbdog 127.0.0.1/32 md5"
+      print "local all dbdog trust"
       print "# dbdog-release END: local Agent monitor"
     }
     $0 == "# dbdog-release BEGIN: local Agent monitor" { skip=1; next }
@@ -757,7 +758,8 @@ bootstrap_gaussdb_monitoring() {
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
   log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与兼容视图（仅安装阶段）..."
-  # 先落受管 MD5 规则，才能用将交付给 integration 的凭证做真实登录探测；
+  # 先落受管 Unix socket local trust 规则，再用内嵌 psycopg 经相同 socket
+  # 做真实登录探测；这避开 GaussDB 私有 SHA256 SASL 与标准 libpq 的不兼容。
   # 后续任一步失败，EXIT trap 会用内容比对后的备份恢复 HBA。
   for ((index=0; index<count; index++)); do agent_install_hba_rule "$index"; done
   agent_set_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \

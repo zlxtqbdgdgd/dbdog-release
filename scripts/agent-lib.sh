@@ -703,7 +703,7 @@ EOF
 
 agent_render_checks() { # <conf.d> <db_password> <db_user> <db_name> <env>
   local confd="$1" password="$2" username="$3" dbname="$4" env_name="$5"
-  local check dir port glob
+  local check dir port host glob index count
   for check in cpu disk file_handle io load memory network system_core uptime; do
     dir="$confd/$check.d"
     install -d -m 0755 "$dir"
@@ -731,13 +731,20 @@ init_config:
 
 instances:
 EOF
-  for port in "${AGENT_GAUSS_PORTS[@]}"; do
+  count="${#AGENT_GAUSS_PID_PORTS[@]}"
+  [ "$count" -eq "${#AGENT_GAUSS_PID_HOSTS[@]}" ] || \
+    die "GaussDB 实例端口与 Unix socket 探测结果数量不一致"
+  [ "$count" -gt 0 ] || die "没有可渲染的 GaussDB 运行实例"
+  for ((index=0; index<count; index++)); do
+    port="${AGENT_GAUSS_PID_PORTS[$index]}"
+    host="${AGENT_GAUSS_PID_HOSTS[$index]}"
+    [ -n "$host" ] || die "GaussDB 实例索引 ${index} 缺少 Unix socket 目录"
     cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
     database_identifier:
       template: '\$resolved_hostname:\$port'
     service: gaussdb
-    host: 127.0.0.1
+    host: $(agent_yaml_quote "$host")
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "$password")
