@@ -60,7 +60,7 @@ printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=37001\0PGHOST=%s\0LD_LIBRARY_PATH=%s/l
   >"$PROC/$PID/environ"
 printf 'Name:\tgaussdb\nUid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$PROC/$PID/status"
 printf '4242\n%s\n0\n15432\n%s\n' "$DATA" "$SOCKET_DIR" >"$DATA/postmaster.pid"
-# 模拟同实例的另一个 gaussdb backend；安装事实必须按端口去重。
+# 模拟同实例的另一个 gaussdb backend；安装事实必须按 socket+端口去重。
 mkdir -p "$PROC/4243"
 printf 'gaussdb\n' >"$PROC/4243/comm"
 printf 'gaussdb: dbdog postgres 127.0.0.1\0' >"$PROC/4243/cmdline"
@@ -84,6 +84,43 @@ esac
   fail "没有从进程 GAUSSLOG 生成日志 glob"
 [ "$AGENT_GAUSS_DEPLOYMENT" = centralized ] || fail "单实例拓扑推断错误"
 pass "优先从目标机运行进程发现 GaussDB 端口、socket、客户端库与日志"
+
+# 运行进程中残留 TCP PGHOST 时必须回退到 postmaster.pid 的真实 socket，
+# 但操作者显式指定 TCP host 时必须 fail closed，不能悄悄继续走 SASL。
+cp "$PROC/$PID/environ" "$TEST_ROOT/main-environ"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGPORT=37001\0PGHOST=127.0.0.1\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$GAUSSLOG" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
+  >"$PROC/$PID/environ"
+agent_detect_gaussdb
+[ "${AGENT_GAUSS_PID_HOSTS[*]}" = "$SOCKET_DIR" ] || fail "TCP PGHOST 没有回退到运行态 Unix socket"
+cp "$TEST_ROOT/main-environ" "$PROC/$PID/environ"
+if (DBDOG_GAUSSDB_PGHOST=127.0.0.1; export DBDOG_GAUSSDB_PGHOST; agent_detect_gaussdb) \
+  >"$TEST_ROOT/tcp-pghost.out" 2>&1; then
+  fail "显式 TCP PGHOST 被错误接受"
+fi
+grep -Fq '必须是绝对 Unix socket 目录' "$TEST_ROOT/tcp-pghost.out" || \
+  fail "显式 TCP PGHOST 没有给出清晰错误"
+pass "自动 TCP PGHOST 回退到 socket，显式 TCP PGHOST fail closed"
+
+# 两个实例可以监听相同端口但使用不同 socket 目录，不能只按端口合并。
+DATA2="$TEST_ROOT/gauss/data2"
+SOCKET_DIR2="$TEST_ROOT/gauss/socket2"
+mkdir -p "$PROC/4244" "$DATA2" "$SOCKET_DIR2"
+printf 'gaussdb\n' >"$PROC/4244/comm"
+printf '%s\0-D\0%s\0' "$GAUSSHOME/bin/gaussdb" "$DATA2" >"$PROC/4244/cmdline"
+printf 'GAUSSHOME=%s\0GAUSSLOG=%s\0PGDATA=%s\0PGPORT=15432\0PGHOST=%s\0LD_LIBRARY_PATH=%s/lib:%s/lib/libsimsearch\0PATH=%s/bin:/usr/bin:/bin\0' \
+  "$GAUSSHOME" "$GAUSSLOG" "$DATA2" "$SOCKET_DIR2" "$GAUSSHOME" "$GAUSSHOME" "$GAUSSHOME" \
+  >"$PROC/4244/environ"
+cp "$PROC/$PID/status" "$PROC/4244/status"
+printf '4244\n%s\n0\n15432\n%s\n' "$DATA2" "$SOCKET_DIR2" >"$DATA2/postmaster.pid"
+agent_detect_gaussdb
+[ "${#AGENT_GAUSS_PID_PORTS[@]}" -eq 2 ] || fail "相同端口的不同 socket 实例被错误合并"
+case " ${AGENT_GAUSS_PID_HOSTS[*]} " in *" $SOCKET_DIR "*) ;; *) fail "第一实例 socket 映射错误" ;; esac
+case " ${AGENT_GAUSS_PID_HOSTS[*]} " in *" $SOCKET_DIR2 "*) ;; *) fail "第二实例 socket 映射错误" ;; esac
+[ "$AGENT_GAUSS_DEPLOYMENT" = distributed ] || fail "相同端口多 socket 的拓扑推断错误"
+mv "$PROC/4244" "$TEST_ROOT/ignored-proc-4244"
+agent_detect_gaussdb
+pass "按 socket+端口区分同端口 GaussDB 实例"
 
 DBDOG_GAUSSDB_PGHOST="$TEST_ROOT/explicit-socket"
 DBDOG_GAUSSDB_LD_LIBRARY_PATH="$TEST_ROOT/explicit-lib"
@@ -311,7 +348,7 @@ esac
 EOF
 cat >"$PREFLIGHT_ROOT/bin/fake-python" <<'EOF'
 #!/bin/sh
-# agent_monitor_password_works 的合同替身：消费 stdin 中的 Python 程序并模拟成功登录。
+# agent_monitor_connection_works 的合同替身：消费 stdin 中的 Python 程序并模拟成功登录。
 printf 'python-args=%s\n' "$*" >>"$(dirname "$0")/calls"
 cat >/dev/null
 exit 0
@@ -372,11 +409,16 @@ run_fake_gauss_action preflight >/dev/null || \
 
 printf '3\n' >"$PREFLIGHT_ROOT/bin/mode"
 printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
-if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode3.out" 2>&1; then
+run_fake_gauss_action preflight >/dev/null || \
+  fail "Unix socket trust 路径错误拒绝了 GaussDB SM3 密码模式"
+
+printf '4\n' >"$PREFLIGHT_ROOT/bin/mode"
+printf '0\n' >"$PREFLIGHT_ROOT/bin/exists"
+if run_fake_gauss_action preflight >"$PREFLIGHT_ROOT/mode4.out" 2>&1; then
   fail "需要创建/重置密码时错误接受了不兼容的认证模式"
 fi
-if ! grep -Fq 'password_encryption_type=3' "$PREFLIGHT_ROOT/mode3.out"; then
-  sed -n '1,80p' "$PREFLIGHT_ROOT/mode3.out" >&2
+if ! grep -Fq 'password_encryption_type=4' "$PREFLIGHT_ROOT/mode4.out"; then
+  sed -n '1,80p' "$PREFLIGHT_ROOT/mode4.out" >&2
   fail "认证不兼容没有给出清晰且非侵入式的错误"
 fi
 pass "真实命令形态完成 ldd/version/SELECT 预检、socket 环境传递、幂等密码与认证 fail-closed"

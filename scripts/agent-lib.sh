@@ -358,6 +358,10 @@ agent_detect_gaussdb() {
   local map_index mapped explicit_env="${DBDOG_GAUSSDB_ENV_FILE:-}"
   local old_conf="${AGENT_EXISTING_GAUSS_CONFIG:-}"
   case "$explicit_env" in "" | /*) ;; *) die "DBDOG_GAUSSDB_ENV_FILE 必须是绝对路径" ;; esac
+  case "${DBDOG_GAUSSDB_PGHOST:-}" in
+    "" | /*) ;;
+    *) die "DBDOG_GAUSSDB_PGHOST 必须是绝对 Unix socket 目录，不能使用 TCP host" ;;
+  esac
   AGENT_GAUSS_PORTS=()
   AGENT_GAUSS_LOG_GLOBS=()
   AGENT_GAUSS_PID_PORTS=()
@@ -460,6 +464,9 @@ agent_detect_gaussdb() {
     agent_valid_port "$port" || die "无法从 gaussdb PID $pid 确定有效监听端口"
     agent_add_unique AGENT_GAUSS_PORTS "$port"
 
+    # 标准 libpq 与 GaussDB 私有 TCP SASL 不兼容。自动发现到 hostname/IP 时，
+    # 丢弃它并继续从 postmaster.pid 或监听 socket 事实中恢复本地目录。
+    case "$env_host" in /*) ;; *) env_host="" ;; esac
     if [ -z "$env_host" ] && [ -n "$data" ] && [ -r "$data/postmaster.pid" ]; then
       socket_dir="$(sed -n '5p' "$data/postmaster.pid" | awk '{$1=$1; print}')"
       [ -z "$socket_dir" ] || env_host="$socket_dir"
@@ -469,6 +476,10 @@ agent_detect_gaussdb() {
     [ -n "$owner" ] || die "无法从 gaussdb PID $pid 确定运行用户"
     [ -n "$env_host" ] || \
       die "无法发现 GaussDB 本地 socket；可显式设置 DBDOG_GAUSSDB_PGHOST"
+    case "$env_host" in
+      /*) ;;
+      *) die "发现的 GaussDB PGHOST 不是绝对 Unix socket 目录: $env_host" ;;
+    esac
 
     # 实际运行环境优先，并只追加当前安装中真实存在的标准相对目录。
     [ ! -d "$env_home/lib" ] || env_ld="$(agent_merge_path_lists "$env_ld" "$env_home/lib")"
@@ -480,11 +491,12 @@ agent_detect_gaussdb() {
     [ -x "$gsql" ] || gsql="$(agent_find_in_path "$env_path" gsql 2>/dev/null || true)"
     [ -n "$gsql" ] || die "目标 GaussDB 客户端环境中找不到可执行 gsql"
 
-    # GaussDB 可能让多个后端进程都使用 comm=gaussdb；安装事实按实际端口去重，
+    # GaussDB 可能让多个后端进程都使用 comm=gaussdb；安装事实按 socket+端口去重，
     # 不能把每个 backend 误当成一个数据库实例重复初始化。
     mapped=0
     for ((map_index=0; map_index<${#AGENT_GAUSS_PID_PORTS[@]}; map_index++)); do
       [ "${AGENT_GAUSS_PID_PORTS[$map_index]}" = "$port" ] || continue
+      [ "${AGENT_GAUSS_PID_HOSTS[$map_index]}" = "$env_host" ] || continue
       mapped=1
       [ -n "${AGENT_GAUSS_PID_DATA_DIRS[$map_index]}" ] || AGENT_GAUSS_PID_DATA_DIRS[map_index]="$data"
       [ -n "${AGENT_GAUSS_PID_HOMES[$map_index]}" ] || AGENT_GAUSS_PID_HOMES[map_index]="$env_home"
@@ -526,7 +538,7 @@ agent_detect_gaussdb() {
 
   AGENT_GAUSS_DEPLOYMENT="${DBDOG_GAUSSDB_DEPLOYMENT:-}"
   if [ -z "$AGENT_GAUSS_DEPLOYMENT" ]; then
-    if [ "${#AGENT_GAUSS_PORTS[@]}" -gt 1 ]; then
+    if [ "${#AGENT_GAUSS_PID_PORTS[@]}" -gt 1 ]; then
       AGENT_GAUSS_DEPLOYMENT=distributed
     else
       AGENT_GAUSS_DEPLOYMENT=centralized

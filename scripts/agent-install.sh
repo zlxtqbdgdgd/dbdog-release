@@ -504,14 +504,14 @@ preflight_gaussdb_clients() {
     # Agent 认证；这里只拒绝数据库返回未知值，避免错误环境下继续 mutation。
     if [ "$exists" = 0 ]; then
       case "$mode" in
-        0 | 1 | 2) ;;
-        *) die "当前 password_encryption_type=${mode} 不在安装器支持范围 0/1/2；拒绝创建监控用户" ;;
+        0 | 1 | 2 | 3) ;;
+        *) die "当前 password_encryption_type=${mode} 不在安装器支持范围 0/1/2/3；拒绝创建监控用户" ;;
       esac
     fi
   done
 }
 
-agent_monitor_password_works() { # 经受管 Unix socket 验证监控连接；0=有效，其他=失败
+agent_monitor_connection_works() { # 经受管 Unix socket 验证监控连接；0=有效，其他=失败
   local index="$1" password="$2" python password_file out attempt rc success=0 rejected=0
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
   python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
@@ -588,7 +588,7 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
       | awk 'NF { value=$0 } END { print value }')" || return 1
     case "$exists" in
       0)
-        case "$mode" in 0 | 1 | 2) ;; *) return 1 ;; esac
+        case "$mode" in 0 | 1 | 2 | 3) ;; *) return 1 ;; esac
         printf "CREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
         reset=1
         ;;
@@ -596,18 +596,18 @@ agent_set_gaussdb_password() { # <密码> [force]；所有发现实例上设置�
         password_status=2
         if [ "$force" != force ]; then
           password_status=0
-          agent_monitor_password_works "$index" "$password" || password_status=$?
+          agent_monitor_connection_works "$index" "$password" || password_status=$?
         fi
         case "$password_status" in
           0)
             printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
             ;;
           2)
-          case "$mode" in 0 | 1 | 2) ;;
-            *) warn "实例索引 ${index} 的现有 dbdog 密码不可用，且 password_encryption_type=${mode} 不允许安全重置"; return 1 ;;
-          esac
-          printf "ALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
-          reset=1
+            case "$mode" in 0 | 1 | 2 | 3) ;;
+              *) warn "实例索引 ${index} 的现有 dbdog 密码不可用，且 password_encryption_type=${mode} 不允许安全重置"; return 1 ;;
+            esac
+            printf "ALTER USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
+            reset=1
             ;;
           *)
             warn "实例索引 ${index} 无法可靠判定现有 dbdog 密码；拒绝把探测故障当作密码错误并重置"
