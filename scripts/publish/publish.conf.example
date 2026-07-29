@@ -1,16 +1,16 @@
 # 发布配置（复制为 publish.conf 填写；publish.conf 已 gitignore）
-# 构建机 ssh 目标（必填）。构建机 = 与内网鲲鹏 EulerOS 产物兼容的公网测试机。
-BUILD_HOST="z1@CHANGE-ME"
+# 构建机 ssh 目标（必填）。标准维护机在 ~/.ssh/config 中定义 dbdog-build。
+BUILD_HOST="dbdog-build"
 
 # 各源仓在本机的父目录（默认取 dbdog-release 的上一级，通常无需改）
 #SRC_ROOT="$HOME/Code/github.com/zlxtqbdgdgd"
 
 # 构建机上的目录
-REPO_ROOT="/home/z1/dbdog/repo"          # 各源仓在构建机上的 clone 父目录
-BUILD_WORK="/home/z1/dbdog-release-build" # 发布构建工作目录（自动创建）
+REPO_ROOT="/home/dbdog/repo"               # 各源仓在构建机上的 clone 父目录
+BUILD_WORK="/home/dbdog/dbdog-release-build" # 发布构建工作目录（自动创建）
 
 # 构建机上工具链 PATH 前缀（go / cargo / node 所在 bin 目录，冒号分隔）
-TOOL_PATH="/home/z1/dbdog/dev/go/bin:/home/z1/.cargo/bin"
+TOOL_PATH="/home/dbdog/tools/go/bin:/home/dbdog/tools/node/bin:/home/dbdog/.cargo/bin"
 
 # dbdog-agent 版本前缀和实际出货源码不接受本机配置覆盖。发布器只读取：
 #   $SRC_ROOT/dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv
@@ -18,9 +18,9 @@ TOOL_PATH="/home/z1/dbdog/dev/go/bin:/home/z1/.cargo/bin"
 # release.json 的 current_milestone 不是发布依据。
 
 # PostgreSQL 留空时从构建机 PATH 自动探测 pg_config。
-#PG_PREFIX="/usr/local/pgsql"   # PostgreSQL 安装前缀（bin/lib/share 的父目录）
+#PG_PREFIX="/home/dbdog/tools/pgsql" # PostgreSQL 安装前缀（bin/lib/share 的父目录）
 
 # ClickHouse 必须显式配置，不能从构建机 PATH 随机选择当前安装版本。
 # ClickHouse 必须指向已离线审计的原始 aarch64v80compat 自解压缓存；版本和 SHA 由
 # recipe 固定，普通 /usr/local/bin/clickhouse 或 master 更新后的文件会在执行前被拒绝。
-#CH_BIN="/home/z1/cache/clickhouse/clickhouse-26.8.1.184-aarch64v80compat.self-extracting"
+#CH_BIN="/home/dbdog/tools/clickhouse/bin/clickhouse"

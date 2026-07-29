@@ -305,6 +305,21 @@ fail closed。对应 manifest 文件名的 Agent tarball 可预置到目标机�
 
 ## 公网：发布（维护者）
 
+新会话先执行持久化预检；标准构建机只通过 `dbdog-build` SSH 别名访问，
+`dbdog-build-old` 仅用于回退核对：
+
+```bash
+cd ~/Code/github.com/zlxtqbdgdgd/dbdog-release
+test -f scripts/publish/publish.conf
+gh auth status
+source scripts/publish/publish.conf
+ssh -o BatchMode=yes "$BUILD_HOST" 'uname -m; nproc; test -d /home/dbdog/repo'
+```
+
+`scripts/publish/publish.conf` 是 gitignore 的本机环境配置；标准目录为 `/home/dbdog/repo`、
+`/home/dbdog/dbdog-release-build`，工具链位于 `/home/dbdog/tools` 与 `/home/dbdog/.cargo`。
+发布 Agent/Web/MCP 等模块必须串行。
+
 ```bash
 cp scripts/publish/publish.conf.example scripts/publish/publish.conf  # 首次：填 BUILD_HOST 等
 ./scripts/publish/publish.sh plan                # 看哪些模块有变更
@@ -315,6 +330,7 @@ cp scripts/publish/publish.conf.example scripts/publish/publish.conf  # 首次�
 
 构建在麒麟 V10 / aarch64 专职机完成。开发阶段每模块只保留 manifest 当前产物；发布脚本
 先推 main，再删除该模块旧资产。发布必须串行，清理会校验远端 HEAD、文件名与 SHA-256。
+自动化代理发布前还必须完整读取 [发布 Skill](.claude/skills/publish/SKILL.md)。
 
 设计说明见 [ADR 0001](docs/adr/0001-single-bucket-release-via-main.md)，术语见
 [CONTEXT.md](CONTEXT.md)。

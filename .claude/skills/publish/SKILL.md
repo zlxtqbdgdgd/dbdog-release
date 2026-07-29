@@ -1,26 +1,47 @@
 ---
 name: publish
-description: 公网侧一键发布：检测各源仓变更，ssh 构建机出包，上传产物桶，提交 manifest。用户说"发布"、"publish"、"发个版"时使用。
+description: 公网侧发布 dbdog 模块：检测源仓变更，经 aarch64 构建机出包，验证并上传 GitHub 产物桶，原子提交 manifest。用户要求“发布”“publish”“发版”“构建正式包”“清理旧产物”时使用。
 ---
 
 # dbdog 发布
 
-核心逻辑全在 `scripts/publish/publish.sh`，本 skill 只是驾驶它。
+核心逻辑全在 `scripts/publish/publish.sh`。不要手工修改 `manifest.tsv`、README 版本表或
+GitHub 资产来绕过脚本。
 
 ## 流程
 
-1. **前置检查**（第一次或报错时）：
-   - `scripts/publish/publish.conf` 存在（否则 `cp publish.conf.example publish.conf` 并让用户填 BUILD_HOST）；
-   - `gh auth status` 通过；`ssh <BUILD_HOST> true` 可达。
-2. **看变更**：`scripts/publish/publish.sh plan`，把结果表原样给用户看。
-3. **定范围**：与用户确认要发哪些模块、bump 级别（默认 patch；接口/行为有破坏性变化建议 minor/major）。三方件只在用户点名时发布。
-4. **执行**：`scripts/publish/publish.sh publish <模块...> --bump <级别> --yes`
-   （交互确认由你在第 3 步完成，脚本层直接 --yes。）
-5. **汇报**：发布了哪些模块、各自新版本号；提醒内网可 `check-upgrade.sh --pull` 升级。
+1. **读环境**：确认 `scripts/publish/publish.conf` 存在；缺失时从
+   `publish.conf.example` 复制。配置是本机私有文件，禁止提交。
+2. **做预检**：
+
+   ```bash
+   gh auth status
+   source scripts/publish/publish.conf
+   ssh -G "$BUILD_HOST" | grep -E '^(hostname|user|identityfile|identitiesonly) '
+   ssh -o BatchMode=yes "$BUILD_HOST" \
+     'uname -m; test -d /home/dbdog/repo; test -d /home/dbdog/dbdog-release-build'
+   ```
+
+   标准维护机的 `BUILD_HOST` 是 `dbdog-build`；`dbdog-build-old` 仅供回退核对，禁止用于新发布。
+3. **看变更**：运行 `./scripts/publish/publish.sh plan`，核对模块、当前版本、源码锚和目标版本。
+4. **定范围**：按用户要求确定模块与 bump；默认 patch。三方件只有用户点名才发布。
+5. **执行**：正式发布必须串行：
+
+   ```bash
+   ./scripts/publish/publish.sh publish <模块...> --bump <patch|minor|major> --yes
+   ```
+
+6. **闭环复核**：确认本地 HEAD 等于 `origin/main`，manifest/README 一致，GitHub 资产唯一，
+   其 size/digest 等于 manifest，并运行 `./scripts/publish/publish.sh prune` 确认无孤儿资产。
+7. **汇报**：列出模块、版本、发布提交、资产 SHA-256；提示内网走正常升级路径。
 
 ## 注意
 
-- 脚本会因"本地 HEAD 未推送到 origin/main"而拒绝发布——这是特性，提醒用户先 push。
-- agent（dbdog-agent）配方尚未跑通，发布它会明确报错；不要试图绕过，引导用户看配方文件头的一次性准备清单。
-- 桶膨胀时问一句是否 `publish.sh prune --keep 3`（试运行后再 --yes）。
-- 发布失败中途退出时，manifest 未提交的改动用 `git -C . status` 检查，不留半成品提交。
+- 源仓出货提交必须已经进入各自 `origin/main`；发布器会 fail closed。
+- Agent 正式配方已经跑通。版本和 Agent/Core 源码锚只认
+  `dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv`，不要用 `publish.conf` 覆盖。
+- Agent、Web、MCP 等正式发布不要并发执行；它们会修改同一份 manifest 和 `main`。
+- 清理先运行 `./scripts/publish/publish.sh prune`，确认目标后再加 `--yes`。
+- 网络错误发生在上传或 push 之后时，不要盲目重跑：先核对 GitHub 同名资产、远端 `main` 和
+  manifest，避免错误递增版本。构建前失败且三者均未变化时才安全重跑原命令。
+- 中途退出时检查 `git status`。保留用户已有的 `.codex/`、`bugs/` 和无关工作树修改。
