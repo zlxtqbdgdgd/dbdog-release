@@ -699,6 +699,11 @@ run_path: $(agent_yaml_quote "$AGENT_RUN_DIR")
 log_file: $(agent_yaml_quote "$AGENT_LOG_DIR/agent.log")
 log_level: info
 
+# dbdog 使用自己的私有摄入端；不要向 Datadog 公网 instrumentation intake
+# 发送 Agent/APM 遥测，避免隔离内网中的持续 DNS 错误和无效重试。
+agent_telemetry:
+  enabled: false
+
 cmd_port: 5101
 expvar_port: 5102
 GUI_port: -1
@@ -718,6 +723,8 @@ apm_config:
   receiver_port: 5126
   apm_dd_url: $(agent_yaml_quote "$server")
   log_file: $(agent_yaml_quote "$AGENT_LOG_DIR/trace-agent.log")
+  telemetry:
+    enabled: false
 ol_proxy_config:
   enabled: true
   dd_url: $(agent_yaml_quote "$server/api/v1/lineage")

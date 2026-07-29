@@ -330,6 +330,12 @@ for expected in \
   'inventories_enabled: true'; do
   grep -Fq "$expected" "$CONF/datadog.yaml" || fail "缺少已验证功能开关: $expected"
 done
+[ "$(grep -c 'enabled: false' "$CONF/datadog.yaml")" -ge 3 ] || \
+  fail "私有部署没有显式关闭 Agent/APM 公网遥测"
+grep -A1 '^agent_telemetry:' "$CONF/datadog.yaml" | grep -Fq 'enabled: false' || \
+  fail "Agent instrumentation telemetry 仍会访问 Datadog 公网"
+grep -A6 '^apm_config:' "$CONF/datadog.yaml" | grep -A1 'telemetry:' | \
+  grep -Fq 'enabled: false' || fail "APM telemetry 仍会访问 Datadog 公网"
 grep -Fq 'network_config:' "$CONF/system-probe.yaml" || fail "NPM 未启用"
 grep -Fq 'service_monitoring_config:' "$CONF/system-probe.yaml" || fail "USM 未启用"
 if grep -Eq '^[[:space:]]+enable_event_stream:[[:space:]]*false([[:space:]]|$)' \
@@ -474,7 +480,9 @@ SUCCESS_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'INSTALL_SUCCEEDED=1' | hea
   fail "main 没有让新旧 runtime 共用唯一的验收后 marker 写入路径"
 VERIFY_BODY="$(awk '/^start_and_verify\(\)/ { scan=1 } /^main\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 STABILITY_BODY="$(awk '/^verify_agent_stability_window\(\)/ { scan=1 } /^append_agent_validation_logs\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
-SNAPSHOT_BODY="$(awk '/^capture_agent_unit_snapshot\(\)/ { scan=1 } /^verify_agent_stability_window\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+STABILITY_COMPARE_BODY="$(awk '/^compare_agent_stability_snapshots\(\)/ { scan=1 } /^verify_agent_stability_window\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+SNAPSHOT_BODY="$(awk '/^capture_agent_unit_snapshot\(\)/ { scan=1 } /^compare_agent_stability_snapshots\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+READINESS_BODY="$(awk '/^wait_agent_readiness\(\)/ { scan=1 } /^capture_agent_unit_snapshot\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 VALIDATION_LOG_BODY="$(awk '/^append_agent_validation_logs\(\)/ { scan=1 } /^agent_validation_has_known_runtime_error\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 LOG_CURSOR_BODY="$(awk '/^agent_log_file_identity\(\)/ { scan=1 } /^append_agent_validation_logs\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
 # shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
@@ -482,16 +490,45 @@ grep -Fq 'verify_agent_stability_window "$baseline_snapshot" "$active_snapshot" 
   fail "升级验收没有进入跨采集周期稳定窗口"
 grep -Fq 'elapsed" -lt 35' <<<"$STABILITY_BODY" || \
   fail "稳定窗口没有覆盖至少两个完整 15s 采集周期并保留余量"
-for field in MainPID NRestarts require_pid; do
+for field in MainPID NRestarts InvocationID require_generation; do
   grep -Fq "$field" <<<"$SNAPSHOT_BODY" || fail "unit snapshot 缺少字段: $field"
 done
 for field in baseline_pid active_pid after_pid baseline_restarts active_restarts \
-  after_restarts restart_delta; do
-  grep -Fq "$field" <<<"$STABILITY_BODY" || fail "稳定窗口缺少全程进程/重启证据字段: $field"
+  after_restarts startup_restarts window_restart_delta baseline_invocation \
+  active_invocation after_invocation; do
+  grep -Fq "$field" <<<"$STABILITY_COMPARE_BODY" || \
+    fail "稳定窗口缺少新生命周期进程/重启证据字段: $field"
 done
 # shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
-grep -Fq '"$restart_delta" -ne 0' <<<"$STABILITY_BODY" || \
-  fail "稳定窗口没有按启动前基线比较 NRestarts 增量"
+grep -Fq 'window_restart_delta=$((after_restarts - active_restarts))' \
+  <<<"$STABILITY_COMPARE_BODY" || fail "稳定窗口没有在新服务生命周期内比较 NRestarts"
+if grep -Fq 'after_restarts - baseline_restarts' <<<"$STABILITY_COMPARE_BODY"; then
+  fail "稳定窗口仍跨新旧服务生命周期直接相减 NRestarts"
+fi
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq '"$active_restarts" -ne 0' <<<"$STABILITY_COMPARE_BODY" || \
+  fail "稳定窗口会漏掉 all-active 快照前的本次启动重启"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq '"$active_invocation" != "$after_invocation"' <<<"$STABILITY_COMPARE_BODY" || \
+  fail "稳定窗口没有用 InvocationID 检测服务代际变化"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'start_seconds=$SECONDS' <<<"$READINESS_BODY" || \
+  fail "Agent readiness 没有按真实墙钟截止时间等待"
+grep -Fq 'readiness attempt' <<<"$READINESS_BODY" || \
+  fail "Agent readiness 没有逐次保留时间、耗时和退出码"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'wait_agent_readiness "$health_out" "$AGENT_HEALTH_TIMEOUT_SECONDS"' \
+  <<<"$VERIFY_BODY" || fail "安装验收没有使用可配置的真实 readiness 截止时间"
+grep -Fq 'AGENT_HEALTH_TIMEOUT_SECONDS=90' "$INSTALL_SCRIPT" || \
+  fail "Agent readiness 默认截止时间不是 90 秒"
+grep -Fq 'DBDOG_AGENT_HEALTH_TIMEOUT 必须在 30–600 秒之间' "$INSTALL_SCRIPT" || \
+  fail "Agent readiness 外部覆盖没有安全上下界"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'append_agent_validation_logs "$validation_start" "$agent_log_cursor" "$validation_out"' \
+  <<<"$VERIFY_BODY" || fail "readiness 失败没有保留本次启动后的有界日志差量"
+if grep -Fq 'for ((i=1; i<=10; i++))' <<<"$VERIFY_BODY"; then
+  fail "安装验收仍用十次快速调用冒充 60 秒 readiness 等待"
+fi
 BASELINE_LINE="$(grep -n -m1 'capture_agent_unit_snapshot.*baseline_snapshot.* 0' <<<"$VERIFY_BODY" | cut -d: -f1)"
 LOG_CURSOR_LINE="$(grep -n -m1 'capture_agent_log_cursor.*agent_log_cursor' <<<"$VERIFY_BODY" | cut -d: -f1)"
 FIRST_START_LINE="$(grep -n -m1 'systemctl start dbdog-agent-sysprobe' <<<"$VERIFY_BODY" | cut -d: -f1)"
@@ -503,10 +540,116 @@ CONFIGCHECK_LINE="$(grep -n -m1 'bin/agent/agent.*configcheck' <<<"$VERIFY_BODY"
   fail "agent.log dev/inode/size 游标没有在任一 Agent unit 启动前记录"
 [ -n "$ACTIVE_LINE" ] && [ "$ACTIVE_LINE" -lt "$CONFIGCHECK_LINE" ] || \
   fail "四 unit active 后 PID snapshot 没有覆盖后续全部验收"
-# baseline_restarts 可以是 109 等任意历史值；只有 final-baseline 的 delta 非零才失败。
-if grep -Eq 'baseline_restarts.*(==|!=|-eq|-ne)[[:space:]]*0' <<<"$STABILITY_BODY"; then
+# baseline_restarts 可以是 109 等任意历史值，但只能作为诊断字段。
+if grep -Eq 'after_restarts[[:space:]]*-[[:space:]]*baseline_restarts' \
+  <<<"$STABILITY_COMPARE_BODY"; then
   fail "稳定窗口错误地把升级前已有的历史 NRestarts 当成当前失败"
 fi
+
+HEALTH_TEST_ROOT="$TEST_ROOT/readiness-behavior"
+HEALTH_FAKE_BIN="$HEALTH_TEST_ROOT/bin"
+HEALTH_STATE_FILE="$HEALTH_TEST_ROOT/attempts"
+HEALTH_DIAGNOSTIC="$HEALTH_TEST_ROOT/readiness.log"
+mkdir -p "$HEALTH_FAKE_BIN" "$AGENT_RUNTIME_DIR/bin/agent" "$AGENT_CONFIG_DIR" \
+  "$HEALTH_TEST_ROOT/work"
+cat >"$HEALTH_FAKE_BIN/systemctl" <<'EOF'
+#!/bin/sh
+case "$1" in
+  is-active) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+cat >"$AGENT_RUNTIME_DIR/bin/agent/agent" <<'EOF'
+#!/bin/sh
+count=0
+[ ! -f "$HEALTH_STATE_FILE" ] || count=$(cat "$HEALTH_STATE_FILE")
+count=$((count + 1))
+printf '%s\n' "$count" >"$HEALTH_STATE_FILE"
+if [ "$count" -ge "$HEALTH_SUCCEED_AFTER" ]; then
+  printf '%s\n' 'Agent health: PASS' '=== 16 healthy components ===' 'forwarder, healthcheck'
+  exit 0
+fi
+printf '%s\n' 'Agent health: FAIL' '=== 2 healthy components ===' 'healthcheck, healthcheck' \
+  '=== 14 unhealthy components ===' 'forwarder, aggregator'
+exit 1
+EOF
+chmod 0755 "$HEALTH_FAKE_BIN/systemctl" "$AGENT_RUNTIME_DIR/bin/agent/agent"
+
+run_readiness_behavior() { # <deadline> <success attempt> <result output>
+  local deadline="$1" succeed_after="$2" result="$3"
+  rm -f -- "$HEALTH_STATE_FILE" "$HEALTH_DIAGNOSTIC" "$result"
+  set +e
+  PATH="$HEALTH_FAKE_BIN:$FAKE_BIN:$PATH" \
+    HEALTH_STATE_FILE="$HEALTH_STATE_FILE" HEALTH_SUCCEED_AFTER="$succeed_after" \
+    bash -c '
+      source "$1"
+      trap - EXIT INT TERM HUP
+      WORK_DIR="$2"
+      AGENT_UNITS=(dbdog-agent.service)
+      set +e
+      wait_agent_readiness "$3" "$4"
+      rc=$?
+      set -e
+      printf "rc=%s attempts=%s elapsed=%s reason=%s\n" "$rc" \
+        "$AGENT_HEALTH_WAIT_ATTEMPTS" "$AGENT_HEALTH_WAIT_ELAPSED" \
+        "$AGENT_HEALTH_WAIT_REASON"
+      exit "$rc"
+    ' bash "$INSTALL_SCRIPT" "$HEALTH_TEST_ROOT/work" "$HEALTH_DIAGNOSTIC" \
+      "$deadline" >"$result" 2>&1
+  local rc=$?
+  set -e
+  return "$rc"
+}
+
+READY_RESULT="$HEALTH_TEST_ROOT/ready.result"
+run_readiness_behavior 15 2 "$READY_RESULT" || fail "readiness 在截止时间内转绿仍被拒绝"
+grep -Fq 'rc=0 attempts=2' "$READY_RESULT" || fail "readiness 没有保留真实尝试次数"
+grep -Fq 'reason=ready' "$READY_RESULT" || fail "readiness 成功原因没有记录"
+[ "$(grep -c '^===== readiness attempt' "$HEALTH_DIAGNOSTIC")" -eq 2 ] || \
+  fail "readiness 诊断覆盖了前一次失败输出"
+grep -Fq 'Agent health: FAIL' "$HEALTH_DIAGNOSTIC" || fail "readiness 缺失失败尝试"
+grep -Fq 'Agent health: PASS' "$HEALTH_DIAGNOSTIC" || fail "readiness 缺失成功尝试"
+
+DEADLINE_RESULT="$HEALTH_TEST_ROOT/deadline.result"
+if run_readiness_behavior 1 99 "$DEADLINE_RESULT"; then
+  fail "readiness 超过真实截止时间后仍被接受"
+fi
+grep -Fq 'rc=1 attempts=1' "$DEADLINE_RESULT" || fail "readiness 截止时间没有限制快速失败重试"
+grep -Fq 'reason=deadline-exceeded' "$DEADLINE_RESULT" || fail "readiness 截止原因没有记录"
+pass "readiness 使用真实截止时间并逐次保留失败到成功的完整证据"
+
+STABILITY_TEST_ROOT="$TEST_ROOT/stability-generations"
+mkdir -p "$STABILITY_TEST_ROOT"
+printf 'dbdog-agent-sysprobe.service\t0\t32\t-\n' >"$STABILITY_TEST_ROOT/baseline"
+printf 'dbdog-agent-sysprobe.service\t501235\t0\taaaa\n' >"$STABILITY_TEST_ROOT/active"
+printf 'dbdog-agent-sysprobe.service\t501235\t0\taaaa\n' >"$STABILITY_TEST_ROOT/after"
+run_stability_compare() { # <active> <after> <output>
+  bash -c '
+    source "$1"
+    trap - EXIT INT TERM HUP
+    compare_agent_stability_snapshots "$2" "$3" "$4" "$5"
+  ' bash "$INSTALL_SCRIPT" "$STABILITY_TEST_ROOT/baseline" "$1" "$2" "$3"
+}
+STABLE_OUTPUT="$STABILITY_TEST_ROOT/stable.out"
+: >"$STABLE_OUTPUT"
+run_stability_compare "$STABILITY_TEST_ROOT/active" "$STABILITY_TEST_ROOT/after" \
+  "$STABLE_OUTPUT" || fail "历史 NRestarts=32 错误污染了新生命周期稳定性"
+grep -Fq 'baseline_restarts=32' "$STABLE_OUTPUT" || fail "稳定性诊断没有保留历史重启计数"
+grep -Fq 'window_restart_delta=0' "$STABLE_OUTPUT" || fail "稳定性诊断没有记录新生命周期差值"
+
+printf 'dbdog-agent-sysprobe.service\t501235\t1\tbbbb\n' >"$STABILITY_TEST_ROOT/active-restarted"
+printf 'dbdog-agent-sysprobe.service\t501235\t1\tbbbb\n' >"$STABILITY_TEST_ROOT/after-restarted"
+if run_stability_compare "$STABILITY_TEST_ROOT/active-restarted" \
+  "$STABILITY_TEST_ROOT/after-restarted" "$STABILITY_TEST_ROOT/startup-restart.out"; then
+  fail "all-active 快照前发生的本次启动重启被漏过"
+fi
+printf 'dbdog-agent-sysprobe.service\t501236\t1\tcccc\n' >"$STABILITY_TEST_ROOT/after-window-restart"
+if run_stability_compare "$STABILITY_TEST_ROOT/active" \
+  "$STABILITY_TEST_ROOT/after-window-restart" "$STABILITY_TEST_ROOT/window-restart.out"; then
+  fail "稳定窗口内 PID/InvocationID/NRestarts 变化被漏过"
+fi
+pass "稳定性比较隔离历史计数，并拒绝新生命周期启动早期及窗口内重启"
+
 # shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
 grep -Fq -- '--since "@$since"' <<<"$VALIDATION_LOG_BODY" || \
   fail "升级验收 journal 没有从本次启动时刻开始截取"
@@ -1128,4 +1271,4 @@ PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
 pass "staging 与 SHA-skip 精确绑定版本身份，且 Agent version 只加载候选 runtime 私有库"
 
-printf 'ALL PASS: 21 agent install contract groups\n'
+printf 'ALL PASS: 23 agent install contract groups\n'

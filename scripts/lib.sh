@@ -460,7 +460,7 @@ download_artifact() { # download_artifact <artifact> <sha256> → stdout 本地�
     # --proxy，保留其大小写优先级、协议选择和本机绕过规则。
     if ! curl "${curl_args[@]}" -o "$dest.part" "$BUCKET_URL/$artifact"; then
       rm -f "$dest.part"
-      die "下载失败: ${artifact}（代理用 https_proxy/HTTPS_PROXY，重签 CA 用 CURL_CA_BUNDLE；需放行 github.com 与 release-assets.githubusercontent.com）"
+      die "下载失败: ${artifact}（代理用 https_proxy/HTTPS_PROXY，重签 CA 优先用 CURL_CA_BUNDLE；仅临时排障可显式 CURL_INSECURE=1；需放行 github.com 与 release-assets.githubusercontent.com）"
     fi
     if ! sha256_verify "$dest.part" "$sha"; then
       rm -f "$dest.part"

@@ -28,6 +28,10 @@ HAD_CONFIG=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
 INSTALLER_CONTRACT_SHA256=""
+AGENT_HEALTH_TIMEOUT_SECONDS=90
+AGENT_HEALTH_WAIT_ATTEMPTS=0
+AGENT_HEALTH_WAIT_ELAPSED=0
+AGENT_HEALTH_WAIT_REASON="not-started"
 
 usage() {
   cat <<'EOF'
@@ -49,6 +53,7 @@ usage() {
   DBDOG_GAUSSDB_DEPLOYMENT               centralized 或 distributed
   DBDOG_ENV                              默认 prod
   DBDOG_AGENT_HOSTNAME                   默认 hostname -s
+  DBDOG_AGENT_HEALTH_TIMEOUT             全组件 readiness 截止时间，默认 90 秒（30–600）
 
 也可通过统一入口 sudo ./scripts/upgrade.sh dbdog-agent 调用；已落地的 server URL、
 API key 和数据库密码默认保留。
@@ -157,6 +162,14 @@ require_root_host() {
     command -v "$command" >/dev/null 2>&1 || die "缺少安装依赖命令: $command"
   done
   [ -x /usr/bin/timeout ] || die "systemd 单元需要 /usr/bin/timeout"
+}
+
+configure_agent_health_timeout() {
+  local requested="${DBDOG_AGENT_HEALTH_TIMEOUT:-90}"
+  case "$requested" in '' | *[!0-9]*) die "DBDOG_AGENT_HEALTH_TIMEOUT 必须是 30–600 的整数秒" ;; esac
+  [ "$requested" -ge 30 ] && [ "$requested" -le 600 ] || \
+    die "DBDOG_AGENT_HEALTH_TIMEOUT 必须在 30–600 秒之间"
+  AGENT_HEALTH_TIMEOUT_SECONDS="$requested"
 }
 
 prompt_value() { # <变量名> <提示> <是否隐藏:0|1>
@@ -1013,25 +1026,133 @@ wait_socket() { # <path> <seconds>
   return 1
 }
 
-capture_agent_unit_snapshot() { # <output> <require nonzero pid: 0|1>; unit<TAB>MainPID<TAB>NRestarts
-  local output="$1" require_pid="$2" unit state pid restarts
+wait_agent_readiness() { # <diagnostic output> <wall-clock deadline seconds>
+  local output="$1" limit="$2" attempt_output start_seconds elapsed remaining
+  local command_timeout rc sleep_seconds unit
+  attempt_output="$(mktemp "$WORK_DIR/agent-health-attempt.XXXXXX")"
+  : >"$output"
+  chmod 0600 "$output"
+  start_seconds=$SECONDS
+  AGENT_HEALTH_WAIT_ATTEMPTS=0
+  AGENT_HEALTH_WAIT_ELAPSED=0
+  AGENT_HEALTH_WAIT_REASON="deadline-exceeded"
+
+  while :; do
+    elapsed=$((SECONDS - start_seconds))
+    [ "$elapsed" -lt "$limit" ] || break
+    remaining=$((limit - elapsed))
+    command_timeout=5
+    [ "$remaining" -ge "$command_timeout" ] || command_timeout="$remaining"
+    AGENT_HEALTH_WAIT_ATTEMPTS=$((AGENT_HEALTH_WAIT_ATTEMPTS + 1))
+    : >"$attempt_output"
+    if timeout "$command_timeout" "$AGENT_RUNTIME_DIR/bin/agent/agent" health \
+      -c "$AGENT_CONFIG_DIR" >"$attempt_output" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    elapsed=$((SECONDS - start_seconds))
+    AGENT_HEALTH_WAIT_ELAPSED="$elapsed"
+    printf '\n===== readiness attempt %s at %s elapsed=%ss command_timeout=%ss rc=%s =====\n' \
+      "$AGENT_HEALTH_WAIT_ATTEMPTS" "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+      "$elapsed" "$command_timeout" "$rc" >>"$output"
+    cat "$attempt_output" >>"$output"
+    if [ "$rc" -eq 0 ] && \
+      grep -Eq '^=== [1-9][0-9]* healthy components ===$' "$attempt_output"; then
+      AGENT_HEALTH_WAIT_REASON="ready"
+      return 0
+    fi
+
+    for unit in "${AGENT_UNITS[@]}"; do
+      if ! systemctl is-active --quiet "$unit"; then
+        AGENT_HEALTH_WAIT_REASON="unit-inactive:$unit"
+        printf '\nunit became inactive while waiting for readiness: %s\n' "$unit" >>"$output"
+        return 1
+      fi
+    done
+
+    elapsed=$((SECONDS - start_seconds))
+    AGENT_HEALTH_WAIT_ELAPSED="$elapsed"
+    [ "$elapsed" -lt "$limit" ] || break
+    remaining=$((limit - elapsed))
+    sleep_seconds=2
+    [ "$remaining" -ge "$sleep_seconds" ] || sleep_seconds="$remaining"
+    [ "$sleep_seconds" -gt 0 ] || break
+    sleep "$sleep_seconds"
+  done
+  AGENT_HEALTH_WAIT_ELAPSED=$((SECONDS - start_seconds))
+  return 1
+}
+
+capture_agent_unit_snapshot() { # <output> <require live generation: 0|1>; unit<TAB>MainPID<TAB>NRestarts<TAB>InvocationID
+  local output="$1" require_generation="$2" unit state pid restarts invocation
   : >"$output"
   chmod 0600 "$output"
   for unit in "${AGENT_UNITS[@]}"; do
-    state="$(systemctl show "$unit" --no-pager -p MainPID -p NRestarts)" || return 1
+    state="$(systemctl show "$unit" --no-pager -p MainPID -p NRestarts -p InvocationID)" || return 1
     pid="$(awk -F= '$1 == "MainPID" { print $2; exit }' <<<"$state")"
     restarts="$(awk -F= '$1 == "NRestarts" { print $2; exit }' <<<"$state")"
+    invocation="$(awk -F= '$1 == "InvocationID" { print $2; exit }' <<<"$state")"
+    [ -n "$invocation" ] || invocation=-
     case "$pid" in '' | *[!0-9]*) return 1 ;; esac
-    if [ "$require_pid" -eq 1 ] && [ "$pid" -eq 0 ]; then return 1; fi
+    if [ "$require_generation" -eq 1 ] && { [ "$pid" -eq 0 ] || [ "$invocation" = - ]; }; then
+      return 1
+    fi
     case "$restarts" in '' | *[!0-9]*) return 1 ;; esac
-    printf '%s\t%s\t%s\n' "$unit" "$pid" "$restarts" >>"$output"
+    case "$invocation" in *[!0-9A-Fa-f-]*) return 1 ;; esac
+    printf '%s\t%s\t%s\t%s\n' "$unit" "$pid" "$restarts" "$invocation" >>"$output"
   done
 }
 
+compare_agent_stability_snapshots() { # <pre-start> <all-active> <after> <diagnostic output>
+  local baseline="$1" active="$2" after="$3" output="$4"
+  local unit active_pid active_restarts active_invocation line
+  local baseline_pid baseline_restarts baseline_invocation
+  local after_pid after_restarts after_invocation window_restart_delta unstable=0
+  local baseline_count active_count after_count
+  baseline_count="$(awk 'END { print NR + 0 }' "$baseline")"
+  active_count="$(awk 'END { print NR + 0 }' "$active")"
+  after_count="$(awk 'END { print NR + 0 }' "$after")"
+  printf 'snapshot_counts baseline=%s active=%s after=%s\n' \
+    "$baseline_count" "$active_count" "$after_count" >>"$output"
+  if [ "$active_count" -eq 0 ] || [ "$baseline_count" -ne "$active_count" ] || \
+    [ "$after_count" -ne "$active_count" ]; then
+    return 1
+  fi
+  while IFS=$'\t' read -r unit active_pid active_restarts active_invocation; do
+    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$baseline")"
+    if [ -z "$line" ]; then
+      printf 'unit missing from pre-start snapshot: %s\n' "$unit" >>"$output"
+      unstable=1
+      continue
+    fi
+    IFS=$'\t' read -r _ baseline_pid baseline_restarts baseline_invocation <<<"$line"
+    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$after")"
+    if [ -z "$line" ]; then
+      printf 'unit missing from final snapshot: %s\n' "$unit" >>"$output"
+      unstable=1
+      continue
+    fi
+    IFS=$'\t' read -r _ after_pid after_restarts after_invocation <<<"$line"
+    window_restart_delta=$((after_restarts - active_restarts))
+    printf '%s baseline_pid=%s active_pid=%s after_pid=%s baseline_restarts=%s active_restarts=%s after_restarts=%s startup_restarts=%s window_restart_delta=%s baseline_invocation=%s active_invocation=%s after_invocation=%s\n' \
+      "$unit" "$baseline_pid" "$active_pid" "$after_pid" "$baseline_restarts" \
+      "$active_restarts" "$after_restarts" "$active_restarts" "$window_restart_delta" \
+      "$baseline_invocation" "$active_invocation" "$after_invocation" >>"$output"
+    # cutover 会先完整停止全部私有 unit，因此 all-active 时的非零 NRestarts
+    # 属于本次新生命周期；升级前历史计数只作诊断，绝不能跨生命周期相减。
+    if [ "$active_restarts" -ne 0 ] || [ "$window_restart_delta" -ne 0 ] || \
+      [ "$active_pid" != "$after_pid" ] || \
+      [ "$active_invocation" != "$after_invocation" ]; then
+      unstable=1
+    fi
+  done <"$active"
+  [ "$unstable" -eq 0 ]
+}
+
 verify_agent_stability_window() { # <pre-start snapshot> <all-active snapshot> <diagnostic output>
-  local baseline="$1" active="$2" output="$3" after unit baseline_pid baseline_restarts
-  local line active_pid active_restarts after_pid after_restarts restart_delta
-  local elapsed=0 step=5 unstable=0
+  local baseline="$1" active="$2" output="$3" after unit
+  local elapsed=0 step=5
   after="$(mktemp "$WORK_DIR/agent-units-after.XXXXXX")"
   : >"$output"
   chmod 0600 "$output"
@@ -1049,33 +1170,10 @@ verify_agent_stability_window() { # <pre-start snapshot> <all-active snapshot> <
     done
   done
   capture_agent_unit_snapshot "$after" 1 || {
-    printf 'cannot capture final MainPID/NRestarts snapshot\n' >>"$output"
+    printf 'cannot capture final MainPID/NRestarts/InvocationID snapshot\n' >>"$output"
     return 1
   }
-  while IFS=$'\t' read -r unit baseline_pid baseline_restarts; do
-    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$after")"
-    if [ -z "$line" ]; then
-      printf 'unit missing from final snapshot: %s\n' "$unit" >>"$output"
-      unstable=1
-      continue
-    fi
-    IFS=$'\t' read -r _ after_pid after_restarts <<<"$line"
-    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$active")"
-    if [ -z "$line" ]; then
-      printf 'unit missing from all-active snapshot: %s\n' "$unit" >>"$output"
-      unstable=1
-      continue
-    fi
-    IFS=$'\t' read -r _ active_pid active_restarts <<<"$line"
-    restart_delta=$((after_restarts - baseline_restarts))
-    printf '%s baseline_pid=%s active_pid=%s after_pid=%s baseline_restarts=%s active_restarts=%s after_restarts=%s restart_delta=%s\n' \
-      "$unit" "$baseline_pid" "$active_pid" "$after_pid" "$baseline_restarts" \
-      "$active_restarts" "$after_restarts" "$restart_delta" >>"$output"
-    if [ "$active_pid" != "$after_pid" ] || [ "$restart_delta" -ne 0 ]; then
-      unstable=1
-    fi
-  done <"$baseline"
-  [ "$unstable" -eq 0 ]
+  compare_agent_stability_snapshots "$baseline" "$active" "$after" "$output"
 }
 
 agent_log_file_identity() { # <regular non-symlink file>; dev<TAB>inode<TAB>size
@@ -1330,29 +1428,17 @@ start_and_verify() {
     die "Agent 配置校验失败；详情留在 ${config_out}，本次安装会回滚"
   fi
 
-  ready=0
-  : >"$health_out"
-  chmod 0600 "$health_out"
-  for ((i=1; i<=10; i++)); do
-    if timeout 5 "$AGENT_RUNTIME_DIR/bin/agent/agent" health \
-      -c "$AGENT_CONFIG_DIR" >"$health_out" 2>&1 && \
-      grep -Eq '^=== [1-9][0-9]* healthy components ===$' "$health_out"; then
-      ready=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$ready" -ne 1 ]; then
-    systemctl status dbdog-agent.service --no-pager >>"$health_out" 2>&1 || true
-    if command -v journalctl >/dev/null 2>&1; then
-      printf '\n===== recent dbdog-agent journal =====\n' >>"$health_out"
-      journalctl -u dbdog-agent.service -n 200 --no-pager >>"$health_out" 2>&1 || true
-    fi
+  if ! wait_agent_readiness "$health_out" "$AGENT_HEALTH_TIMEOUT_SECONDS"; then
+    printf '\n===== systemd units after readiness failure =====\n' >>"$health_out"
+    for unit in "${AGENT_UNITS[@]}"; do
+      systemctl status "$unit" --no-pager >>"$health_out" 2>&1 || true
+    done
+    append_agent_validation_logs "$validation_start" "$agent_log_cursor" "$validation_out" || true
     if grep -Eqi '(^|[^0-9])413([^0-9]|$)|payload too large|单批事件数超过上限|请求体超过摄入上限' \
-      "$health_out"; then
+      "$health_out" "$validation_out"; then
       die "Agent forwarder 收到摄入端 413；延长等待不能修复协议拒绝，请升级/检查 dbdog-server 摄入合同。详情留在 ${health_out}"
     fi
-    die "Agent forwarder health 未在 60 秒内就绪；详情留在 ${health_out}"
+    die "Agent readiness 未在 ${AGENT_HEALTH_TIMEOUT_SECONDS} 秒内全部就绪（reason=${AGENT_HEALTH_WAIT_REASON}, attempts=${AGENT_HEALTH_WAIT_ATTEMPTS}, elapsed=${AGENT_HEALTH_WAIT_ELAPSED}s）；查看 ${health_out} 和 ${validation_out}，本次安装会回滚"
   fi
 
   : >"$check_out"
@@ -1382,6 +1468,7 @@ main() {
   esac
   [ "$#" -le 1 ] || { usage >&2; die "参数过多"; }
   require_root_host
+  configure_agent_health_timeout
   WORK_DIR="$(mktemp -d /tmp/dbdog-agent-install.XXXXXX)"
   INSTALLER_CONTRACT_SHA256="$(agent_installer_contract_fingerprint "$SCRIPT_DIR")" || \
     die "无法计算 dbdog-agent 安装器合约指纹"

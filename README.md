@@ -246,10 +246,14 @@ GaussDB。可在创建前判定的 mode、字面 HBA 和已有账号认证问题
 - 默认开启现网已验证的 GaussDB DBM（query metrics/samples、schema、settings、activity、
   database size）、数据库日志、主机指标、Live Processes/Process Discovery、NPM/USM、
   APM/OpenLineage、Remote Config 与 inventories/metadata；同时把全部 intake/EvP endpoint
-  指向本次输入的 dbdog-server；
+  指向本次输入的 dbdog-server，并关闭只会访问 Datadog 公网端点的 Agent/APM telemetry；
 - 以 root 安装并启用 Core、Trace、Process、System Probe 四个私有服务；只有 API key
-  validate、Remote Config trust root、四服务 active、forwarder health 和真实
+  validate、Remote Config trust root、四服务 active、全部 Agent readiness 组件和真实
   `agent check gaussdb` 全部通过才返回成功，否则恢复上一套 runtime/config/unit。
+
+readiness 使用真实墙钟截止时间而不是固定调用次数，默认等待 90 秒，并把每次尝试的时间、
+耗时、退出码和组件列表追加到安装诊断。极慢主机可在 30–600 秒内显式设置
+`DBDOG_AGENT_HEALTH_TIMEOUT`；这只延长严格的全组件验收，不会把单次 forwarder 202 当作整机健康。
 
 Agent 包里的 `datadog-gaussdb` 版本（以 `manifest.tsv` 对应 Agent 产物为准）是
 **GaussDB integration 自身的版本**，不是被监控 GaussDB 的服务端版本，
@@ -295,11 +299,13 @@ fail closed。对应 manifest 文件名的 Agent tarball 可预置到目标机�
 显式设置 `DBDOG_GAUSSDB_ENV_FILE`、`DBDOG_GAUSSDB_PGHOST`（仅安装期 gsql 管理 socket）、
 `DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、`DBDOG_GAUSSDB_LOG_GLOB`、
 `DBDOG_GAUSSDB_DEPLOYMENT`、`DBDOG_ENV` 或 `DBDOG_AGENT_HOSTNAME` 只用于自动发现无法表达的
-特殊部署。正常集中式安装不需要这些覆盖。上一套 runtime/config 会保留在安装输出给出的
+特殊部署；`DBDOG_AGENT_HEALTH_TIMEOUT` 只用于有证据表明冷启动超过默认 90 秒的机器。正常集中式
+安装不需要这些覆盖。上一套 runtime/config 会保留在安装输出给出的
 `.dbdog-agent-before-*` 目录。安装验收诊断均为 root `0600` 文件：配置检查在
-`/var/log/dbdog-agent/install-configcheck.log`，forwarder health 在
+`/var/log/dbdog-agent/install-configcheck.log`，逐次 readiness 在
 `/var/log/dbdog-agent/install-agent-health.log`，数据库 check 在
-`/var/log/dbdog-agent/install-gaussdb-check.log`，跨两个采集周期的 PID/NRestarts 证据在
+`/var/log/dbdog-agent/install-gaussdb-check.log`，跨两个采集周期的新生命周期
+PID/NRestarts/InvocationID 证据在
 `/var/log/dbdog-agent/install-agent-stability.log`，本次启动后的有界日志差量在
 `/var/log/dbdog-agent/install-agent-validation.log`。
 
