@@ -325,7 +325,7 @@ b5dcfa966d6ebe9bcb080c392b8544693ec3c3bf5c88e49275da7c093b427b50  omnibus-kylin-
 f696515133a97de9784b86c91324f2447f11022e7da90d823d3348a645c2208f  external sources/python/gaussdb/612be7bea397c87df707489599c02ed623c29631/datadog_gaussdb-1.0.1-py3-none-any.whl
 4c050fe90b1a0306afbec43e6a2fcd5c9d3151a8dfc33175cfe7a5a7c772b8be  finalize-agent-runtime-v3.sh
 4b5fdce057bacca6dfde0d5352255cf8760ab57458aae29024dd2f917036ad77  run-finalize-agent-runtime-v3.sh
-a81ddff3c5ed61a096c8988b824d3e575c598181dd199cccef6b3bfd51e46fa2  ../recipes/dbdog-agent.sh
+82935b65a102f7b6bf386861e38e28961cb6139e727a96ae5039b3d6f8765dcb  ../recipes/dbdog-agent.sh
 ```
 
 ## Historical v10-v13 SHA-256 values

@@ -26,6 +26,19 @@ file_sha256() {
   fi
 }
 
+stdin_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{ print $1 }'
+  else
+    shasum -a 256 | awk '{ print $1 }'
+  fi
+}
+
+recipe_readonly() {
+  local name=$1
+  sed -n "s/^readonly ${name}=//p" "$RECIPE"
+}
+
 bash -n "$FINALIZER"
 bash -n "$WRAPPER"
 bash -n "$RUNNER"
@@ -136,8 +149,23 @@ grep -Fq 'SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073c
   "$RECIPE" || fail "recipe does not pin the sealed 69-output manifest"
 grep -Fq 'RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=523d7976ae926c5769252b0011f8b7e57dfa72d981d835154ec8772df5401191' \
   "$RECIPE" || fail "recipe does not pin the release-relocated output manifest"
-grep -Fq 'RELEASE_SYSTEM_PROBE_MARKER_SHA256=bc45c1f60977b7dff248494af7fb6607011aed837372819b5bab8f0c438e457f' \
+grep -Fq 'RELEASE_SYSTEM_PROBE_MARKER_SHA256=809ad5d381c703641173e0e6b1d1b94ec9d4660e55cc398d4266f4129e961549' \
   "$RECIPE" || fail "recipe does not pin the release handoff marker"
+release_agent_sha=$(recipe_readonly PINNED_AGENT_SHA)
+release_origin_sha=$(recipe_readonly SEALED_ORIGIN_AGENT_SHA)
+release_core_sha=$(recipe_readonly PINNED_OMNIBUS_CORE_SHA)
+release_assets_sha=$(recipe_readonly SEALED_SYSTEM_PROBE_ASSETS_SHA256)
+release_outputs_sha=$(recipe_readonly RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256)
+release_marker_sha=$(recipe_readonly RELEASE_SYSTEM_PROBE_MARKER_SHA256)
+calculated_release_marker_sha=$(printf '%s\n' \
+  "manifest_rel=manifests/$release_origin_sha-$release_core_sha-aarch64-kylin10-v7" \
+  "agent_sha=$release_agent_sha" \
+  "generated_outputs_origin_agent_sha=$release_origin_sha" \
+  "core_sha=$release_core_sha" \
+  "assets_manifest_sha256=$release_assets_sha" \
+  "outputs_manifest_sha256=$release_outputs_sha" | stdin_sha256)
+[[ $release_marker_sha == "$calculated_release_marker_sha" ]] ||
+  fail "release handoff marker digest is stale relative to its pinned inputs"
 grep -Fq 'generated_outputs_origin_agent_sha=$SEALED_ORIGIN_AGENT_SHA' "$RECIPE" ||
   fail "recipe does not distinguish generated-output origin from release Agent source"
 grep -Fq 'git clone --local --no-hardlinks --no-checkout --no-tags' "$RECIPE" ||
