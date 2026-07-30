@@ -781,12 +781,18 @@ cmd_plan() {
 }
 
 assert_manifest_is_origin_main() {
-  local local_head remote_head
+  local local_head remote_head attempt=1
   git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv \
     || die "manifest.tsv 有未提交变更，拒绝删除产物"
   local_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
-  remote_head="$(git -C "$RELEASE_DIR" ls-remote origin refs/heads/main | awk 'NR==1 {print $1}')" \
-    || die "读取 origin/main 失败，拒绝删除产物"
+  while ! remote_head="$(git -C "$RELEASE_DIR" ls-remote origin refs/heads/main \
+      | awk 'NR==1 {print $1}')"; do
+    [ "$attempt" -lt 3 ] \
+      || die "dbdog-release 连续 3 次无法读取 origin/main，拒绝删除产物"
+    warn "dbdog-release 读取 origin/main 瞬时失败，2 秒后重试（$attempt/3）"
+    sleep 2
+    attempt=$((attempt + 1))
+  done
   [ -n "$remote_head" ] && [ "$remote_head" = "$local_head" ] \
     || die "origin/main 已变化或不可确认，拒绝按本地 manifest 删除产物"
 }
