@@ -42,7 +42,7 @@ DBDOG_MIGRATION_REQUIRED=1 run_hook "$hook_root" pre-switch >/dev/null
 pass "升级编排把 required=1 传入模块迁移钩子"
 
 # shellcheck disable=SC2016
-grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build1/out/$BUILT_ARTIFACT"' \
+grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"' \
   "$SCRIPTS_DIR/publish/publish.sh" || fail "Agent 发布器未钉住 seal 的 canonical out 路径"
 # shellcheck disable=SC2016
 grep -Fq 'expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"' \
@@ -284,4 +284,4 @@ rc_auth_header="$(cat "$TEST_ROOT/rc-auth-header-path")"
 [ ! -e "$rc_auth_header" ] || fail "Remote Config 验收遗留了含内部凭证的临时文件"
 pass "Remote Config 验收覆盖内部认证、seed 权限与 TUF root 结构"
 
-printf 'ALL PASS: 13 release contract tests\n'
+printf 'ALL PASS: 14 release contract tests\n'

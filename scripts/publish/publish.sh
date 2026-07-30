@@ -565,7 +565,7 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   if [ "$m" = dbdog-agent ]; then
     # Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个 build attempt；
     # 它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的路径/owner/mode 门禁。
-    expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build1/out/$BUILT_ARTIFACT"
+    expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
   fi
