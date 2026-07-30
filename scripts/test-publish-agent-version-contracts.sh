@@ -171,8 +171,9 @@ if grep -Fq 'AGENT_BASE_VERSION' "$SCRIPTS_DIR/publish/publish.sh"; then
 fi
 pass '构建输入只使用基线源码锚，且不存在本机版本前缀 fallback'
 
-grep -Fq 'if ! recipe_stdout="$(ssh "$BUILD_HOST"' "$SCRIPTS_DIR/publish/publish.sh" || \
-  fail 'publish.sh 没有在截取结果行前保留远端 recipe 退出状态'
+grep -Fq 'if ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12' \
+  "$SCRIPTS_DIR/publish/publish.sh" || \
+  fail 'publish.sh 没有以 keepalive 保持远端 recipe，并在截取结果行前保留退出状态'
 if grep -Fq 'bash -s <"$recipe" | tail -n1' "$SCRIPTS_DIR/publish/publish.sh"; then
   fail 'publish.sh 仍用 tail 成功状态掩盖远端 recipe 失败'
 fi

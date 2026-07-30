@@ -509,7 +509,8 @@ builder_upload_once() { # <远端产物> <asset> <release id> <size> <sha256>
   printf -v remote_cmd '/usr/bin/bash -c %q _ %q %q %q %q %q %q' \
     "$remote_script" "$remote_path" "$asset_name" "$REPO" "$release_id" \
     "$expected_size" "$expected_sha"
-  printf '%s\n' "$token" | ssh "$BUILD_HOST" "$remote_cmd"
+  printf '%s\n' "$token" | ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+    "$BUILD_HOST" "$remote_cmd"
 }
 
 upload_release_asset_from_builder() { # <module> <远端产物> <asset> <size> <sha256>
@@ -641,7 +642,8 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
 
   log "[$m] 构建于 $BUILD_HOST ..."
   local out recipe_stdout
-  if ! recipe_stdout="$(ssh "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
+  if ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+        "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
         ARCH="$ARCH" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
         PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}" bash -s <"$recipe")"; then
     die "[$m] 远端构建配方执行失败"

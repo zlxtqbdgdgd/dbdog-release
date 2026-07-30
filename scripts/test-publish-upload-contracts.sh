@@ -112,6 +112,10 @@ set -euo pipefail
 : "${FAKE_ASSET_SIZE:?}"
 : "${FAKE_ASSET_SHA:?}"
 
+case " $* " in
+  *' -o ServerAliveInterval=10 -o ServerAliveCountMax=12 '*) ;;
+  *) printf '%s\n' 'test fake: builder upload lacks SSH keepalive' >&2; exit 93 ;;
+esac
 case "$*" in
   *"$FAKE_GH_TOKEN"*)
     printf '%s\n' 'test fake: token leaked into ssh arguments' >&2
@@ -244,7 +248,7 @@ run_builder_case() { # <scenario>
   || { sed -n '1,120p' "$TEST_ROOT/builder-success.log" >&2; fail "构建机直传成功场景失败"; }
 [ "$(<"$TEST_ROOT/state/builder-success/upload-count")" = 1 ] \
   || fail "构建机直传成功场景不是一次上传"
-pass "构建机使用 stdin 临时令牌直传成功"
+pass "构建机使用 SSH keepalive 和 stdin 临时令牌直传成功"
 
 (run_builder_case builder-absent-retry) >"$TEST_ROOT/builder-absent-retry.log" 2>&1 \
   || fail "构建机直传瞬时失败后没有有限重试"
