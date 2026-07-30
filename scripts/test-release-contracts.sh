@@ -51,8 +51,8 @@ grep -Fq 'refresh_first_party_origins' "$SCRIPTS_DIR/publish/publish.sh" \
   || fail "发布计划没有在变更检测前刷新所有自研仓 origin/main"
 grep -Fq '连续 3 次无法刷新 origin' "$SCRIPTS_DIR/publish/publish.sh" \
   || fail "发布计划没有对只读 origin fetch 做有限重试"
-grep -Fq '连续 3 次无法读取 origin/main' "$SCRIPTS_DIR/publish/publish.sh" \
-  || fail "产物清理没有对只读 origin/main 核验做有限重试"
+grep -Fq '连续 3 次无法通过 GitHub API 读取 main' "$SCRIPTS_DIR/publish/publish.sh" \
+  || fail "产物清理没有对 GitHub main 权威核验做有限重试"
 grep -Fq '拒绝发布过期源码；先 fast-forward 后重试' \
   "$SCRIPTS_DIR/publish/publish.sh" \
   || fail "显式发布没有拒绝落后于 origin/main 的本地源码"

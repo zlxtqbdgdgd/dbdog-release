@@ -785,11 +785,10 @@ assert_manifest_is_origin_main() {
   git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv \
     || die "manifest.tsv 有未提交变更，拒绝删除产物"
   local_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
-  while ! remote_head="$(git -C "$RELEASE_DIR" ls-remote origin refs/heads/main \
-      | awk 'NR==1 {print $1}')"; do
+  while ! remote_head="$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha')"; do
     [ "$attempt" -lt 3 ] \
-      || die "dbdog-release 连续 3 次无法读取 origin/main，拒绝删除产物"
-    warn "dbdog-release 读取 origin/main 瞬时失败，2 秒后重试（$attempt/3）"
+      || die "dbdog-release 连续 3 次无法通过 GitHub API 读取 main，拒绝删除产物"
+    warn "dbdog-release 通过 GitHub API 读取 main 瞬时失败，2 秒后重试（$attempt/3）"
     sleep 2
     attempt=$((attempt + 1))
   done
