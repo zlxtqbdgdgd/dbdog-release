@@ -334,8 +334,10 @@ cp scripts/publish/publish.conf.example scripts/publish/publish.conf  # 首次�
 ./scripts/publish/publish.sh prune               # 核对非 manifest 当前产物（--yes 执行清理）
 ```
 
-构建在麒麟 V10 / aarch64 专职机完成。开发阶段每模块只保留 manifest 当前产物；发布脚本
-先推 main，再删除该模块旧资产。发布必须串行，清理会校验远端 HEAD、文件名与 SHA-256。
+构建在麒麟 V10 / aarch64 专职机完成。产物在构建机上完成架构与 SHA-256 校验后直接上传
+GitHub，本机只负责发布编排和 manifest 提交；`gh` 登录令牌通过 SSH stdin 临时传给上传进程，
+不写入构建机持久配置或日志。开发阶段每模块只保留 manifest 当前产物；发布脚本先推 main，再删除
+该模块旧资产。发布必须串行，清理会校验远端 HEAD、文件名与 SHA-256。
 自动化代理发布前还必须完整读取 [发布 Skill](.claude/skills/publish/SKILL.md)。
 
 设计说明见 [ADR 0001](docs/adr/0001-single-bucket-release-via-main.md)，术语见

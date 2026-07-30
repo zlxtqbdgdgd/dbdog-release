@@ -7,7 +7,7 @@
 #   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
-# 本机还需 tar、file、find、objdump，用于上传前核对包内全部机器码架构。
+# 产物在构建机上完成架构/摘要校验并直传 GitHub；本机不再中转大文件。
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../lib.sh"   # log/die/manifest_* （其内网路径变量在本机不使用）
@@ -455,6 +455,102 @@ upload_release_asset() { # <module> <local file> <asset name> <sha256>
   done
 }
 
+remote_artifact_metadata() { # <远端绝对路径>；设置 REMOTE_ARTIFACT_SIZE/SHA256
+  local remote_path="$1" remote_q metadata
+  printf -v remote_q '%q' "$remote_path"
+  metadata="$(ssh "$BUILD_HOST" \
+    "test -f $remote_q && test ! -L $remote_q && stat -c '%s' -- $remote_q && sha256sum -- $remote_q")" \
+    || die "无法读取构建机产物元数据: $remote_path"
+  REMOTE_ARTIFACT_SIZE="$(sed -n '1p' <<<"$metadata")"
+  REMOTE_ARTIFACT_SHA256="$(sed -n '2p' <<<"$metadata" | awk '{print $1}')"
+  case "$REMOTE_ARTIFACT_SIZE" in
+    '' | *[!0-9]*) die "构建机产物大小非法: $REMOTE_ARTIFACT_SIZE" ;;
+  esac
+  [ "$REMOTE_ARTIFACT_SIZE" -gt 0 ] || die "构建机产物是空文件: $remote_path"
+  [ "${#REMOTE_ARTIFACT_SHA256}" -eq 64 ] \
+    || die "构建机产物 SHA-256 长度非法: $REMOTE_ARTIFACT_SHA256"
+  case "$REMOTE_ARTIFACT_SHA256" in
+    *[!0-9a-f]*) die "构建机产物 SHA-256 非法: $REMOTE_ARTIFACT_SHA256" ;;
+  esac
+}
+
+verify_remote_artifact_arch() { # <远端产物> <aarch64|noarch> <module>
+  local remote_path="$1" expected="$2" module="$3"
+  ssh "$BUILD_HOST" /usr/bin/bash -s -- "$remote_path" "$expected" "$module" \
+    <"$HERE/verify-artifact-arch.sh" \
+    || die "[$module] 构建机产物架构检查失败"
+}
+
+builder_upload_once() { # <远端产物> <asset> <release id> <size> <sha256>
+  local remote_path="$1" asset_name="$2" release_id="$3" expected_size="$4" expected_sha="$5"
+  local token remote_script remote_cmd
+
+  token="$(gh auth token)" || return 1
+  [ -n "$token" ] || return 1
+
+  # 令牌只经 SSH stdin 进入远端 shell；不进入 ssh 命令行、远端进程参数或日志。
+  # curl 的临时 config 为 0600，并由 trap 删除。上传文件始终是已经过 size/SHA
+  # 和架构门禁的构建机 canonical 产物。
+  remote_script=$'set -euo pipefail\n'
+  remote_script+=$'remote_path=$1\nasset_name=$2\nrepo=$3\nrelease_id=$4\nexpected_size=$5\nexpected_sha=$6\n'
+  remote_script+=$'test -f "$remote_path" && test ! -L "$remote_path"\n'
+  remote_script+=$'test "$(stat -c \'%s\' -- "$remote_path")" = "$expected_size"\n'
+  remote_script+=$'test "$(sha256sum -- "$remote_path" | awk \'{print $1}\')" = "$expected_sha"\n'
+  remote_script+=$'IFS= read -r token\ntest -n "$token"\numask 077\n'
+  remote_script+=$'auth_config=$(mktemp /tmp/dbdog-gh-auth.XXXXXX)\nresponse=$(mktemp /tmp/dbdog-gh-upload.XXXXXX)\n'
+  remote_script+=$'cleanup() { rm -f -- "$auth_config" "$response"; }\ntrap cleanup EXIT HUP INT TERM\n'
+  remote_script+=$'printf \'header = "Authorization: Bearer %s"\\n\' "$token" >"$auth_config"\nunset token\n'
+  remote_script+=$'set +e\nhttp_code=$(curl --silent --show-error --output "$response" --write-out \'%{http_code}\' --request POST --config "$auth_config" --header \'Accept: application/vnd.github+json\' --header \'X-GitHub-Api-Version: 2022-11-28\' --header \'Content-Type: application/octet-stream\' --data-binary "@$remote_path" "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$asset_name")\ncurl_rc=$?\nset -e\n'
+  remote_script+=$'if [ "$curl_rc" -ne 0 ] || [ "$http_code" != 201 ]; then\n  printf \'GitHub builder upload failed: curl_rc=%s http=%s\\n\' "$curl_rc" "$http_code" >&2\n  sed -n \'1,20p\' "$response" >&2\n  exit 1\nfi\n'
+
+  printf -v remote_cmd '/usr/bin/bash -c %q _ %q %q %q %q %q %q' \
+    "$remote_script" "$remote_path" "$asset_name" "$REPO" "$release_id" \
+    "$expected_size" "$expected_sha"
+  printf '%s\n' "$token" | ssh "$BUILD_HOST" "$remote_cmd"
+}
+
+upload_release_asset_from_builder() { # <module> <远端产物> <asset> <size> <sha256>
+  local module="$1" remote_path="$2" asset_name="$3" expected_size="$4" expected_sha="$5"
+  local release_id attempt=1
+
+  inspect_release_asset "$asset_name" "$expected_size" "$expected_sha" \
+    || die "[$module] 无法读取产物桶资产元数据，拒绝上传"
+  [ "$RELEASE_ASSET_STATE" = "absent" ] \
+    || die "[$module] 产物桶已存在同名文件，拒绝覆盖: ${asset_name}（${RELEASE_ASSET_DETAIL}）"
+  release_id="$(gh api "repos/$REPO/releases/tags/$BUCKET_TAG" --jq '.id')" \
+    || die "[$module] 无法读取产物桶 release id"
+  case "$release_id" in '' | *[!0-9]*) die "[$module] 产物桶 release id 非法" ;; esac
+
+  while [ "$attempt" -le "$PUBLISH_UPLOAD_MAX_ATTEMPTS" ]; do
+    log "[$module] 构建机直传产物桶（第 $attempt/$PUBLISH_UPLOAD_MAX_ATTEMPTS 次）"
+    if builder_upload_once "$remote_path" "$asset_name" "$release_id" \
+        "$expected_size" "$expected_sha"; then
+      return 0
+    fi
+
+    warn "[$module] 构建机直传失败；先核验远端同名资产，再决定是否重试"
+    inspect_release_asset "$asset_name" "$expected_size" "$expected_sha" \
+      || die "[$module] 直传失败且无法确认远端状态，拒绝盲目重试"
+    case "$RELEASE_ASSET_STATE" in
+      identical)
+        log "[$module] 上传响应虽失败，但 ${RELEASE_ASSET_DETAIL}，按成功继续"
+        return 0
+        ;;
+      conflict)
+        die "[$module] 直传失败后发现同名资产不一致，拒绝覆盖: ${asset_name}（${RELEASE_ASSET_DETAIL}）"
+        ;;
+      absent)
+        [ "$attempt" -lt "$PUBLISH_UPLOAD_MAX_ATTEMPTS" ] \
+          || die "[$module] 构建机直传已失败 $attempt 次，且远端仍无同名资产"
+        [ "$PUBLISH_UPLOAD_RETRY_DELAY_SECONDS" -eq 0 ] \
+          || sleep "$PUBLISH_UPLOAD_RETRY_DELAY_SECONDS"
+        attempt=$((attempt + 1))
+        ;;
+      *) die "[$module] 未知远端资产状态: $RELEASE_ASSET_STATE" ;;
+    esac
+  done
+}
+
 update_manifest_row() { # <module> <version> <artifact> <sha256> <source_sha>
   awk -F'\t' -v OFS='\t' -v m="$1" -v v="$2" -v a="$3" -v h="$4" -v s="$5" \
     '!/^#/ && $1==m { $5=v; $6=a; $7=h; $8=s } { print }' \
@@ -571,16 +667,15 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   fi
   [ "$rpath" = "$expected_rpath" ] || \
     die "[$m] 配方产物不在约定的远端 out 目录: $rpath"
-  log "[$m] 取回产物 $BUILT_ARTIFACT"
-  fetch_remote_artifact "$rpath" "$SCRATCH/$BUILT_ARTIFACT"
   local artifact_arch
   case "$BUILT_ARTIFACT" in
     *-"$ARCH".tar.gz) artifact_arch="$ARCH" ;;
     *-noarch.tar.gz) artifact_arch="noarch" ;;
     *) die "[$m] 产物名没有受支持的架构后缀: $BUILT_ARTIFACT" ;;
   esac
-  "$HERE/verify-artifact-arch.sh" "$SCRATCH/$BUILT_ARTIFACT" "$artifact_arch" "$m"
-  BUILT_SHA256="$(shasum -a 256 "$SCRATCH/$BUILT_ARTIFACT" | awk '{print $1}')"
+  remote_artifact_metadata "$rpath"
+  verify_remote_artifact_arch "$rpath" "$artifact_arch" "$m"
+  BUILT_SHA256="$REMOTE_ARTIFACT_SHA256"
 
   if [ "$m" = "dbdog-agent" ]; then
     # Agent 构建耗时很长；上传前重读基线，避免等待期间有人换锚，导致版本/manifest
@@ -596,7 +691,8 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   fi
 
   ensure_bucket
-  upload_release_asset "$m" "$SCRATCH/$BUILT_ARTIFACT" "$BUILT_ARTIFACT" "$BUILT_SHA256"
+  upload_release_asset_from_builder "$m" "$rpath" "$BUILT_ARTIFACT" \
+    "$REMOTE_ARTIFACT_SIZE" "$BUILT_SHA256"
 
   local srcsha="-"
   if [ "$kind" = "first-party" ]; then

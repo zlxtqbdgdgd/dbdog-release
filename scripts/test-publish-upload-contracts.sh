@@ -39,8 +39,15 @@ increment() {
 }
 
 if [ "${1:-}" = "api" ]; then
+  for arg in "$@"; do
+    if [ "$arg" = ".id" ]; then
+      printf '%s\n' 424242
+      exit 0
+    fi
+  done
   api_count="$(increment "$FAKE_GH_STATE_DIR/api-count")"
-  if [ "$FAKE_GH_SCENARIO" = "preexisting-identical" ]; then
+  if [ "$FAKE_GH_SCENARIO" = "preexisting-identical" ] \
+      || [ "$FAKE_GH_SCENARIO" = "builder-preexisting-identical" ]; then
     printf '%s\t%s\tsha256:%s\n' \
       "$FAKE_ASSET_NAME" "$FAKE_ASSET_SIZE" "$FAKE_ASSET_SHA"
     exit 0
@@ -48,17 +55,22 @@ if [ "${1:-}" = "api" ]; then
   # 第一次是上传前同名门禁，所有场景都必须显示不存在。
   [ "$api_count" -gt 1 ] || exit 0
   case "$FAKE_GH_SCENARIO" in
-    absent-retry) exit 0 ;;
-    remote-identical)
+    absent-retry | builder-absent-retry) exit 0 ;;
+    remote-identical | builder-remote-identical)
       printf '%s\t%s\tsha256:%s\n' \
         "$FAKE_ASSET_NAME" "$FAKE_ASSET_SIZE" "$FAKE_ASSET_SHA"
       ;;
-    remote-conflict)
+    remote-conflict | builder-remote-conflict)
       printf '%s\t%s\tsha256:%064d\n' \
         "$FAKE_ASSET_NAME" "$FAKE_ASSET_SIZE" 0
       ;;
     *) printf 'unknown fake scenario: %s\n' "$FAKE_GH_SCENARIO" >&2; exit 91 ;;
   esac
+  exit 0
+fi
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  printf '%s\n' "${FAKE_GH_TOKEN:?}"
   exit 0
 fi
 
@@ -87,6 +99,55 @@ printf '\n' >&2
 exit 92
 EOF
 chmod 0755 "$TEST_ROOT/bin/gh"
+
+cat >"$TEST_ROOT/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FAKE_GH_STATE_DIR:?}"
+: "${FAKE_GH_SCENARIO:?}"
+: "${FAKE_GH_TOKEN:?}"
+: "${FAKE_REMOTE_ARTIFACT:?}"
+: "${FAKE_ASSET_NAME:?}"
+: "${FAKE_ASSET_SIZE:?}"
+: "${FAKE_ASSET_SHA:?}"
+
+case "$*" in
+  *"$FAKE_GH_TOKEN"*)
+    printf '%s\n' 'test fake: token leaked into ssh arguments' >&2
+    exit 94
+    ;;
+esac
+for expected in "$FAKE_REMOTE_ARTIFACT" "$FAKE_ASSET_NAME" "$FAKE_ASSET_SIZE" "$FAKE_ASSET_SHA"; do
+  case "$*" in
+    *"$expected"*) ;;
+    *) printf 'test fake: ssh command missing %s\n' "$expected" >&2; exit 95 ;;
+  esac
+done
+
+IFS= read -r token
+[ "$token" = "$FAKE_GH_TOKEN" ] || {
+  printf '%s\n' 'test fake: token was not delivered through stdin' >&2
+  exit 96
+}
+
+count_file="$FAKE_GH_STATE_DIR/upload-count"
+count=0
+[ ! -f "$count_file" ] || count="$(<"$count_file")"
+count=$((count + 1))
+printf '%s\n' "$count" >"$count_file"
+
+case "$FAKE_GH_SCENARIO" in
+  builder-success) exit 0 ;;
+  builder-absent-retry)
+    [ "$count" -gt 1 ] && exit 0
+    exit 1
+    ;;
+  builder-remote-identical | builder-remote-conflict) exit 1 ;;
+  *) printf 'test fake: unexpected builder scenario: %s\n' "$FAKE_GH_SCENARIO" >&2; exit 97 ;;
+esac
+EOF
+chmod 0755 "$TEST_ROOT/bin/ssh"
 
 artifact="$TEST_ROOT/dbdog-server-0.1.5-aarch64.tar.gz"
 printf 'contract-test release artifact\n' >"$artifact"
@@ -163,4 +224,52 @@ grep -Fq '同名资产不一致，拒绝覆盖' "$TEST_ROOT/remote-conflict.log"
   || fail "同名冲突没有明确 fail closed 原因"
 pass "同名远端资产 size/digest 不一致时拒绝覆盖且不重试"
 
-printf 'ALL PASS: 5 publish upload contract tests\n'
+run_builder_case() { # <scenario>
+  local scenario="$1" state_dir
+  state_dir="$TEST_ROOT/state/$scenario"
+  mkdir -p "$state_dir"
+  export FAKE_GH_STATE_DIR="$state_dir"
+  export FAKE_GH_SCENARIO="$scenario"
+  export FAKE_GH_TOKEN='github_pat_test_secret_must_not_leak'
+  export FAKE_REMOTE_ARTIFACT="/remote/$asset_name"
+  export FAKE_ASSET_NAME="$asset_name"
+  export FAKE_ASSET_SIZE="$asset_size"
+  export FAKE_ASSET_SHA="$asset_sha"
+  export BUILD_HOST=fake-builder
+  PATH="$TEST_ROOT/bin:$PATH" upload_release_asset_from_builder \
+    dbdog-server "$FAKE_REMOTE_ARTIFACT" "$asset_name" "$asset_size" "$asset_sha"
+}
+
+(run_builder_case builder-success) >"$TEST_ROOT/builder-success.log" 2>&1 \
+  || { sed -n '1,120p' "$TEST_ROOT/builder-success.log" >&2; fail "构建机直传成功场景失败"; }
+[ "$(<"$TEST_ROOT/state/builder-success/upload-count")" = 1 ] \
+  || fail "构建机直传成功场景不是一次上传"
+pass "构建机使用 stdin 临时令牌直传成功"
+
+(run_builder_case builder-absent-retry) >"$TEST_ROOT/builder-absent-retry.log" 2>&1 \
+  || fail "构建机直传瞬时失败后没有有限重试"
+[ "$(<"$TEST_ROOT/state/builder-absent-retry/upload-count")" = 2 ] \
+  || fail "构建机直传瞬时失败场景的上传次数不是 2"
+pass "构建机直传失败且远端不存在时有限重试"
+
+(run_builder_case builder-remote-identical) >"$TEST_ROOT/builder-remote-identical.log" 2>&1 \
+  || fail "构建机直传响应丢失后没有核验远端正确资产"
+[ "$(<"$TEST_ROOT/state/builder-remote-identical/upload-count")" = 1 ] \
+  || fail "构建机直传已落远端时仍重复上传"
+pass "构建机直传响应丢失但远端摘要一致时幂等成功"
+
+if (run_builder_case builder-remote-conflict) >"$TEST_ROOT/builder-remote-conflict.log" 2>&1; then
+  fail "构建机直传后远端摘要冲突时仍继续"
+fi
+[ "$(<"$TEST_ROOT/state/builder-remote-conflict/upload-count")" = 1 ] \
+  || fail "构建机直传发现冲突后仍重复上传"
+pass "构建机直传远端摘要冲突时 fail closed"
+
+if (run_builder_case builder-preexisting-identical) >"$TEST_ROOT/builder-preexisting.log" 2>&1; then
+  fail "构建机直传开始前已有同名资产时仍继续"
+fi
+[ ! -e "$TEST_ROOT/state/builder-preexisting-identical/upload-count" ] \
+  || fail "构建机直传开始前同名冲突仍发起上传"
+pass "构建机直传开始前已有同名资产时零上传拒绝"
+
+printf 'ALL PASS: 10 publish upload contract tests\n'
