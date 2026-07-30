@@ -12,7 +12,7 @@
 #   - agent-core 不是模块：构建期被打进 dbdog-agent 的 omnibus 运行时。
 dbdog-server	first-party	stack	yes	0.1.7	dbdog-server-0.1.7-aarch64.tar.gz	e5b82d4d481a0f5255ad5a77839ee8a2b8ae817fbee1584acf44f8888ebd0a02	7d6ae2c
 dbdog-web	first-party	stack	yes	0.1.7	dbdog-web-0.1.7-aarch64.tar.gz	65a868ad69a1d9add6b0f001851ac13719067afe9de0f45c4b321542cefcf5ce	3903e72
-dbdog-mcp	first-party	stack	yes	0.1.4	dbdog-mcp-0.1.4-noarch.tar.gz	ec09a64b827f87054e2fd007e1949550ab89cca385fa48ce24336bffe1c22739	0de1c3e
+dbdog-mcp	first-party	stack	yes	0.1.5	dbdog-mcp-0.1.5-noarch.tar.gz	fa76ded526029fc44dd836193453ef46771c53d392606dd148abe13d0004b7ef	54c3831
 dbdog-agent	first-party	dbhost	no	7.81.0-dbdog.3	dbdog-agent-7.81.0-dbdog.3-aarch64.tar.gz	f4910628ae56f94437510fa1157a01440fda35f76219ea42a9be4c80dbd2f0b2	agent:62ad297,core:d725d98
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-
 clickhouse	third-party	stack	yes	26.8.1.184	clickhouse-26.8.1.184-aarch64.tar.gz	fb72234cc32e9f3ea6247511cddb9994b129002f9c05f48fc797f6451e237130	-
