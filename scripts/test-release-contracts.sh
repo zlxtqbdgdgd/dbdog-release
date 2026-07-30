@@ -47,6 +47,12 @@ grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build1/out/$BUIL
 # shellcheck disable=SC2016
 grep -Fq 'expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"' \
   "$SCRIPTS_DIR/publish/publish.sh" || fail "其他模块的通用 out 路径门禁被放宽"
+grep -Fq 'refresh_first_party_origins' "$SCRIPTS_DIR/publish/publish.sh" \
+  || fail "发布计划没有在变更检测前刷新所有自研仓 origin/main"
+grep -Fq '拒绝发布过期源码；先 fast-forward 后重试' \
+  "$SCRIPTS_DIR/publish/publish.sh" \
+  || fail "显式发布没有拒绝落后于 origin/main 的本地源码"
+pass "发布计划刷新远端引用，显式发布拒绝过期本地 HEAD"
 
 env_file="$TEST_ROOT/service.env"
 cat >"$env_file" <<'EOF'

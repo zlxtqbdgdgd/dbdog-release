@@ -232,6 +232,52 @@ live_sha() { # 当前源码指纹（与 manifest.source_sha 同格式）
   esac
 }
 
+fetch_source_origin() { # <repo>；变更检测前刷新真实远端引用，禁止依赖过期缓存
+  local repo="$1"
+  git -C "$SRC_ROOT/$repo" fetch -q --prune origin \
+    || die "$repo 无法刷新 origin，拒绝用过期引用判断发布范围"
+  git -C "$SRC_ROOT/$repo" rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
+    || die "$repo 缺少 origin/main，无法判断发布范围"
+}
+
+source_checkout_matches_origin() { # <repo>
+  local repo="$1"
+  [ "$(git -C "$SRC_ROOT/$repo" rev-parse HEAD)" = \
+    "$(git -C "$SRC_ROOT/$repo" rev-parse origin/main)" ]
+}
+
+refresh_first_party_origins() {
+  local m kind
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+    [ "$kind" = "first-party" ] || continue
+    [ -d "$SRC_ROOT/$m/.git" ] || continue
+    fetch_source_origin "$m"
+    if [ "$m" = "dbdog-agent" ]; then
+      [ -d "$SRC_ROOT/dbdog-agent-core/.git" ] \
+        || die "Agent integrations-core 源仓不存在: $SRC_ROOT/dbdog-agent-core"
+      fetch_source_origin dbdog-agent-core
+    fi
+  done < <(manifest_rows)
+}
+
+assert_first_party_checkouts_current() {
+  local m kind stale=0
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+    [ "$kind" = "first-party" ] || continue
+    [ -d "$SRC_ROOT/$m/.git" ] || continue
+    if ! source_checkout_matches_origin "$m"; then
+      warn "$m 本地 HEAD 未对齐 origin/main"
+      stale=1
+    fi
+    if [ "$m" = "dbdog-agent" ] && ! source_checkout_matches_origin dbdog-agent-core; then
+      warn "dbdog-agent-core 本地 HEAD 未对齐 origin/main"
+      stale=1
+    fi
+  done < <(manifest_rows)
+  [ "$stale" -eq 0 ] \
+    || die "存在未同步的自研源仓，拒绝自动推导发布范围；先 fast-forward 后重试"
+}
+
 changed_first_party() {
   while IFS=$'\t' read -r m kind _t _s _v _a _h recorded; do
     [ "$kind" = "first-party" ] || continue
@@ -263,10 +309,14 @@ ensure_pushed() { # 构建机从 origin 取码，未推送的提交构建不到
         target="$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT"
         ;;
     esac
-    git -C "$SRC_ROOT/$repo" fetch -q origin \
-      || warn "$repo fetch origin 失败，用本地已有的 origin/main 引用判断"
+    fetch_source_origin "$repo"
     git -C "$SRC_ROOT/$repo" merge-base --is-ancestor "$target" origin/main \
       || die "$repo 出货源码 $target 尚未推送到 origin/main，先 push 再发布"
+    case "$repo" in
+      dbdog-agent | dbdog-agent-core) ;;
+      *) source_checkout_matches_origin "$repo" \
+        || die "$repo 本地 HEAD 未对齐 origin/main，拒绝发布过期源码；先 fast-forward 后重试" ;;
+    esac
   done
 }
 
@@ -580,21 +630,35 @@ regen_readme() {
 
 # ---- 子命令 ----
 cmd_plan() {
+  refresh_first_party_origins
   printf '%-14s %-24s %-24s %s\n' "模块" "manifest 记录" "当前源码" "状态"
   printf '%s\n' "--------------------------------------------------------------------------"
+  local stale=0
   while IFS=$'\t' read -r m kind _t _s v _a _h recorded; do
     if [ "$kind" = "first-party" ]; then
       if [ -d "$SRC_ROOT/$m/.git" ]; then
         if [ "$m" = "dbdog-agent" ]; then
-          load_agent_release_baseline
-          warn_agent_unshipped_heads
-          local_sha="$(agent_loaded_source_fingerprint)"
+          if ! source_checkout_matches_origin dbdog-agent \
+              || ! source_checkout_matches_origin dbdog-agent-core; then
+            local_sha="?"
+            st="本地未同步 origin/main ←"
+            stale=1
+          else
+            load_agent_release_baseline
+            warn_agent_unshipped_heads
+            local_sha="$(agent_loaded_source_fingerprint)"
+            st="一致"; [ "$local_sha" != "$recorded" ] && st="有变更 ←"
+            agent_version_uses_loaded_baseline "$v" || st="官方版本基线变化 ←"
+          fi
         else
-          local_sha="$(live_sha "$m")"
-        fi
-        st="一致"; [ "$local_sha" != "$recorded" ] && st="有变更 ←"
-        if [ "$m" = "dbdog-agent" ]; then
-          agent_version_uses_loaded_baseline "$v" || st="官方版本基线变化 ←"
+          if source_checkout_matches_origin "$m"; then
+            local_sha="$(live_sha "$m")"
+            st="一致"; [ "$local_sha" != "$recorded" ] && st="有变更 ←"
+          else
+            local_sha="$(git -C "$SRC_ROOT/$m" rev-parse --short=7 origin/main)"
+            st="远端有更新；本地未同步 ←"
+            stale=1
+          fi
         fi
         printf '%-14s %-24s %-24s %s\n' "$m(v$v)" "$recorded" "$local_sha" "$st"
       else
@@ -606,6 +670,8 @@ cmd_plan() {
   done < <(manifest_rows)
   echo
   echo "发布: publish.sh publish [模块...] [--bump patch|minor|major]"
+  [ "$stale" -eq 0 ] \
+    || die "存在未同步的自研源仓；plan 已显示真实 origin/main，先 fast-forward 后重试"
 }
 
 assert_manifest_is_origin_main() {
@@ -700,6 +766,8 @@ cmd_publish() {
   case "$bump" in patch | minor | major) ;; *) die "未知 bump 级别: $bump" ;; esac
   if [ ${#mods[@]} -eq 0 ]; then
     local changed
+    refresh_first_party_origins
+    assert_first_party_checkouts_current
     changed="$(changed_first_party)" \
       || die "检测一方模块发布状态失败"
     while IFS= read -r m; do
