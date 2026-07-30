@@ -476,7 +476,10 @@ remote_artifact_metadata() { # <远端绝对路径>；设置 REMOTE_ARTIFACT_SIZ
 
 verify_remote_artifact_arch() { # <远端产物> <aarch64|noarch> <module>
   local remote_path="$1" expected="$2" module="$3"
-  ssh "$BUILD_HOST" /usr/bin/bash -s -- "$remote_path" "$expected" "$module" \
+  # 大型 Agent 包的解包和逐文件扫描可能长时间没有 stdout；主动发送 SSH
+  # keepalive，避免中间网络设备把仍在运行的只读检查误判为空闲连接。
+  ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+    "$BUILD_HOST" /usr/bin/bash -s -- "$remote_path" "$expected" "$module" \
     <"$HERE/verify-artifact-arch.sh" \
     || die "[$module] 构建机产物架构检查失败"
 }
