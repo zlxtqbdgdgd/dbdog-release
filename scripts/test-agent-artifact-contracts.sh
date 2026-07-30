@@ -134,7 +134,7 @@ grep -Fq 'SYSTEM_PROBE_SEED_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-buil
   fail "recipe lost the exact validated system-probe seed attempt"
 grep -Fq 'SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073cf88b9510bde5f22bc1d84b3688f52' \
   "$RECIPE" || fail "recipe does not pin the sealed 69-output manifest"
-grep -Fq 'RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=7ea1f502bfe9ed2c40089d1ecc3c554fe382e946f72029e9630b4943dceecc02' \
+grep -Fq 'RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=523d7976ae926c5769252b0011f8b7e57dfa72d981d835154ec8772df5401191' \
   "$RECIPE" || fail "recipe does not pin the release-relocated output manifest"
 grep -Fq 'RELEASE_SYSTEM_PROBE_MARKER_SHA256=bc45c1f60977b7dff248494af7fb6607011aed837372819b5bab8f0c438e457f' \
   "$RECIPE" || fail "recipe does not pin the release handoff marker"
