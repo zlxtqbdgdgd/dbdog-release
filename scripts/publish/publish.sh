@@ -233,9 +233,14 @@ live_sha() { # 当前源码指纹（与 manifest.source_sha 同格式）
 }
 
 fetch_source_origin() { # <repo>；变更检测前刷新真实远端引用，禁止依赖过期缓存
-  local repo="$1"
-  git -C "$SRC_ROOT/$repo" fetch -q --prune origin \
-    || die "$repo 无法刷新 origin，拒绝用过期引用判断发布范围"
+  local repo="$1" attempt=1
+  while ! git -C "$SRC_ROOT/$repo" fetch -q --prune origin; do
+    [ "$attempt" -lt 3 ] \
+      || die "$repo 连续 3 次无法刷新 origin，拒绝用过期引用判断发布范围"
+    warn "$repo 刷新 origin 瞬时失败，2 秒后重试（$attempt/3）"
+    sleep 2
+    attempt=$((attempt + 1))
+  done
   git -C "$SRC_ROOT/$repo" rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
     || die "$repo 缺少 origin/main，无法判断发布范围"
 }
