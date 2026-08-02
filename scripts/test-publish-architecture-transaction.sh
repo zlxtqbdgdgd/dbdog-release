@@ -274,8 +274,13 @@ setup_src_repo() { # setup_src_repo <dir>
 }
 
 run_txn_pipeline() { # run_txn_pipeline <module> <version> → 依次跑三阶段（真实驱动被测函数），
-  # 镜像 cmd_publish 里真实的调用序列：先给整个矩阵做 builder 预检，再逐架构构建。
+  # 镜像 cmd_publish 里真实的调用序列：先看是不是"commit 成功、push 失败"的中断恢复
+  # （命中就直接补 push，不进入下面任何一步），否则给整个矩阵做 builder 预检、再逐
+  # 架构构建。
   local m="$1" v="$2" arch txn_dir
+  if publish_resume_pending_push "$m"; then
+    return 0
+  fi
   publish_ensure_arch_builders "$m"
   while IFS= read -r arch; do
     [ -n "$arch" ] || continue
@@ -283,6 +288,23 @@ run_txn_pipeline() { # run_txn_pipeline <module> <version> → 依次跑三阶�
   done < <(publish_arches_for_module "$m")
   txn_dir="$(publish_txn_dir "$m" "$v")"
   publish_commit_arch_matrix "$txn_dir/txn.tsv"
+}
+
+write_gate_hook() { # write_gate_hook <repo> <hook名> <marker文件> → 除非 marker 存在，
+  # 否则该 git hook 拒绝操作；用真实 git hook 模拟"commit/push 在这一步失败"，
+  # 不需要另外 fake git 本身。
+  local repo="$1" hook="$2" marker="$3"
+  mkdir -p "$repo/.git/hooks"
+  cat >"$repo/.git/hooks/$hook" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+if [ -f "$marker" ]; then
+  exit 0
+fi
+echo "blocked by test $hook gate (marker not present: $marker)" >&2
+exit 1
+EOF
+  chmod +x "$repo/.git/hooks/$hook"
 }
 
 # ===========================================================================
@@ -626,4 +648,271 @@ setup_release_repo "$CASE5/release" "$CASE5/release-bare.git" "$manifest_fixture
 ) || exit 1
 pass "矩阵中任一架构缺少 builder 时，整个矩阵在触碰任何构建之前就整体失败（不会先构建排在前面的架构）"
 
-printf 'ALL PASS: 16 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 评审 Important 1：build 阶段的恢复短路必须校验 source SHA（含 Agent 基线），
+# 不能只按 (module, arch) 匹配就无条件跳过重新构建。
+#
+# 场景：第一轮把两个架构都构建完（事务记录 source_sha=S1），在进入上传阶段之前
+# 中断（比如进程被杀）；源仓这时候被人补了一个新 commit（source_sha 变成 S2）；
+# 第二次执行必须拒绝直接复用旧事务行去发布 S1 的产物，而不是静默跳过重新构建。
+# ===========================================================================
+CASE6="$TEST_ROOT/case6"
+mkdir -p "$CASE6"
+manifest_fixture6="$CASE6/manifest.fixture.tsv"
+setup_src_repo "$CASE6/src/dbdog-web"
+source_sha6_s1="$(git -C "$CASE6/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture6" "$OLD_VERSION" "$source_sha6_s1"
+setup_release_repo "$CASE6/release" "$CASE6/release-bare.git" "$manifest_fixture6"
+
+(
+  DBDOG_HOME="$CASE6/home"
+  RELEASE_DIR="$CASE6/release"
+  SRC_ROOT="$CASE6/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE6/build-work"
+  REPO_ROOT="$CASE6/repo-root"
+  TOOL_PATH=""
+
+  FAKE_STATE_DIR="$CASE6/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+  export FAKE_BUILD_X86_64_FAIL=0
+
+  # 第一轮：两个架构都构建成功（模拟"死在进入上传阶段之前"，所以只调用
+  # build_one_arch，不调用 publish_commit_arch_matrix）。
+  build_one_arch dbdog-web "$NEW_VERSION" aarch64
+  build_one_arch dbdog-web "$NEW_VERSION" x86_64
+  txn_dir6="$(publish_txn_dir dbdog-web "$NEW_VERSION")"
+  [ "$(awk -F'\t' '$1=="dbdog-web"' "$txn_dir6/txn.tsv" | wc -l | tr -d ' ')" = 2 ] \
+    || fail "第一轮结束后事务记录应该恰好有两行（aarch64+x86_64）"
+
+  # 源仓在事务开始后被人补了一个新 commit——source_sha 从 S1 漂移到 S2。
+  printf 'unexpected upstream drift after the transaction started\n' >>"$CASE6/src/dbdog-web/main.go"
+  git -C "$CASE6/src/dbdog-web" add -A
+  git -C "$CASE6/src/dbdog-web" commit -qm 'drift after txn started'
+  source_sha6_s2="$(git -C "$CASE6/src/dbdog-web" rev-parse --short=7 HEAD)"
+  [ "$source_sha6_s2" != "$source_sha6_s1" ] \
+    || fail "测试 fixture 本身有问题：漂移前后的 source_sha 应该不同"
+
+  # 第二次执行：对 aarch64 重新调用 build_one_arch，必须拒绝短路复用 S1 的旧构建。
+  if (build_one_arch dbdog-web "$NEW_VERSION" aarch64) >"$CASE6/rerun.log" 2>&1; then
+    sed -n '1,200p' "$CASE6/rerun.log" >&2
+    fail "源码在事务开始后漂移时，重跑本应拒绝短路却直接返回成功"
+  fi
+  grep -Fq '源码/基线在事务开始后发生了漂移' "$CASE6/rerun.log" \
+    || { sed -n '1,200p' "$CASE6/rerun.log" >&2; fail "源码漂移时没有给出明确的漂移诊断"; }
+  grep -Fq "$source_sha6_s1" "$CASE6/rerun.log" && grep -Fq "$source_sha6_s2" "$CASE6/rerun.log" \
+    || { sed -n '1,200p' "$CASE6/rerun.log" >&2; fail "漂移诊断信息里应该同时出现事务记录的旧 SHA 和当前的新 SHA，方便定位"; }
+
+  # 事务记录里 aarch64 那一行必须原封不动（不能被静默改写成新 source_sha，
+  # 也不能变成重复行——拒绝短路之后应该在漂移检查这里就停下，不触碰 txn.tsv）。
+  [ "$(awk -F'\t' '$1=="dbdog-web" && $2=="aarch64"' "$txn_dir6/txn.tsv" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "拒绝短路后事务记录不应该产生额外/重复的 aarch64 行"
+  awk -F'\t' '$1=="dbdog-web" && $2=="aarch64" {print $7}' "$txn_dir6/txn.tsv" \
+    | grep -Fqx "$source_sha6_s1" \
+    || fail "拒绝短路后事务记录里 aarch64 那一行的 source_sha 被意外改写了"
+
+  # 没有发生任何新的真实构建（第二次调用在漂移检查这里就 die 了，从未走到
+  # resolve_build_host_for_arch/ssh 那一步）。
+  [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "源码漂移时 aarch64 不应该发生新的真实构建（应该在漂移校验处就 die）"
+) || exit 1
+pass "构建阶段的恢复短路会校验 source_sha；源码在事务开始后漂移时拒绝复用旧构建并给出精确诊断"
+
+# ===========================================================================
+# 评审 Important 2a：manifest 已经 mv 到本次目标版本、但 commit 还没做（用真实
+# git pre-commit hook 模拟"死在 mv 之后、commit 之前"）——重跑必须识别这个状态，
+# 跳过重新上传，直接补 commit/push，不能把自己刚写的 manifest 说成"无关残留"
+# 而拒绝，也不能留一个脏工作区不管。
+# ===========================================================================
+CASE7="$TEST_ROOT/case7"
+mkdir -p "$CASE7"
+manifest_fixture7="$CASE7/manifest.fixture.tsv"
+setup_src_repo "$CASE7/src/dbdog-web"
+source_sha7="$(git -C "$CASE7/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture7" "$OLD_VERSION" "$source_sha7"
+setup_release_repo "$CASE7/release" "$CASE7/release-bare.git" "$manifest_fixture7"
+allow_commit7="$CASE7/allow-commit"
+write_gate_hook "$CASE7/release" pre-commit "$allow_commit7"
+
+(
+  DBDOG_HOME="$CASE7/home"
+  RELEASE_DIR="$CASE7/release"
+  SRC_ROOT="$CASE7/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE7/build-work"
+  REPO_ROOT="$CASE7/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_STATE_DIR="$CASE7/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+
+  before_head7="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+
+  # 第一次执行：两个架构构建、上传都成功，manifest 也 mv 成功，commit 被
+  # pre-commit hook 挡住（模拟"死在 mv 之后、commit 之前"）。
+  if (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE7/round1.log" 2>&1; then
+    sed -n '1,200p' "$CASE7/round1.log" >&2
+    fail "第一次执行本应在 commit 阶段被 pre-commit hook 挡住却成功完成"
+  fi
+  grep -Fq 'blocked by test pre-commit gate' "$CASE7/round1.log" \
+    || { sed -n '1,200p' "$CASE7/round1.log" >&2; fail "第一次执行没有在预期的 pre-commit hook 处失败"; }
+  pass "第一次执行：build/upload/manifest mv 全部成功，commit 被 pre-commit hook 挡住后中断"
+
+  [ "$(git -C "$RELEASE_DIR" rev-parse HEAD)" = "$before_head7" ] \
+    || fail "commit 被 hook 挡住后不应该产生任何新提交"
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv \
+    && fail "commit 被挡住后 manifest.tsv 应该相对 HEAD 有未提交的改动（已经 mv 到新版本）"
+  [ "$(manifest_get dbdog-web 5 aarch64)" = "$NEW_VERSION" ] \
+    || fail "commit 被挡住后本地 manifest.tsv（未提交）应该已经是新版本"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "第一次执行 aarch64 的上传次数不是 1"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-x86_64")" = 1 ] \
+    || fail "第一次执行 x86_64 的上传次数不是 1"
+  pass "commit 被挡住后：manifest.tsv 已在工作区 mv 到新版本但未提交，HEAD 不变，两个架构各自只上传了一次"
+
+  # 放开 pre-commit hook，第二次执行必须识别"已经 mv、只差 commit"，不重新上传。
+  : >"$allow_commit7"
+  (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE7/round2.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE7/round2.log" >&2; fail "第二次执行（放开 pre-commit hook 后）未能完成发布"; }
+  grep -Fq '判定为「mv 之后、commit 之前中断」的恢复' "$CASE7/round2.log" \
+    || { sed -n '1,200p' "$CASE7/round2.log" >&2; fail "第二次执行没有留下识别出「mv 之后、commit 之前」状态的日志"; }
+  pass "第二次执行：正确识别出「已经 mv、只差 commit」的状态并补完提交"
+
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "第二次执行不应该重新上传 aarch64（manifest 已经是目标状态，不该再走一遍上传循环）"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-x86_64")" = 1 ] \
+    || fail "第二次执行不应该重新上传 x86_64"
+  [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "第二次执行不应该重新构建 aarch64"
+  [ "$(<"$FAKE_STATE_DIR/count-build-x86_64")" = 1 ] \
+    || fail "第二次执行不应该重新构建 x86_64"
+  after_head7="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$after_head7" != "$before_head7" ] || fail "第二次执行后应该产生了新的 commit"
+  [ "$(git -C "$RELEASE_DIR" rev-list --count "${before_head7}..${after_head7}")" = 1 ] \
+    || fail "两轮执行合计应该只产生一个 commit"
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md \
+    || fail "第二次执行后工作区不应该再有未提交的改动"
+) || exit 1
+pass "manifest 已 mv、commit 未做时中断重跑：零重复上传、零重复构建，只产生一个 commit，收敛干净"
+
+# ===========================================================================
+# 评审 Important 2b：commit 已经成功、push 还没做（用真实 git pre-push hook
+# 模拟）——release HEAD 已经因为这次 commit 前进，事务目录按新 HEAD 是找不到旧
+# 记录的；重跑必须靠 publish_resume_pending_push 识别"HEAD 本身就是这次未推送
+# 的发布提交"，直接补推同一个提交，不重建矩阵、不重复上传。
+# ===========================================================================
+CASE8="$TEST_ROOT/case8"
+mkdir -p "$CASE8"
+manifest_fixture8="$CASE8/manifest.fixture.tsv"
+setup_src_repo "$CASE8/src/dbdog-web"
+source_sha8="$(git -C "$CASE8/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture8" "$OLD_VERSION" "$source_sha8"
+setup_release_repo "$CASE8/release" "$CASE8/release-bare.git" "$manifest_fixture8"
+allow_push8="$CASE8/allow-push"
+write_gate_hook "$CASE8/release" pre-push "$allow_push8"
+
+(
+  DBDOG_HOME="$CASE8/home"
+  RELEASE_DIR="$CASE8/release"
+  SRC_ROOT="$CASE8/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE8/build-work"
+  REPO_ROOT="$CASE8/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_STATE_DIR="$CASE8/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+
+  before_head8="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  before_origin8="$(git -C "$CASE8/release-bare.git" rev-parse refs/heads/main)"
+
+  # 第一次执行：build/upload/mv/commit 全部成功，push 被 pre-push hook 挡住。
+  if (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE8/round1.log" 2>&1; then
+    sed -n '1,200p' "$CASE8/round1.log" >&2
+    fail "第一次执行本应在 push 阶段被 pre-push hook 挡住却成功完成"
+  fi
+  grep -Fq 'blocked by test pre-push gate' "$CASE8/round1.log" \
+    || { sed -n '1,200p' "$CASE8/round1.log" >&2; fail "第一次执行没有在预期的 pre-push hook 处失败"; }
+  pass "第一次执行：build/upload/manifest/commit 全部成功，push 被 pre-push hook 挡住后中断"
+
+  after_round1_head8="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$after_round1_head8" != "$before_head8" ] \
+    || fail "commit 应该已经成功，本地 HEAD 应该已经前进"
+  [ "$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD)" = "publish: dbdog-web@$NEW_VERSION" ] \
+    || fail "本地 HEAD 的提交信息应该是本次发布提交"
+  [ "$(git -C "$CASE8/release-bare.git" rev-parse refs/heads/main)" = "$before_origin8" ] \
+    || fail "push 被挡住后 origin（bare 仓）不应该有任何变化"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "第一次执行 aarch64 的上传次数不是 1"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-x86_64")" = 1 ] \
+    || fail "第一次执行 x86_64 的上传次数不是 1"
+  pass "push 被挡住后：本地已经提交（HEAD 前进），origin 完全没变，两个架构各自只上传了一次"
+
+  # 放开 pre-push hook，第二次执行必须识别"HEAD 已经是本次发布提交，只差 push"。
+  : >"$allow_push8"
+  (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE8/round2.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE8/round2.log" >&2; fail "第二次执行（放开 pre-push hook 后）未能完成发布"; }
+  grep -Fq '只是尚未推送；直接补 push' "$CASE8/round2.log" \
+    || { sed -n '1,200p' "$CASE8/round2.log" >&2; fail "第二次执行没有留下识别出「commit 已完成、只差 push」状态的日志"; }
+  pass "第二次执行：正确识别出「commit 已完成、只差 push」的状态并补推"
+
+  final_head8="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$final_head8" = "$after_round1_head8" ] \
+    || fail "第二次执行不应该产生新的 commit，本地 HEAD 应该和第一次执行后完全一样（重推同一个提交）"
+  [ "$(git -C "$CASE8/release-bare.git" rev-parse refs/heads/main)" = "$final_head8" ] \
+    || fail "第二次执行后 origin（bare 仓）应该和本地 HEAD 一致"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "第二次执行不应该重新上传 aarch64"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-x86_64")" = 1 ] \
+    || fail "第二次执行不应该重新上传 x86_64"
+  [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "第二次执行不应该重新构建 aarch64（不应该重建矩阵）"
+  [ "$(<"$FAKE_STATE_DIR/count-build-x86_64")" = 1 ] \
+    || fail "第二次执行不应该重新构建 x86_64（不应该重建矩阵）"
+) || exit 1
+pass "commit 已完成、push 未做时中断重跑：重推同一个提交，零重建矩阵、零重复上传"
+
+printf 'ALL PASS: 22 publish architecture transaction contract tests\n'

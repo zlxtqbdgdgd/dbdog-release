@@ -729,12 +729,10 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
 
   txn_dir="$(publish_txn_init "$m" "$ver")"
   txn_tsv="$txn_dir/txn.tsv"
-  if [ -f "$txn_tsv" ] && awk -F'\t' -v m="$m" -v a="$arch" \
-      '$1==m && $2==a { found=1 } END { exit !found }' "$txn_tsv"; then
-    log "[$m/$arch] 事务已记录该架构的构建结果，跳过重复构建（同一事务目录内恢复）"
-    return 0
-  fi
 
+  # kind/sha/Agent 基线门禁必须在短路判断之前算出来——短路只是"跳过重新构建"，
+  # 不是"跳过校验"：Agent 的官方基线合法性（agent_version_uses_loaded_baseline）
+  # 每次调用都要重新核实，不能因为事务里已经有一行记录就假定基线没变过。
   kind="$(manifest_get "$m" 2 "$arch")"
   if [ "$kind" = "first-party" ]; then
     if [ "$m" = "dbdog-agent" ]; then
@@ -747,6 +745,30 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
         dbdog-deploy/RELEASE-BASELINE.tsv)"
     else
       sha="$(git -C "$SRC_ROOT/$m" rev-parse HEAD)"
+    fi
+  fi
+
+  # 这次调用如果真的构建，理应记录的 source_sha——短路前用它核对事务里已经记录的
+  # 那一行是否仍然对应当前源码/当前基线；真正构建完成后也复用同一份计算结果写进
+  # 事务行，两处不用两套口径，避免分裂。
+  local live_srcsha="-"
+  if [ "$kind" = "first-party" ]; then
+    if [ "$m" = "dbdog-agent" ]; then
+      live_srcsha="$(agent_loaded_source_fingerprint)"
+    else
+      live_srcsha="$(live_sha "$m")"
+    fi
+  fi
+
+  if [ -f "$txn_tsv" ]; then
+    local existing_srcsha
+    existing_srcsha="$(awk -F'\t' -v m="$m" -v a="$arch" \
+      '$1==m && $2==a { print $7; exit }' "$txn_tsv")"
+    if [ -n "$existing_srcsha" ]; then
+      [ "$existing_srcsha" = "$live_srcsha" ] || \
+        die "[$m/$arch] 事务已记录的构建使用了旧的 source_sha（事务记录=${existing_srcsha}，当前源码=${live_srcsha}），源码/基线在事务开始后发生了漂移，拒绝复用陈旧构建；清理事务目录后重新发布: $txn_dir"
+      log "[$m/$arch] 事务已记录该架构的构建结果，且 source_sha 与当前源码一致，跳过重复构建（同一事务目录内恢复）"
+      return 0
     fi
   fi
 
@@ -807,17 +829,10 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
       || die "[$m/$arch] 构建版本已不属于当前官方基线，拒绝记录事务: $BUILT_VERSION"
   fi
 
-  local srcsha="-"
-  if [ "$kind" = "first-party" ]; then
-    if [ "$m" = "dbdog-agent" ]; then
-      srcsha="$(agent_loaded_source_fingerprint)"
-    else
-      srcsha="$(live_sha "$m")"
-    fi
-  fi
-
+  # 复用函数开头算好的 live_srcsha（短路判断用的是同一个值），不再重新计算一遍，
+  # 避免两处口径分裂；Agent 分支上面的基线复读门禁已经确认它没有在构建期间失效。
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$m" "$arch" "$BUILT_VERSION" "$rpath" "$REMOTE_ARTIFACT_SIZE" "$BUILT_SHA256" "$srcsha" \
+    "$m" "$arch" "$BUILT_VERSION" "$rpath" "$REMOTE_ARTIFACT_SIZE" "$BUILT_SHA256" "$live_srcsha" \
     >>"$txn_tsv"
   log "[$m/$arch] 已记录事务行（未上传、未改 manifest）"
 }
@@ -896,6 +911,48 @@ publish_claim_or_upload_arch_asset() { # <module> <arch> <version> <remote_path>
   esac
 }
 
+publish_manifest_row_matches_target() { # <module> <arch> <version> <artifact> <sha256> <source_sha> → 0/1
+  # manifest.tsv 里 (module, arch) 那一行是否已经恰好等于事务要写入的目标值。
+  # 只在这五列都能读到且完全相等时返回 0；读不到该行（尚未发布过这个架构）或任一
+  # 列不等都返回 1——这是"目标状态尚未生效"，不是错误。
+  local m="$1" a="$2" v="$3" art="$4" sha="$5" ssha="$6"
+  local cur_v cur_art cur_sha cur_ssha
+  cur_v="$(manifest_get "$m" 5 "$a" 2>/dev/null)" || return 1
+  cur_art="$(manifest_get "$m" 6 "$a" 2>/dev/null)" || return 1
+  cur_sha="$(manifest_get "$m" 7 "$a" 2>/dev/null)" || return 1
+  cur_ssha="$(manifest_get "$m" 8 "$a" 2>/dev/null)" || return 1
+  [ "$cur_v" = "$v" ] && [ "$cur_art" = "$art" ] && [ "$cur_sha" = "$sha" ] && [ "$cur_ssha" = "$ssha" ]
+}
+
+publish_resume_pending_push() { # publish_resume_pending_push <module> → 0：HEAD 已是该模块本次发布的提交、只差 push，已就地补 push+prune 并返回；1：不是这个状态，调用方走正常流程
+  # 覆盖"commit 成功、push 失败"这道中断窗口。这个状态下 release HEAD 已经因为
+  # 我们自己的 commit 前进了，publish_txn_dir 会算出一个新目录、找不到旧事务
+  # 记录，没法用 build_one_arch 的短路机制识别"已经做过"；只能反过来看：HEAD 本
+  # 身是不是一个还没推的 "publish: <module>@<version>" 提交。命中就只补
+  # push+prune，完全不碰构建/上传/manifest，不会重建矩阵也不会重复上传。
+  local m="$1" head_msg v arch
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md || return 1
+  head_msg="$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD 2>/dev/null)" || return 1
+  case "$head_msg" in
+    "publish: ${m}@"*) v="${head_msg#"publish: ${m}@"}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$v" ] || return 1
+  while IFS= read -r arch; do
+    [ -n "$arch" ] || continue
+    [ "$(manifest_get "$m" 5 "$arch" 2>/dev/null)" = "$v" ] || return 1
+  done < <(publish_arches_for_module "$m")
+  log "[$m] HEAD 已是本次发布提交（${head_msg}），只是尚未推送；直接补 push（不重建矩阵、不重新上传）"
+  # 显式 || die，不指望调用方永远处在 set -e 会触发的位置——if/while 条件、
+  # 命令替换等上下文里 set -e 对普通命令失效，但 die() 的 exit 不受这个影响，
+  # 任何时候 push 失败都必须可靠地在这里停下，不能滑到 prune 那一步。
+  git -C "$RELEASE_DIR" push origin main \
+    || die "[$m] push origin main 失败（本地已提交 ${head_msg}，尚未推送）；请检查网络/权限后重试，不会自动重建矩阵，也不会删除任何资产"
+  prune_modules_to_manifest 1 "$m"
+  RESUMED_PUBLISH_VERSION="$v"
+  return 0
+}
+
 publish_apply_arch_matrix_manifest_update() { # <updates.tsv: module arch version artifact sha256 source_sha>
   local updates="$1" tmp
   [ -s "$updates" ] || die "manifest 矩阵更新输入为空: $updates"
@@ -968,28 +1025,71 @@ publish_commit_arch_matrix() { # publish_commit_arch_matrix <txn.tsv> → 校验
 
   ensure_bucket
 
-  local i asset_name updates
-  updates="$txn_dir/manifest-updates.tsv"
-  : >"$updates"
+  # 恢复场景之一：上一次执行已经把全部资产真实上传/认领、也已经把 manifest mv 到
+  # 本次目标状态，只是在 commit 之前中断（release HEAD 还没变，所以还能走到这
+  # 里）。这种情况下不能再跑一遍上传循环——upload_release_asset_from_builder 对
+  # 已经上传过的资产会直接 fail closed（"产物桶已存在同名文件，拒绝覆盖"），而
+  # publish_verify_recovery_claim 的恢复认领要求"manifest 仍指向旧版本"，manifest
+  # 已经是新版本时会被它拒绝，报出"可能是无关残留"这种其实指向自己刚写的状态、
+  # 容易误导人的话。所以先检测这个状态，命中就跳过上传循环和 manifest 更新，只对
+  # 每个架构的资产做一次轻量 GitHub digest 核验（不完全信任本地 manifest），再继续
+  # 走 commit/push/prune。
+  local already_applied=1 i asset_name
   for ((i = 0; i < ${#row_module[@]}; i++)); do
     asset_name="$(basename "${row_path[$i]}")"
-    publish_claim_or_upload_arch_asset "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" \
-      "${row_path[$i]}" "$asset_name" "${row_size[$i]}" "${row_sha[$i]}" "${row_srcsha[$i]}" "$txn_dir"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" "$asset_name" "${row_sha[$i]}" "${row_srcsha[$i]}" \
-      >>"$updates"
+    if ! publish_manifest_row_matches_target "${row_module[$i]}" "${row_arch[$i]}" \
+        "${row_version[$i]}" "$asset_name" "${row_sha[$i]}" "${row_srcsha[$i]}"; then
+      already_applied=0
+      break
+    fi
   done
 
-  # 全部目标资产已确认存在（本次真实上传或恢复认领）且 digest 正确后，才精确更新
-  # 全部 (module, arch) 行；publish_apply_arch_matrix_manifest_update 内部会再校验一遍
-  # 同模块 version/source_sha 一致。
-  publish_apply_arch_matrix_manifest_update "$updates"
+  if [ "$already_applied" -eq 1 ]; then
+    log "[$module] manifest 已处于本次事务目标状态，判定为「mv 之后、commit 之前中断」的恢复；跳过重新上传与 manifest 更新"
+    for ((i = 0; i < ${#row_module[@]}; i++)); do
+      asset_name="$(basename "${row_path[$i]}")"
+      inspect_release_asset "$asset_name" "${row_size[$i]}" "${row_sha[$i]}" \
+        || die "[$module/${row_arch[$i]}] 无法读取产物桶资产元数据，拒绝确认恢复状态"
+      [ "$RELEASE_ASSET_STATE" = "identical" ] || \
+        die "[$module/${row_arch[$i]}] manifest 已指向本次目标版本，但产物桶资产状态是 ${RELEASE_ASSET_STATE}（期望 identical），拒绝在未确认远端资产完整前继续；请人工核实后再重试，不要直接删除任何资产"
+    done
+  else
+    local updates
+    updates="$txn_dir/manifest-updates.tsv"
+    : >"$updates"
+    for ((i = 0; i < ${#row_module[@]}; i++)); do
+      asset_name="$(basename "${row_path[$i]}")"
+      publish_claim_or_upload_arch_asset "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" \
+        "${row_path[$i]}" "$asset_name" "${row_size[$i]}" "${row_sha[$i]}" "${row_srcsha[$i]}" "$txn_dir"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" "$asset_name" "${row_sha[$i]}" "${row_srcsha[$i]}" \
+        >>"$updates"
+    done
+
+    # 全部目标资产已确认存在（本次真实上传或恢复认领）且 digest 正确后，才精确更新
+    # 全部 (module, arch) 行；publish_apply_arch_matrix_manifest_update 内部会再校验一遍
+    # 同模块 version/source_sha 一致。
+    publish_apply_arch_matrix_manifest_update "$updates"
+  fi
 
   regen_readme
-  git -C "$RELEASE_DIR" add manifest.tsv README.md
-  git -C "$RELEASE_DIR" commit -m "publish: $module@$version"
-  git -C "$RELEASE_DIR" push origin main
-  # main/manifest 成为权威后再清理；push 失败时 set -e 会在到达这里之前终止，绝不提前删除旧资产。
+  if git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md; then
+    # 没有未提交变更：说明这次的 commit 已经做过了（例如上一次恰好死在 commit 成功、
+    # push 失败之间）。不能再 commit 一次——那样会产生第二个提交，破坏"一次事务一个
+    # commit"。正常情况下走不到这一分支，因为这种状态应该在更早的
+    # publish_resume_pending_push 那一关就被拦下、直接补 push 了；这里只是防御。
+    log "[$module] manifest/README 相对 HEAD 已无未提交变更，跳过重复 commit"
+  else
+    git -C "$RELEASE_DIR" add manifest.tsv README.md
+    # 显式 || die：commit 失败（比如 pre-commit hook 拒绝）必须可靠地在这里停下，
+    # 不能指望调用方总是处在 set -e 会触发的位置——if/while 条件、命令替换等上下文
+    # 里 set -e 对普通命令失效，但 die() 的 exit 不受这个影响。
+    git -C "$RELEASE_DIR" commit -m "publish: $module@$version" \
+      || die "[$module] git commit 失败（manifest/README 已经 mv 到本次目标版本但未提交）；修复问题后重新执行发布会识别出这个状态并补完提交，不会重新上传"
+  fi
+  git -C "$RELEASE_DIR" push origin main \
+    || die "[$module] push origin main 失败（本地已提交本次发布但尚未推送）；请检查网络/权限后重试，重新执行发布会识别出这个状态并只补推同一个提交，不会重建矩阵"
+  # main/manifest 成为权威后再清理；push 失败上面已经 die，绝不会滑到这里提前删除旧资产。
   prune_modules_to_manifest 1 "$module"
 
   rm -rf -- "$txn_dir"
@@ -1240,6 +1340,15 @@ cmd_publish() {
   # regen_readme → commit → push → prune）；一个模块完成/失败不影响下一个模块。
   local i=0 summary=""
   for m in "${mods[@]}"; do
+    # 先看这是不是"上一次已经 commit 成功、只是 push 失败"的中断恢复：这种状态下
+    # release HEAD 已经因为那次 commit 前进了，事务目录按新 HEAD 是找不到的，必须
+    # 在触碰 build_one_arch/版本规划之前单独识别，直接补 push，不重建矩阵。
+    if publish_resume_pending_push "$m"; then
+      summary="$summary $m@$RESUMED_PUBLISH_VERSION"
+      i=$((i + 1))
+      continue
+    fi
+
     local kind ver="" arch txn_dir="" actual_ver
     kind="$(manifest_module_field "$m" 2)"
     if [ "$kind" = "first-party" ]; then
