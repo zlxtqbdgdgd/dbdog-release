@@ -2,3 +2,7 @@ cache/
 scratch/
 *.part
 scripts/publish/publish.conf
+# publish_apply_arch_matrix_manifest_update / publish_migrate_manifest_v2 /
+# cmd_register_module 的 mktemp 临时文件（manifest.tsv.matrix.*、.migrate.*、
+# .register.*）；正常情况下会被各自的 mv 消费掉，只在中断时残留。
+manifest.tsv.*

@@ -494,7 +494,7 @@ remote_artifact_metadata() { # <远端绝对路径>；设置 REMOTE_ARTIFACT_SIZ
   esac
 }
 
-verify_remote_artifact_arch() { # <远端产物> <aarch64|noarch> <module>
+verify_remote_artifact_arch() { # <远端产物> <aarch64|x86_64|noarch> <module>
   local remote_path="$1" expected="$2" module="$3"
   # 大型 Agent 包的解包和逐文件扫描可能长时间没有 stdout；主动发送 SSH
   # keepalive，避免中间网络设备把仍在运行的只读检查误判为空闲连接。
@@ -1349,7 +1349,31 @@ cmd_publish() {
     while IFS= read -r m; do
       [ -n "$m" ] && mods+=("$m")
     done <<<"$changed"
-    [ ${#mods[@]} -gt 0 ] || { log "没有变更的一方模块（三方件需点名发布）"; exit 0; }
+    if [ ${#mods[@]} -eq 0 ]; then
+      # 裸跑（不点名任何模块）也可能撞上"commit 成功、push 失败"的中断窗口：那次
+      # commit 已经把 manifest 的 source_sha 更新成当前源码值，changed_first_party
+      # 从此再也看不出"变更"，若这里直接 exit 0，待推送的发布提交会被永久静默
+      # 丢在本地，origin/main 悄悄落后而没有任何报错——这正是终审 Important 1
+      # 指出的场景。在判定"无变更"之前，先看 HEAD 是不是这样一个还没推的
+      # "publish: <module>@<version>" 提交，命中就直接交给
+      # publish_resume_pending_push 补推（它自己会用本地缓存的 origin/main 校验
+      # "HEAD 真的领先"，稳态下不会误命中，见 test-publish-architecture-
+      # transaction.sh CASE9/CASE12）。
+      local pending_head_msg pending_module=""
+      pending_head_msg="$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD 2>/dev/null)" || pending_head_msg=""
+      case "$pending_head_msg" in
+        "publish: "*"@"*)
+          pending_module="${pending_head_msg#publish: }"
+          pending_module="${pending_module%%@*}"
+          ;;
+      esac
+      if [ -n "$pending_module" ] && publish_resume_pending_push "$pending_module"; then
+        log "发布完成: ${pending_module}@${RESUMED_PUBLISH_VERSION}"
+        exit 0
+      fi
+      log "没有变更的一方模块（三方件需点名发布）"
+      exit 0
+    fi
   fi
 
   echo "发布计划（bump=${bump}）:"

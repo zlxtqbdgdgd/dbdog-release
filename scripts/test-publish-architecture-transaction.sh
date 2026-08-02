@@ -1303,4 +1303,137 @@ PRUNE_SHA_A="$(printf 'e%.0s' $(seq 1 64))"
 ) || exit 1
 pass "manifest 里存在已登记未发布的模块（artifact=\"-\"）时，prune 试运行正确跳过它、不报错，且已发布模块的真实资产仍被正确保护"
 
-printf 'ALL PASS: 43 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 场景 12（终审 Important 1）：裸跑（cmd_publish 不点名任何模块，mods 为空靠
+# changed_first_party 自动推导）在 push 失败后再次裸跑重试，必须走
+# publish_resume_pending_push 补推同一个提交，不能被 changed_first_party 判定
+# "无变更"而静默 no-op——CASE8/CASE9 只覆盖点名重跑（run_txn_pipeline 直接把
+# 模块名传给 publish_resume_pending_push），从未走过 cmd_publish 本体的裸跑分支
+# （mods 为空 → changed_first_party → 空则直接 exit 0）；这里必须直接调用
+# cmd_publish 才能复现/覆盖这个 bug——第一次裸跑成功 commit 后，manifest 的
+# source_sha 已经被更新为当前源码 sha，第二次裸跑时 changed_first_party 会认为
+# "没有变更"，问题就在这个夹缝里发生。
+# ===========================================================================
+CASE12="$TEST_ROOT/case12"
+mkdir -p "$CASE12"
+manifest_fixture12="$CASE12/manifest.fixture.tsv"
+
+setup_tracked_src_repo() { # setup_tracked_src_repo <dir> <bare>；与 setup_src_repo 的区别是
+  # 额外建一个 bare remote 并 push——cmd_publish 裸跑分支会先跑
+  # refresh_first_party_origins/assert_first_party_checkouts_current，两者都要求
+  # 本地 HEAD 与 origin/main 完全一致，不能像其它场景那样只建本地仓、不建远端。
+  local dir="$1" bare="$2"
+  git init -q --bare "$bare"
+  git init -q "$dir"
+  git -C "$dir" config user.name dbdog-contract-test
+  git -C "$dir" config user.email dbdog-contract-test@example.invalid
+  git -C "$dir" remote add origin "$bare"
+  printf 'dbdog-web source under test\n' >"$dir/main.go"
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm 'source under test'
+  git -C "$dir" branch -M main
+  git -C "$dir" push -q -u origin main
+}
+
+setup_tracked_src_repo "$CASE12/src/dbdog-web" "$CASE12/src-bare/dbdog-web.git"
+old_source_sha12="$(git -C "$CASE12/src/dbdog-web" rev-parse --short=7 HEAD)"
+# 制造"源码已有未发布变更"的起点：多提交一次并推送，让 live_sha 领先 manifest
+# 记录的 source_sha，这样第一次裸跑的 changed_first_party 才能自动推导出 dbdog-web。
+printf 'more work\n' >>"$CASE12/src/dbdog-web/main.go"
+git -C "$CASE12/src/dbdog-web" commit -qam 'more work, ready to publish'
+git -C "$CASE12/src/dbdog-web" push -q origin main
+
+write_manifest "$manifest_fixture12" "$OLD_VERSION" "$old_source_sha12"
+setup_release_repo "$CASE12/release" "$CASE12/release-bare.git" "$manifest_fixture12"
+allow_push12="$CASE12/allow-push"
+write_gate_hook "$CASE12/release" pre-push "$allow_push12"
+
+(
+  DBDOG_HOME="$CASE12/home"
+  RELEASE_DIR="$CASE12/release"
+  SRC_ROOT="$CASE12/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE12/build-work"
+  REPO_ROOT="$CASE12/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_STATE_DIR="$CASE12/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  FAKE_ASSET_NAME_AARCH64="dbdog-web-$NEW_VERSION-aarch64.tar.gz"
+  FAKE_ASSET_NAME_X86_64="dbdog-web-$NEW_VERSION-x86_64.tar.gz"
+  FAKE_SIZE_AARCH64=5555
+  FAKE_SIZE_X86_64=6666
+  FAKE_SHA_AARCH64="$(printf 'f%.0s' $(seq 1 64))"
+  FAKE_SHA_X86_64="$(printf '1%.0s' $(seq 1 64))"
+  FAKE_VERSION="$NEW_VERSION"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_ASSET_NAME_AARCH64 FAKE_ASSET_NAME_X86_64 FAKE_SIZE_AARCH64 FAKE_SIZE_X86_64 \
+    FAKE_SHA_AARCH64 FAKE_SHA_X86_64 FAKE_VERSION FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+
+  before_head12="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  before_origin12="$(git -C "$CASE12/release-bare.git" rev-parse refs/heads/main)"
+
+  # 第一次裸跑：changed_first_party 应自动识别出 dbdog-web 有未发布变更，
+  # build/upload/commit 全部成功，push 被 pre-push hook 挡住后中断。
+  if (cmd_publish --yes) >"$CASE12/round1.log" 2>&1; then
+    sed -n '1,200p' "$CASE12/round1.log" >&2
+    fail "裸跑第一次执行本应在 push 阶段被 pre-push hook 挡住却成功完成"
+  fi
+  grep -Fq 'blocked by test pre-push gate' "$CASE12/round1.log" \
+    || { sed -n '1,200p' "$CASE12/round1.log" >&2; fail "裸跑第一次执行没有在预期的 pre-push hook 处失败"; }
+  after_round1_head12="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$after_round1_head12" != "$before_head12" ] \
+    || fail "裸跑第一次执行应该已经本地 commit 成功，HEAD 应该已经前进"
+  [ "$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD)" = "publish: dbdog-web@$NEW_VERSION" ] \
+    || fail "裸跑第一次执行后本地 HEAD 的提交信息应该是本次发布提交"
+  [ "$(git -C "$CASE12/release-bare.git" rev-parse refs/heads/main)" = "$before_origin12" ] \
+    || fail "push 被挡住后 origin（bare 仓）不应该有任何变化"
+  [ "$(manifest_get dbdog-web 8 aarch64)" = "$(git -C "$CASE12/src/dbdog-web" rev-parse --short=7 HEAD)" ] \
+    || fail "第一次裸跑后 manifest 的 source_sha 应该已经更新为当前源码 sha（这正是第二次裸跑会被 changed_first_party 判定为「无变更」的原因）"
+  pass "裸跑第一次执行：changed_first_party 自动识别出 dbdog-web 有变更，build/upload/manifest/commit 全部成功，push 被 pre-push hook 挡住后中断"
+
+  # 放开 pre-push hook。这是本 finding 的核心复现点：源码没有新变更（第一次裸跑
+  # 已把 manifest 的 source_sha 更新成当前值），changed_first_party 对 dbdog-web
+  # 会返回"无变更"，mods 为空——修复前 cmd_publish 会直接打印"没有变更的一方模块"
+  # 后 exit 0，origin 永远停在 push 失败前的状态，是静默 no-op；修复后必须识别出
+  # HEAD 本身就是一个待推送的 "publish: dbdog-web@version" 提交，直接补推。
+  : >"$allow_push12"
+  (cmd_publish --yes) >"$CASE12/round2.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE12/round2.log" >&2; fail "裸跑第二次执行（放开 pre-push hook 后）未能完成发布"; }
+  grep -Fq '只是尚未推送；直接补 push' "$CASE12/round2.log" \
+    || { sed -n '1,200p' "$CASE12/round2.log" >&2; fail "裸跑第二次执行没有留下识别出「commit 已完成、只差 push」状态的日志（很可能回归成「没有变更的一方模块」静默 no-op）"; }
+  ! grep -Fq '没有变更的一方模块' "$CASE12/round2.log" \
+    || fail "裸跑第二次执行不应该把「待推送」状态误判成「没有变更」而静默跳过"
+  pass "裸跑第二次执行：正确识别出「commit 已完成、只差 push」的状态并补推，没有被 changed_first_party 判定成无变更而静默跳过"
+
+  final_head12="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$final_head12" = "$after_round1_head12" ] \
+    || fail "裸跑第二次执行不应该产生新的 commit，本地 HEAD 应该和第一次执行后完全一样（重推同一个提交）"
+  [ "$(git -C "$CASE12/release-bare.git" rev-parse refs/heads/main)" = "$final_head12" ] \
+    || fail "裸跑第二次执行后 origin（bare 仓）应该和本地 HEAD 一致（即 finding 描述的「origin/main 静默落后」问题已修复）"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "裸跑第二次执行不应该重新上传 aarch64"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-x86_64")" = 1 ] \
+    || fail "裸跑第二次执行不应该重新上传 x86_64"
+  [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "裸跑第二次执行不应该重新构建 aarch64（不应该重建矩阵）"
+  [ "$(<"$FAKE_STATE_DIR/count-build-x86_64")" = 1 ] \
+    || fail "裸跑第二次执行不应该重新构建 x86_64（不应该重建矩阵）"
+) || exit 1
+pass "裸跑（不点名模块）push 失败后再次裸跑重试：正确补推同一提交，零重建矩阵、零重复上传，origin 不再静默落后"
+
+printf 'ALL PASS: 44 publish architecture transaction contract tests\n'

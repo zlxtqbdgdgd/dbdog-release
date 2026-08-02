@@ -13,11 +13,11 @@ if [ "${1:-}" = "--oneline" ]; then
     [ "$target" = "stack" ] || continue
     parts="$parts,$m=$(installed_version "$m")"
   done < <(manifest_selected_rows "" "$selected_arch")
-  echo "dbdog[${parts#,}] release=$release_rev $(date '+%Y-%m-%d')"
+  echo "dbdog[${parts#,}] release=$release_rev arch=$selected_arch $(date '+%Y-%m-%d')"
   exit 0
 fi
 
-echo "环境指纹  $(date '+%Y-%m-%d %H:%M')  release@$release_rev"
+echo "环境指纹  $(date '+%Y-%m-%d %H:%M')  release@$release_rev  arch@$selected_arch"
 printf '%-14s %-12s %-12s\n' "模块" "已装" "manifest"
 printf '%s\n' "----------------------------------------"
 while IFS=$'\t' read -r m _k target _s version _a _h _ss _arch; do

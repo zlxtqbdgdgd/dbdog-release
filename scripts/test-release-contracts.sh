@@ -9,8 +9,8 @@ trap 'case "$TEST_ROOT" in "${TMPDIR:-/tmp}"/dbdog-release-contracts.*) rm -rf -
 DBDOG_HOME="$TEST_ROOT/home"
 RELEASE_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
 
-# manifest.tsv 还是 v1（八列），要等 Task 2 用发布器一次性迁移；本文件只测升级顺序
-# 等与架构无关的合同，用本地九列 fixture 覆盖真实 manifest，不依赖尚未迁移的产物。
+# manifest.tsv 早已是 v2（九列，含 arch，Task 2 迁移完成）；本文件只测升级顺序
+# 等与架构无关的合同，用本地九列 fixture 覆盖真实 manifest，不依赖仓库当前状态。
 # 全部登记为 noarch，跟运行测试的机器是什么 CPU 架构无关。
 manifest_fixture="$TEST_ROOT/manifest.tsv"
 manifest_row() { # manifest_row <module> <kind> <target> <service>

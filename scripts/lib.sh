@@ -9,7 +9,6 @@ DBDOG_HOME="${DBDOG_HOME:-$HOME/dbdog}"
 RELEASE_DIR="${RELEASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MANIFEST="${MANIFEST:-$RELEASE_DIR/manifest.tsv}"
 BUCKET_URL="${BUCKET_URL:-https://github.com/zlxtqbdgdgd/dbdog-release/releases/download/artifacts}"
-ARCH="aarch64"
 
 MODULES_DIR="$DBDOG_HOME/modules"
 ETC_DIR="$DBDOG_HOME/etc"
@@ -438,10 +437,11 @@ manifest_get() { # manifest_get <module> <列号> [arch]；精确架构优先，
   else
     arch="$(host_arch)"
   fi
-  # 故意不复用 manifest_selected_rows "" "$arch"：那个函数一次性遍历全表，任何一个
-  # 无关模块的精确/noarch 冲突都会让它的 END 循环整体 exit 1，连累这里按模块名的定向
-  # 查询失败，且外层错误信息会用被查询的模块名，误导成"这个模块自己有歧义"。这里的
-  # awk 只看 $1==m 这一个模块的行，冲突判定和错误信息都严格限定在这一个模块上。
+  # 故意不复用 manifest_selected_rows "" "$arch"：manifest_all_rows 已经在写入侧把
+  # "同一模块混用 noarch 与具体架构"整体拒绝（见该函数内的排他校验），所以任何一个
+  # 模块出现精确/noarch 冲突这件事本身现在已经不会发生，不再是"避免被无关模块的
+  # 冲突连累"的问题；这里仍然只看 $1==m 这一个模块的行，是为了让诊断信息（含出错时
+  # 的模块名）始终精确限定在被查询的这一个模块上，不依赖"全局不会冲突"这个假设。
   if ! manifest_all_rows | awk -F'\t' -v m="$m" -v arch="$arch" -v c="$col" '
       $1 == m {
         if ($9 == arch) {
