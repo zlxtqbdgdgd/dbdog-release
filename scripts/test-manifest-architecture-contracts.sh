@@ -276,4 +276,40 @@ grep -Fq '| m | third-party | 全家桶机 | 1 | m-1-aarch64.tar.gz | aarch64 |'
   || fail 'README 版本表架构列未正确填充'
 pass 'regen_readme 生成的版本表新增架构列，数据取自 manifest 第九列'
 
-printf 'ALL PASS: 30 manifest architecture contract tests\n'
+# ---- 回归：changed_first_party/cmd_plan 用 8 个变量 read 九列 manifest_rows 时，
+# 第 8(source_sha)、9(arch) 列会被 read 原样吞并进最后一个变量（含分隔 tab），
+# 导致 source_sha 比较永远不相等、cmd_plan 表格里的记录列夹带内嵌 tab。----
+plan_regress_root="$TEST_ROOT/plan-regress"
+plan_repo="$plan_regress_root/src/plan-mod"
+mkdir -p "$plan_repo"
+git init -q "$plan_repo"
+git -C "$plan_repo" config user.name dbdog-contract-test
+git -C "$plan_repo" config user.email dbdog-contract-test@example.invalid
+printf 'seed\n' >"$plan_repo/seed.txt"
+git -C "$plan_repo" add -A
+git -C "$plan_repo" commit -qm seed >/dev/null
+plan_sha="$(git -C "$plan_repo" rev-parse --short=7 HEAD)"
+
+plan_manifest="$plan_regress_root/manifest.tsv"
+printf 'plan-mod\tfirst-party\tstack\tno\t1.0.0\tplan-mod-1.0.0-aarch64.tar.gz\t%s\t%s\taarch64\n' \
+  "$SHA_A" "$plan_sha" >"$plan_manifest"
+
+changed="$(SRC_ROOT="$plan_regress_root/src" MANIFEST="$plan_manifest" changed_first_party)"
+[ -z "$changed" ] \
+  || fail "source_sha 未变但 changed_first_party 误报变更（九列被 8 变量 read 吞并第 9 列）: $changed"
+pass 'changed_first_party 对九列 manifest 正确解析纯 source_sha，未变更不误报'
+
+# 源仓不存在时 cmd_plan 仍会打印 manifest 记录列（走"源仓缺失"分支），足以验证解析结果，
+# 且不需要真实 origin/main 远端。
+plan_out="$(SRC_ROOT="$plan_regress_root/does-not-exist" MANIFEST="$plan_manifest" cmd_plan 2>/dev/null)"
+plan_line="$(printf '%s\n' "$plan_out" | grep '^plan-mod')"
+[ -n "$plan_line" ] || fail "cmd_plan 未输出 plan-mod 这一行: $plan_out"
+case "$plan_line" in
+  *"$plan_sha"$'\t'*)
+    fail "cmd_plan 的 manifest 记录列夹带了被吞并的内嵌 tab/架构值: $plan_line" ;;
+esac
+printf '%s\n' "$plan_line" | grep -Fq -- "$plan_sha" \
+  || fail "cmd_plan 未显示纯净的 source_sha: $plan_line"
+pass 'cmd_plan 的 manifest 记录列是纯 source_sha，无内嵌 tab 或被吞并的架构值'
+
+printf 'ALL PASS: 32 manifest architecture contract tests\n'

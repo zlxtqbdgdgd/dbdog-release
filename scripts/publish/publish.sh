@@ -255,7 +255,7 @@ source_checkout_matches_origin() { # <repo>
 
 refresh_first_party_origins() {
   local m kind
-  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || continue
     fetch_source_origin "$m"
@@ -269,7 +269,7 @@ refresh_first_party_origins() {
 
 assert_first_party_checkouts_current() {
   local m kind stale=0
-  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || continue
     if ! source_checkout_matches_origin "$m"; then
@@ -286,7 +286,7 @@ assert_first_party_checkouts_current() {
 }
 
 changed_first_party() {
-  while IFS=$'\t' read -r m kind _t _s _v _a _h recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || { warn "源仓不存在: $SRC_ROOT/${m}，跳过 $m"; continue; }
     if [ "$m" = "dbdog-agent" ]; then
@@ -781,7 +781,7 @@ cmd_plan() {
   printf '%-14s %-24s %-24s %s\n' "模块" "manifest 记录" "当前源码" "状态"
   printf '%s\n' "--------------------------------------------------------------------------"
   local stale=0
-  while IFS=$'\t' read -r m kind _t _s v _a _h recorded; do
+  while IFS=$'\t' read -r m kind _t _s v _a _h recorded _arch; do
     if [ "$kind" = "first-party" ]; then
       if [ -d "$SRC_ROOT/$m/.git" ]; then
         if [ "$m" = "dbdog-agent" ]; then
