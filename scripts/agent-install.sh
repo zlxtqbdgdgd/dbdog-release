@@ -28,6 +28,7 @@ HAD_CONFIG=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
 INSTALLER_CONTRACT_SHA256=""
+AGENT_HOST_ARCH=""
 AGENT_HEALTH_TIMEOUT_SECONDS=90
 AGENT_HEALTH_WAIT_ATTEMPTS=0
 AGENT_HEALTH_WAIT_ELAPSED=0
@@ -151,10 +152,10 @@ trap on_exit EXIT
 trap 'exit 130' INT TERM HUP
 
 require_root_host() {
-  local arch
   [ "$EUID" -eq 0 ] || die "请用 sudo 运行；安装需要写 /opt、/etc 和 systemd"
-  arch="$(uname -m)"
-  [ "$arch" = aarch64 ] || [ "$arch" = arm64 ] || die "dbdog-agent 产物仅支持 aarch64，当前为 $arch"
+  # host_arch 规范化 uname -m（含 arm64/amd64 别名）并对未知架构 fail closed；
+  # 保存为全局供后续 runtime 校验、下载与 marker 比较统一取同一个 manifest 行。
+  AGENT_HOST_ARCH="$(host_arch)"
   [ -d /run/systemd/system ] || die "当前主机不是运行中的 systemd 环境"
   local command
   for command in awk bash cat chmod chown cmp cp curl env file find grep head hostname install ldd \
@@ -762,12 +763,19 @@ validate_runtime_tree() { # <目录> <manifest version>
   local env_bin timeout_bin runtime_ld version_output version_rc=0 label reported_version separator details
   local json_version build_binary_sha version_binary_sha build_text_sha version_text_sha
   local build_json_sha version_json_sha build_output_sha version_output_sha actual_output_sha value
+  local elf_pattern
+  [ -n "$AGENT_HOST_ARCH" ] || die "验证 Agent runtime 前必须先确定主机架构（AGENT_HOST_ARCH 未设置）"
+  case "$AGENT_HOST_ARCH" in
+    aarch64) elf_pattern='ELF 64-bit LSB.*(ARM aarch64|aarch64)' ;;
+    x86_64) elf_pattern='ELF 64-bit LSB.*x86-64' ;;
+    *) die "dbdog-agent 不支持的目标架构: $AGENT_HOST_ARCH" ;;
+  esac
   [ -f "$tree/.install_root" ] || die "Agent runtime 缺少 .install_root"
   [ "$(build_field "$info" product)" = dbdog-agent ] || die "Agent provenance product 错误"
   [ "$(build_field "$info" version)" = "$expected_version" ] || die "Agent provenance version 错误"
   [ "$(build_field "$info" compiled_agent_version)" = "$expected_version" ] || \
     die "Agent provenance compiled_agent_version 与 manifest 版本不一致"
-  [ "$(build_field "$info" architecture)" = aarch64 ] || die "Agent provenance architecture 错误"
+  [ "$(build_field "$info" architecture)" = "$AGENT_HOST_ARCH" ] || die "Agent provenance architecture 错误"
   [ "$(build_field "$info" install_prefix)" = "$AGENT_RUNTIME_DIR" ] || die "Agent install prefix 不匹配"
   # provenance 记录的是 integration 版本；只验证采集插件完整，不拿它限制目标
   # GaussDB 服务端版本。Python minor 随未来 Agent 升级时也不应成为安装器写死条件。
@@ -790,8 +798,8 @@ validate_runtime_tree() { # <目录> <manifest version>
   for bin in bin/agent/agent embedded/bin/trace-loader embedded/bin/trace-agent \
     embedded/bin/process-agent embedded/bin/system-probe; do
     [ -x "$tree/$bin" ] || die "Agent runtime 缺少可执行文件: $bin"
-    file "$tree/$bin" | grep -Eq 'ELF 64-bit LSB.*(ARM aarch64|aarch64)' || \
-      die "Agent 二进制不是 Linux AArch64: $bin"
+    file "$tree/$bin" | grep -Eq "$elf_pattern" || \
+      die "Agent 二进制不是 Linux $AGENT_HOST_ARCH: $bin"
   done
   while IFS= read -r -d '' link; do
     resolved="$(readlink -m "$link")"

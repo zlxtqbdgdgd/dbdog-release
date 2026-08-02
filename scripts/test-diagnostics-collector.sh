@@ -82,10 +82,10 @@ exec "${REAL_DD:?}" "$@"
 EOF
 chmod 0755 "$FAKE_BIN/timeout" "$FAKE_BIN/curl" "$FAKE_BIN/ss" "$FAKE_BIN/dd"
 
-printf '# module\tkind\ttarget\tservice\tversion\tartifact\tsha256\tsource_sha\n' \
+printf '# module\tkind\ttarget\tservice\tversion\tartifact\tsha256\tsource_sha\tarch\n' \
   >"$MANIFEST_FIXTURE"
 for module in node goose postgresql clickhouse dbdog-server dbdog-web dbdog-mcp; do
-  printf '%s\tfirst-party\tstack\t%s\t1.2.3\t%s.tar.gz\t%s\t%s\n' \
+  printf '%s\tfirst-party\tstack\t%s\t1.2.3\t%s-aarch64.tar.gz\t%s\t%s\taarch64\n' \
     "$module" "$module" "$module" \
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' >>"$MANIFEST_FIXTURE"
@@ -134,6 +134,7 @@ run_stack() { # <epoch> <stdout file>
     FAKE_DD_STATE="${FAKE_DD_STATE:-$TEST_ROOT/dd-state}" \
     DBDOG_DIAGNOSTIC_MAX_LOG_BYTES="${DBDOG_DIAGNOSTIC_MAX_LOG_BYTES:-1048576}" \
     MANIFEST="$MANIFEST_FIXTURE" \
+    DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
     bash "$COLLECTOR" >"$output" 2>&1
 }
 
@@ -151,6 +152,9 @@ assert_contains "$FIRST_REPORT" 'release_checkout_commit='
 assert_contains "$FIRST_REPORT" 'release_checkout_dirty='
 assert_contains "$FIRST_REPORT" 'manifest_sha256='
 assert_contains "$FIRST_REPORT" 'diagnostic_contract_sha256='
+assert_contains "$FIRST_REPORT" 'host_arch=aarch64'
+assert_contains "$FIRST_REPORT" 'manifest_arch=aarch64'
+assert_contains "$FIRST_REPORT" 'artifact=dbdog-server-aarch64.tar.gz'
 assert_contains "$FIRST_REPORT" 'old-line-dbdog-server.log'
 assert_contains "$FIRST_REPORT" 'password=<redacted>'
 assert_not_contains "$FIRST_REPORT" 'plain-secret'
@@ -327,6 +331,7 @@ env PATH="$FAKE_BIN:$PATH" \
   DBDOG_DIAGNOSTIC_NOW_EPOCH=200500 \
   REAL_DD="$REAL_DD" \
   MANIFEST="$MANIFEST_FIXTURE" \
+  DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
   bash "$COLLECTOR" >"$MARKER_OUT" 2>&1 || fail '损坏 marker 场景采集失败'
 MARKER_ISSUE="$(result_value "$MARKER_OUT" issue_card)"
 assert_contains "$MARKER_ISSUE" 'module_version.dbdog-web.installed=different_sha256_'
@@ -391,6 +396,7 @@ env PATH="$FAKE_BIN:$PATH" \
   AGENT_CONFIG_DIR="$AGENT_CONFIG" \
   AGENT_LOG_DIR="$AGENT_LOG" \
   MANIFEST="$MANIFEST_FIXTURE" \
+  DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
   bash "$COLLECTOR" >"$AGENT_OUT" 2>&1 && AGENT_RC=0 || AGENT_RC=$?
 AGENT_REPORT="$(result_value "$AGENT_OUT" internal_report)"
 assert_contains "$AGENT_REPORT" 'host_role=agent'
@@ -426,6 +432,7 @@ env PATH="$FAKE_BIN:$PATH" \
   AGENT_CONFIG_DIR="$AGENT_CONFIG" \
   AGENT_LOG_DIR="$AGENT_LOG" \
   MANIFEST="$MANIFEST_FIXTURE" \
+  DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
   bash "$COLLECTOR" >"$POLLUTED_OUT" 2>&1 && POLLUTED_RC=0 || POLLUTED_RC=$?
 POLLUTED_REPORT="$(result_value "$POLLUTED_OUT" internal_report)"
 assert_contains "$POLLUTED_REPORT" 'agent_machine_result_valid=true'
@@ -448,6 +455,7 @@ env PATH="$FAKE_BIN:$PATH" \
   AGENT_CONFIG_DIR="$AGENT_CONFIG" \
   AGENT_LOG_DIR="$AGENT_LOG" \
   MANIFEST="$MANIFEST_FIXTURE" \
+  DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
   bash "$COLLECTOR" >"$INVALID_RESULT_OUT" 2>&1 && \
     fail '重复 machine-result 字段没有 fail closed' || INVALID_RESULT_RC=$?
 [ "$INVALID_RESULT_RC" -eq 2 ] || fail '非法 machine-result 没有返回证据不完整'
@@ -470,6 +478,7 @@ env PATH="$FAKE_BIN:$PATH" \
   AGENT_CONFIG_DIR="$AGENT_CONFIG" \
   AGENT_LOG_DIR="$AGENT_LOG" \
   MANIFEST="$MANIFEST_FIXTURE" \
+  DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
   bash "$COLLECTOR" >"$COMBINED_OUT" 2>&1 && COMBINED_RC=0 || COMBINED_RC=$?
 COMBINED_REPORT="$(result_value "$COMBINED_OUT" internal_report)"
 assert_contains "$COMBINED_REPORT" 'host_role=stack+agent'

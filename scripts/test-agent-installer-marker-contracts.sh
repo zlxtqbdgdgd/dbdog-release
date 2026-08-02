@@ -37,9 +37,9 @@ EXPECTED_CONTRACT="$(agent_installer_contract_fingerprint "$SCRIPTS_DIR")" \
 [[ "$EXPECTED_CONTRACT" =~ ^[0-9a-f]{64}$ ]] \
   || fail "安装器合约指纹不是 64 位小写 SHA-256: $EXPECTED_CONTRACT"
 
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   dbdog-agent first-party dbhost no "$VERSION" \
-  "dbdog-agent-$VERSION-aarch64.tar.gz" "$ARTIFACT_SHA256" agent:test,core:test \
+  "dbdog-agent-$VERSION-aarch64.tar.gz" "$ARTIFACT_SHA256" agent:test,core:test aarch64 \
   >"$MANIFEST_FIXTURE"
 printf '%s\n' "$VERSION" >"$RUNTIME/.dbdog-release-version"
 printf '%s\n' "$ARTIFACT_SHA256" >"$RUNTIME/.dbdog-artifact-sha256"
@@ -48,7 +48,8 @@ run_checker() { # <case> <expected rc>
   local name="$1" expected_rc="$2" rc=0 out
   out="$TEST_ROOT/$name.out"
   AGENT_RUNTIME_DIR="$RUNTIME" MANIFEST="$MANIFEST_FIXTURE" \
-    DBDOG_HOME="$TEST_ROOT/home" bash "$CHECKER" >"$out" 2>&1 || rc=$?
+    DBDOG_HOME="$TEST_ROOT/home" DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
+    bash "$CHECKER" >"$out" 2>&1 || rc=$?
   [ "$rc" -eq "$expected_rc" ] || {
     sed -n '1,160p' "$out" >&2
     fail "$name: check-upgrade exit=$rc，期望 $expected_rc"

@@ -30,9 +30,10 @@ fi
 
 updates=0
 agent_updates=0
+selected_arch="$(host_arch)"
 printf '%-14s %-12s %-12s %s\n' "模块" "已装" "manifest" "状态"
 printf '%s\n' "--------------------------------------------------------"
-while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source_sha; do
+while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source_sha _arch; do
   if [ "$target" = "dbhost" ]; then
     # Agent 不使用 stack 的 current 软链，但仍由同一 manifest 判定版本和产物身份。
     inst="$(agent_marker_value "$AGENT_RUNTIME_DIR/.dbdog-release-version" "$AGENT_RUNTIME_DIR")"
@@ -97,7 +98,7 @@ while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source
     st="一致"
   fi
   printf '%-14s %-12s %-12s %s\n' "$m" "$inst" "$version" "$st"
-done < <(manifest_rows)
+done < <(manifest_selected_rows "" "$selected_arch")
 
 echo
 if [ "$updates" -gt 0 ]; then

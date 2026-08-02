@@ -148,6 +148,7 @@ validate_staged_module() {
 artifact_arch_from_name() {
   case "$1" in
     *-aarch64.tar.gz) echo "aarch64" ;;
+    *-x86_64.tar.gz) echo "x86_64" ;;
     *-noarch.tar.gz) echo "noarch" ;;
     *) die "产物名没有受支持的架构后缀: $1" ;;
   esac
@@ -189,13 +190,13 @@ current_matches_artifact_identity() { # <模块> <manifest 版本> <artifact sha
   [ "$actual_version" = "$version" ] && [ "$actual_sha256" = "$sha256" ]
 }
 
-validate_module_runtime() { # <模块> <版本目录> <aarch64|noarch>
+validate_module_runtime() { # <模块> <版本目录> <aarch64|x86_64|noarch>
   local module="$1" dir="$2" expected_arch="$3" candidate info deps rc
   local machine_count=0
   command -v file >/dev/null 2>&1 || die "缺少运行时检查命令: file"
   command -v ldd >/dev/null 2>&1 || die "缺少运行时检查命令: ldd"
   case "$expected_arch" in
-    aarch64 | noarch) ;;
+    aarch64 | x86_64 | noarch) ;;
     *) die "未知的模块目标架构: $expected_arch" ;;
   esac
 
@@ -207,11 +208,23 @@ validate_module_runtime() { # <模块> <版本目录> <aarch64|noarch>
         ;;
       *ELF*)
         machine_count=$((machine_count + 1))
-        [ "$expected_arch" = "aarch64" ] || \
-          die "noarch 模块含 ELF 机器码: $candidate ($info)"
-        case "$info" in
-          *ELF*64-bit*LSB*ARM\ aarch64*) ;;
-          *) die "模块 ELF 不是 Linux AArch64: $candidate ($info)" ;;
+        case "$expected_arch" in
+          aarch64 | x86_64) ;;
+          *) die "noarch 模块含 ELF 机器码: $candidate ($info)" ;;
+        esac
+        case "$expected_arch" in
+          aarch64)
+            case "$info" in
+              *ELF*64-bit*LSB*ARM\ aarch64*) ;;
+              *) die "模块 ELF 不是 Linux AArch64: $candidate ($info)" ;;
+            esac
+            ;;
+          x86_64)
+            case "$info" in
+              *ELF*64-bit*LSB*x86-64*) ;;
+              *) die "模块 ELF 不是 Linux x86-64: $candidate ($info)" ;;
+            esac
+            ;;
         esac
         case "$info" in
           *"dynamically linked"* | *"shared object"*)
@@ -228,9 +241,12 @@ validate_module_runtime() { # <模块> <版本目录> <aarch64|noarch>
     esac
   done < <(find "$dir" -type f -print0)
 
-  if [ "$expected_arch" = "aarch64" ] && [ "$machine_count" -eq 0 ]; then
-    die "aarch64 模块内没有发现任何 ELF 机器码: $dir"
-  fi
+  case "$expected_arch" in
+    aarch64 | x86_64)
+      [ "$machine_count" -gt 0 ] || \
+        die "$expected_arch 模块内没有发现任何 ELF 机器码: $dir"
+      ;;
+  esac
 
   # 这些命令会触发动态装载和进程初始化，可在切 current 前发现 SIGILL/缺库。
   case "$module" in
@@ -443,12 +459,13 @@ if [ $# -gt 0 ]; then
 else
   # 默认：已安装且版本或产物 SHA 与 manifest 不同（含旧目录无 SHA marker）的模块
   targets=()
-  while IFS=$'\t' read -r m _kind target _svc version _artifact sha256 _source_sha; do
+  selected_arch="$(host_arch)"
+  while IFS=$'\t' read -r m _kind target _svc version _artifact sha256 _source_sha _arch; do
     [ "$target" = "stack" ] || continue
     [ "$version" != "-" ] || continue
     [ -e "$MODULES_DIR/$m/current" ] || [ -L "$MODULES_DIR/$m/current" ] || continue
     current_matches_artifact_identity "$m" "$version" "$sha256" || targets+=("$m")
-  done < <(manifest_rows)
+  done < <(manifest_selected_rows "" "$selected_arch")
   # 配置校准本身也是升级工作。把已安装的同版本模块放入计划后，upgrade_one 可以
   # 安全跳过产物切换，下面仍会重启受影响服务并执行 OAuth 验收。
   if [ "$DBDOG_SERVER_CONFIG_CHANGED" -eq 1 ] \

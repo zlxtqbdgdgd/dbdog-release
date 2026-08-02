@@ -368,14 +368,20 @@ if [ "$HOST_ROLE" = none ]; then
 fi
 
 collect_modules() {
-  local rows="$WORK_DIR/manifest-rows.tsv" module target desired installed artifact
+  local rows="$WORK_DIR/manifest-rows.tsv" module target desired installed installed_sha
+  local manifest_artifact manifest_arch selected_host_arch
   section "stack module identity"
-  if ! manifest_rows >"$rows"; then
+  if ! selected_host_arch="$(host_arch)"; then
     printf 'manifest_status=unavailable\n' >>"$RAW_REPORT"
     COLLECTION_COMPLETE=0
     return
   fi
-  while IFS=$'\t' read -r module _kind target _service desired _artifact _sha _source; do
+  if ! manifest_selected_rows "" "$selected_host_arch" >"$rows"; then
+    printf 'manifest_status=unavailable\n' >>"$RAW_REPORT"
+    COLLECTION_COMPLETE=0
+    return
+  fi
+  while IFS=$'\t' read -r module _kind target _service desired manifest_artifact _sha _source manifest_arch; do
     [ -n "$module" ] || continue
     [ "$target" = stack ] || continue
     case "$module" in
@@ -387,9 +393,10 @@ collect_modules() {
         ;;
     esac
     installed="$(installed_version "$module")"
-    artifact="$(installed_artifact_sha256 "$module")"
-    printf 'module=%s desired_version=%s installed_version=%s installed_artifact_sha256=%s\n' \
-      "$module" "$desired" "$installed" "$artifact" >>"$RAW_REPORT"
+    installed_sha="$(installed_artifact_sha256 "$module")"
+    printf 'module=%s desired_version=%s installed_version=%s installed_artifact_sha256=%s host_arch=%s manifest_arch=%s artifact=%s\n' \
+      "$module" "$desired" "$installed" "$installed_sha" \
+      "$selected_host_arch" "$manifest_arch" "$manifest_artifact" >>"$RAW_REPORT"
     printf '%s\t%s\t%s\n' "$module" "$desired" "$installed" >>"$MODULE_SUMMARY"
   done <"$rows"
 }
