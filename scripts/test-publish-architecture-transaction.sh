@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+# 本机可重复测试：多架构发布事务（build 全部架构 → verify → upload 全部架构（含恢复）
+# → 一次 manifest 更新 → regen_readme → commit → push → prune）。
+#
+# 覆盖两条计划要求的场景：
+#   1. 架构矩阵里第二个架构构建失败：manifest.tsv/README.md 字节不变，且不产生
+#      git commit/push（事务边界卡在 build_one_arch 阶段，永远不会进入
+#      publish_commit_arch_matrix）。
+#   2. 上传响应在第一个架构成功、第二个架构失败后"丢失"（进程中断）：第二次执行
+#      用事务记录 + GitHub size/digest 认领第一个架构已上传的资产（不重复上传），
+#      完成第二个架构后只产生一个发布提交。
+#
+# 加一组补充断言：兼容别名 BUILD_HOST 只在 uname -m 精确匹配请求架构时才回退。
+#
+# 所有场景都真实调用 publish.sh 里的 publish_arches_for_module / build_one_arch /
+# publish_commit_arch_matrix / resolve_build_host_for_arch，只在网络边界（ssh/gh）
+# 打桩，复用 test-publish-upload-contracts.sh 的 fake 手法（按命令形状识别调用，
+# 用环境变量控制场景），git/awk 全部走真实命令。
+set -euo pipefail
+
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dbdog-publish-txn.XXXXXX")"
+trap 'case "$TEST_ROOT" in "${TMPDIR:-/tmp}"/dbdog-publish-txn.*) rm -rf -- "$TEST_ROOT" ;; esac' EXIT
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+pass() { printf 'PASS: %s\n' "$*"; }
+
+# ---- 共享 fake gh / ssh --------------------------------------------------
+# 两者都按“命令形状”分派（识别参数里的固定子串），而不是按调用序号——这样两次
+# 独立执行（模拟进程中断再重启）也能各自被正确识别。所有可变状态落盘在
+# FAKE_STATE_DIR 里，天然跨“两次执行”持久化，模拟真实的 GitHub 产物桶和构建机。
+mkdir -p "$TEST_ROOT/bin"
+
+cat >"$TEST_ROOT/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${FAKE_STATE_DIR:?}"
+: "${FAKE_GH_TOKEN:?}"
+: "${FAKE_RELEASE_DIR:?}"
+
+if [ "${1:-}" = "release" ] && [ "${2:-}" = "view" ]; then
+  exit 0   # 产物桶已存在，跳过 ensure_bucket 的创建分支
+fi
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  printf '%s\n' "$FAKE_GH_TOKEN"
+  exit 0
+fi
+
+if [ "${1:-}" = "api" ]; then
+  for a in "$@"; do
+    if [ "$a" = ".id" ]; then
+      printf '%s\n' 424242
+      exit 0
+    fi
+    if [ "$a" = ".object.sha" ]; then
+      git -C "$FAKE_RELEASE_DIR" rev-parse HEAD
+      exit 0
+    fi
+  done
+  # 两条真实代码路径查同一份资产清单，但 --jq 投影的列不同，必须分别响应：
+  #   inspect_release_asset:            [.name, .size, .digest]  → name, size, sha256:sha
+  #   prune_modules_to_manifest 的完整性校验: [.id, .name, .digest] → id, name, sha256:sha
+  jq_filter=""
+  for a in "$@"; do
+    case "$a" in *'.assets[]'*) jq_filter="$a" ;; esac
+  done
+  case "$jq_filter" in
+    *'.size'*) asset_shape=name-size-digest ;;
+    *'.id'*) asset_shape=id-name-digest ;;
+    *) echo "fake gh: 无法识别资产清单 --jq 投影: $jq_filter" >&2; exit 95 ;;
+  esac
+  if [ -f "$FAKE_STATE_DIR/asset-aarch64" ]; then
+    read -r sz sh <"$FAKE_STATE_DIR/asset-aarch64"
+    if [ "$asset_shape" = name-size-digest ]; then
+      printf '%s\t%s\tsha256:%s\n' "${FAKE_ASSET_NAME_AARCH64:?}" "$sz" "$sh"
+    else
+      printf '%s\t%s\tsha256:%s\n' 1001 "${FAKE_ASSET_NAME_AARCH64:?}" "$sh"
+    fi
+  fi
+  if [ -f "$FAKE_STATE_DIR/asset-x86_64" ]; then
+    read -r sz sh <"$FAKE_STATE_DIR/asset-x86_64"
+    if [ "$asset_shape" = name-size-digest ]; then
+      printf '%s\t%s\tsha256:%s\n' "${FAKE_ASSET_NAME_X86_64:?}" "$sz" "$sh"
+    else
+      printf '%s\t%s\tsha256:%s\n' 1002 "${FAKE_ASSET_NAME_X86_64:?}" "$sh"
+    fi
+  fi
+  exit 0
+fi
+
+printf 'unexpected fake gh call: %s\n' "$*" >&2
+exit 90
+EOF
+chmod 0755 "$TEST_ROOT/bin/gh"
+
+cat >"$TEST_ROOT/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${FAKE_STATE_DIR:?}"
+: "${FAKE_GH_TOKEN:?}"
+
+count() { # count <name> → 自增并把当前计数写到 $FAKE_STATE_DIR/count-<name>
+  local f="$FAKE_STATE_DIR/count-$1" n=0
+  [ ! -f "$f" ] || n="$(<"$f")"
+  n=$((n + 1))
+  printf '%s\n' "$n" >"$f"
+}
+
+joined="$*"
+
+# 1) 远端构建配方执行：ssh ... "$BUILD_HOST" MODULE=... ARCH=... bash -s <"$recipe"
+#    真实调用以 "bash -s" 结尾（没有 --），本地 recipe 内容经 stdin 送达。
+case "$joined" in
+  *"bash -s")
+    cat >/dev/null
+    arch=""
+    for a in "$@"; do
+      case "$a" in ARCH=*) arch="${a#ARCH=}" ;; esac
+    done
+    count "build-$arch"
+    case "$arch" in
+      aarch64)
+        printf 'building aarch64\n' >&2
+        printf '%s\t%s\n' "${FAKE_VERSION:?}" "${FAKE_REMOTE_PATH_AARCH64:?}"
+        exit 0
+        ;;
+      x86_64)
+        if [ "${FAKE_BUILD_X86_64_FAIL:-0}" = 1 ]; then
+          echo "fake recipe: simulated build failure for x86_64" >&2
+          exit 1
+        fi
+        printf 'building x86_64\n' >&2
+        printf '%s\t%s\n' "${FAKE_VERSION:?}" "${FAKE_REMOTE_PATH_X86_64:?}"
+        exit 0
+        ;;
+      *)
+        echo "fake recipe: unexpected ARCH=$arch" >&2
+        exit 89
+        ;;
+    esac
+    ;;
+esac
+
+# 2) 架构检查（verify-artifact-arch.sh）：含 "/usr/bin/bash -s --"
+case "$joined" in
+  *"/usr/bin/bash -s --"*)
+    cat >/dev/null
+    echo "fake: 架构检查通过"
+    exit 0
+    ;;
+esac
+
+# 3) 构建机直传（builder_upload_once）：含 "/usr/bin/bash -c"
+#    必须在下面的元数据探针（case 4）之前判断：这条命令的内嵌校验脚本自己也含有
+#    "stat -c"/"sha256sum --" 字样（用来核对远端文件 size/sha 再上传），如果顺序反了，
+#    真实上传调用会被误判成元数据探针，永远不会走到 FAKE_UPLOAD_OUTCOME_* 分支。
+case "$joined" in
+  *"/usr/bin/bash -c"*)
+    IFS= read -r token
+    [ "$token" = "$FAKE_GH_TOKEN" ] || { echo "fake: token 未通过 stdin 送达" >&2; exit 96; }
+    case "$joined" in
+      *"$FAKE_GH_TOKEN"*) echo "fake: token 泄漏进 ssh 参数" >&2; exit 94 ;;
+    esac
+    arch=""
+    case "$joined" in
+      *"${FAKE_ASSET_NAME_AARCH64:?}"*) arch=aarch64 ;;
+      *"${FAKE_ASSET_NAME_X86_64:?}"*) arch=x86_64 ;;
+      *) echo "fake: 无法识别上传资产" >&2; exit 88 ;;
+    esac
+    count "upload-$arch"
+    outcome_var="FAKE_UPLOAD_OUTCOME_${arch}"
+    outcome="${!outcome_var:-fail}"
+    if [ "$outcome" = "success" ]; then
+      case "$arch" in
+        aarch64) printf '%s %s\n' "$FAKE_SIZE_AARCH64" "$FAKE_SHA_AARCH64" >"$FAKE_STATE_DIR/asset-aarch64" ;;
+        x86_64) printf '%s %s\n' "$FAKE_SIZE_X86_64" "$FAKE_SHA_X86_64" >"$FAKE_STATE_DIR/asset-x86_64" ;;
+      esac
+      exit 0
+    fi
+    echo "fake: 模拟上传响应丢失/网络失败" >&2
+    exit 1
+    ;;
+esac
+
+# 4) 远端产物元数据 / 恢复校验探针：含 "stat -c" 与 "sha256sum --"
+#    remote_artifact_metadata 与 publish_verify_recovery_claim 用的是同一条命令形状。
+case "$joined" in
+  *"stat -c"*"sha256sum --"*)
+    case "$joined" in
+      *"${FAKE_REMOTE_PATH_AARCH64:?}"*)
+        printf '%s\n%s  x\n' "${FAKE_SIZE_AARCH64:?}" "${FAKE_SHA_AARCH64:?}"
+        ;;
+      *"${FAKE_REMOTE_PATH_X86_64:?}"*)
+        printf '%s\n%s  x\n' "${FAKE_SIZE_X86_64:?}" "${FAKE_SHA_X86_64:?}"
+        ;;
+      *)
+        echo "fake: 未知远端产物路径" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+esac
+
+echo "unexpected fake ssh call: $joined" >&2
+exit 87
+EOF
+chmod 0755 "$TEST_ROOT/bin/ssh"
+
+export PATH="$TEST_ROOT/bin:$PATH"
+
+# ---- 固定测试用值 ---------------------------------------------------------
+OLD_VERSION="0.1.0"
+NEW_VERSION="0.1.1"
+FAKE_ASSET_NAME_AARCH64="dbdog-web-$NEW_VERSION-aarch64.tar.gz"
+FAKE_ASSET_NAME_X86_64="dbdog-web-$NEW_VERSION-x86_64.tar.gz"
+FAKE_SIZE_AARCH64=1024
+FAKE_SIZE_X86_64=2048
+FAKE_SHA_AARCH64="$(printf 'a%.0s' $(seq 1 64))"
+FAKE_SHA_X86_64="$(printf 'b%.0s' $(seq 1 64))"
+FAKE_VERSION="$NEW_VERSION"
+FAKE_GH_TOKEN='github_pat_test_secret_must_not_leak'
+export FAKE_ASSET_NAME_AARCH64 FAKE_ASSET_NAME_X86_64 FAKE_SIZE_AARCH64 FAKE_SIZE_X86_64 \
+  FAKE_SHA_AARCH64 FAKE_SHA_X86_64 FAKE_VERSION FAKE_GH_TOKEN
+
+# ---- fixture 建造 ---------------------------------------------------------
+hashes_of() { # hashes_of <release dir>；跨平台取 manifest.tsv/README.md 的内容摘要
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$1" && sha256sum manifest.tsv README.md )
+  else
+    ( cd "$1" && shasum -a 256 manifest.tsv README.md )
+  fi
+}
+
+write_manifest() { # write_manifest <path> <version> <source_sha>
+  local f="$1" v="$2" ssha="$3"
+  {
+    printf 'dbdog-web\tfirst-party\tstack\tyes\t%s\tdbdog-web-%s-aarch64.tar.gz\toldsha-aarch64-placeholder\t%s\taarch64\n' \
+      "$v" "$v" "$ssha"
+    printf 'dbdog-web\tfirst-party\tstack\tyes\t%s\tdbdog-web-%s-x86_64.tar.gz\toldsha-x86_64-placeholder\t%s\tx86_64\n' \
+      "$v" "$v" "$ssha"
+  } >"$f"
+}
+
+setup_release_repo() { # setup_release_repo <dir> <bare> <manifest fixture>
+  local dir="$1" bare="$2" manifest_fixture="$3"
+  git init -q --bare "$bare"
+  git init -q "$dir"
+  git -C "$dir" config user.name dbdog-contract-test
+  git -C "$dir" config user.email dbdog-contract-test@example.invalid
+  git -C "$dir" remote add origin "$bare"
+  cp "$manifest_fixture" "$dir/manifest.tsv"
+  cat >"$dir/README.md" <<'MD'
+# dbdog-release（测试 fixture）
+
+<!-- VERSION-TABLE:BEGIN -->
+<!-- VERSION-TABLE:END -->
+MD
+  git -C "$dir" add manifest.tsv README.md
+  git -C "$dir" commit -qm 'init fixture'
+  git -C "$dir" branch -M main
+  git -C "$dir" push -q -u origin main
+}
+
+setup_src_repo() { # setup_src_repo <dir>
+  local dir="$1"
+  git init -q "$dir"
+  git -C "$dir" config user.name dbdog-contract-test
+  git -C "$dir" config user.email dbdog-contract-test@example.invalid
+  printf 'dbdog-web source under test\n' >"$dir/main.go"
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm 'source under test'
+}
+
+run_txn_pipeline() { # run_txn_pipeline <module> <version> → 依次跑三阶段（真实驱动被测函数），
+  # 镜像 cmd_publish 里真实的调用序列：先给整个矩阵做 builder 预检，再逐架构构建。
+  local m="$1" v="$2" arch txn_dir
+  publish_ensure_arch_builders "$m"
+  while IFS= read -r arch; do
+    [ -n "$arch" ] || continue
+    build_one_arch "$m" "$v" "$arch"
+  done < <(publish_arches_for_module "$m")
+  txn_dir="$(publish_txn_dir "$m" "$v")"
+  publish_commit_arch_matrix "$txn_dir/txn.tsv"
+}
+
+# ===========================================================================
+# 场景 1：第二个架构（x86_64）构建失败 → manifest/README 字节不变，无 commit/push
+# ===========================================================================
+CASE1="$TEST_ROOT/case1"
+mkdir -p "$CASE1"
+manifest_fixture1="$CASE1/manifest.fixture.tsv"
+
+setup_src_repo "$CASE1/src/dbdog-web"
+source_sha1="$(git -C "$CASE1/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture1" "$OLD_VERSION" "$source_sha1"
+setup_release_repo "$CASE1/release" "$CASE1/release-bare.git" "$manifest_fixture1"
+
+DBDOG_HOME="$CASE1/home"
+RELEASE_DIR="$CASE1/release"
+SRC_ROOT="$CASE1/src"
+# 显式设置 MANIFEST（而不是让 lib.sh 用 RELEASE_DIR 派生默认值）：本文件后面还有
+# 场景 2/3 各自的 ( ... ) 子 shell，bash 子 shell 会继承父 shell 的全部变量（不只是
+# export 的），如果这里让 MANIFEST 走 "${MANIFEST:-...}" 的默认值分支，后面场景的
+# 子 shell 会在 source lib.sh 时发现 MANIFEST 已经"被设置过"（继承自本场景），从而
+# 沿用这里的 CASE1 路径，而不是各自场景自己的 RELEASE_DIR/manifest.tsv。
+MANIFEST="$RELEASE_DIR/manifest.tsv"
+export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+# shellcheck source=publish/publish.sh
+source "$SCRIPTS_DIR/publish/publish.sh"
+
+# publish.conf.example 的占位值必须不可用；显式给两个架构配置互不相同的原生 builder。
+BUILD_HOST_AARCH64="fake-aarch64-builder"
+BUILD_HOST_X86_64="fake-x86_64-builder"
+BUILD_HOST=""
+BUILD_WORK="$CASE1/build-work"
+REPO_ROOT="$CASE1/repo-root"
+TOOL_PATH=""
+PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+
+before_hashes="$(hashes_of "$RELEASE_DIR")"
+before_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+
+FAKE_STATE_DIR="$CASE1/state"
+mkdir -p "$FAKE_STATE_DIR"
+export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+export FAKE_BUILD_X86_64_FAIL=1
+
+if (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE1/run.log" 2>&1; then
+  sed -n '1,200p' "$CASE1/run.log" >&2
+  fail "第二个架构（x86_64）构建失败时，事务流水线本应中止却成功完成"
+fi
+grep -Fq '远端构建配方执行失败' "$CASE1/run.log" \
+  || { sed -n '1,200p' "$CASE1/run.log" >&2; fail "x86_64 构建失败没有留下预期的诊断信息"; }
+pass "x86_64 架构构建按预期失败并中止事务流水线"
+
+after_hashes="$(hashes_of "$RELEASE_DIR")"
+[ "$before_hashes" = "$after_hashes" ] \
+  || fail "第二架构构建失败后 manifest.tsv/README.md 字节发生了变化"
+pass "第二架构构建失败时 manifest.tsv 与 README.md 字节完全不变"
+
+after_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+[ "$before_head" = "$after_head" ] \
+  || fail "第二架构构建失败后仍然产生了 git commit"
+[ "$(git -C "$RELEASE_DIR" rev-list --count HEAD)" = 1 ] \
+  || fail "第二架构构建失败后 release 仓提交数不是初始的 1"
+pass "第二架构构建失败时没有产生任何 git commit"
+
+[ ! -e "$FAKE_STATE_DIR/count-upload-aarch64" ] && [ ! -e "$FAKE_STATE_DIR/count-upload-x86_64" ] \
+  || fail "第二架构构建失败前不应该有任何架构进入上传阶段"
+pass "第二架构构建失败时零上传（build 阶段整体先于 upload 阶段）"
+
+txn_dir1="$(publish_txn_dir dbdog-web "$NEW_VERSION")"
+[ -d "$txn_dir1" ] || fail "事务目录未创建: $txn_dir1"
+mode1="$(stat -c '%a' "$txn_dir1" 2>/dev/null || stat -f '%Lp' "$txn_dir1")"
+[ "$mode1" = 700 ] || fail "事务目录权限不是 0700: $mode1"
+[ "$(awk -F'\t' '$1=="dbdog-web"' "$txn_dir1/txn.tsv" | wc -l | tr -d ' ')" = 1 ] \
+  || fail "事务 TSV 应该只有 aarch64 一行（x86_64 从未成功追加）"
+pass "事务目录 mode 0700，且只记录了成功架构（aarch64）那一行"
+
+# ===========================================================================
+# 场景 2：aarch64 上传成功后进程中断；第二次执行认领同一 asset，不重复上传，
+#         完成 x86_64 后只产生一个发布提交。
+# ===========================================================================
+CASE2="$TEST_ROOT/case2"
+mkdir -p "$CASE2"
+manifest_fixture2="$CASE2/manifest.fixture.tsv"
+
+setup_src_repo "$CASE2/src/dbdog-web"
+source_sha2="$(git -C "$CASE2/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture2" "$OLD_VERSION" "$source_sha2"
+setup_release_repo "$CASE2/release" "$CASE2/release-bare.git" "$manifest_fixture2"
+
+(
+  DBDOG_HOME="$CASE2/home"
+  RELEASE_DIR="$CASE2/release"
+  SRC_ROOT="$CASE2/src"
+  # 见场景 1 里的同一条注释：显式设置 MANIFEST，不依赖 lib.sh 的默认派生，
+  # 避免子 shell 继承场景 1 已经 export 过的 MANIFEST。
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE2/build-work"
+  REPO_ROOT="$CASE2/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+
+  FAKE_STATE_DIR="$CASE2/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+
+  before_hashes="$(hashes_of "$RELEASE_DIR")"
+  before_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+
+  # ---- 第一次执行：两个架构都构建成功；aarch64 上传成功，x86_64 上传"响应丢失"----
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=fail
+  if (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE2/round1.log" 2>&1; then
+    sed -n '1,200p' "$CASE2/round1.log" >&2
+    fail "第一次执行本应在 x86_64 上传失败时中断，却成功完成"
+  fi
+  pass "第一次执行：aarch64 上传成功，x86_64 上传失败后中断（模拟进程中断）"
+
+  [ -f "$FAKE_STATE_DIR/asset-aarch64" ] \
+    || fail "第一次执行后 aarch64 资产应该已经真实上传"
+  [ ! -f "$FAKE_STATE_DIR/asset-x86_64" ] \
+    || fail "第一次执行后 x86_64 资产不应该已经上传成功"
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "aarch64 第一次执行的上传尝试次数不是 1"
+  x86_64_upload_attempts_round1="$(<"$FAKE_STATE_DIR/count-upload-x86_64")"
+  [ "$x86_64_upload_attempts_round1" = 1 ] \
+    || fail "x86_64 第一次执行的上传尝试次数不是 1（PUBLISH_UPLOAD_MAX_ATTEMPTS=1，应恰好失败一次后中断）"
+  pass "第一次执行后：aarch64 资产已在（模拟）GitHub 落地，x86_64 尚未落地"
+
+  after_round1_hashes="$(hashes_of "$RELEASE_DIR")"
+  [ "$before_hashes" = "$after_round1_hashes" ] \
+    || fail "第一次执行中断后 manifest.tsv/README.md 字节发生了变化"
+  after_round1_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$before_head" = "$after_round1_head" ] \
+    || fail "第一次执行中断后不应该产生任何 git commit"
+  pass "第一次执行中断后 manifest/README 字节不变，且没有 commit（尚未提交阶段）"
+
+  # ---- 第二次执行：恢复。aarch64 应被认领（不重复上传），x86_64 补齐上传 ----
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+  (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE2/round2.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE2/round2.log" >&2; fail "第二次执行未能完成剩余架构的发布"; }
+  pass "第二次执行：认领 aarch64、补齐 x86_64 上传，事务完成"
+
+  grep -Fq '认领已上传的产物桶资产' "$CASE2/round2.log" \
+    || { sed -n '1,200p' "$CASE2/round2.log" >&2; fail "第二次执行没有留下 aarch64 恢复认领的日志"; }
+  pass "第二次执行的日志明确记录了 aarch64 恢复认领（不是静默重新上传）"
+
+  [ "$(<"$FAKE_STATE_DIR/count-upload-aarch64")" = 1 ] \
+    || fail "aarch64 在恢复后被重复上传了（认领应跳过真实上传调用，总次数应保持第一次执行时的 1）"
+  x86_64_upload_attempts_round2="$(<"$FAKE_STATE_DIR/count-upload-x86_64")"
+  [ "$((x86_64_upload_attempts_round2 - x86_64_upload_attempts_round1))" = 1 ] \
+    || fail "第二次执行里 x86_64 的上传尝试次数不是恰好 1（第一次失败的 1 次 + 第二次成功的 1 次，总数应为 2）"
+  [ -f "$FAKE_STATE_DIR/count-build-aarch64" ] && [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "aarch64 在两轮执行中被构建的次数不是恰好 1（应该在第一次执行中构建、第二次命中事务记录短路）"
+  [ -f "$FAKE_STATE_DIR/count-build-x86_64" ] && [ "$(<"$FAKE_STATE_DIR/count-build-x86_64")" = 1 ] \
+    || fail "x86_64 在两轮执行中被构建的次数不是恰好 1（构建矩阵在第一次执行已全部完成，第二次只补上传）"
+  pass "两个架构全程只被真实构建一次；aarch64 只被真实上传一次，x86_64 补齐时只上传一次"
+
+  final_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$final_head" != "$before_head" ] \
+    || fail "两轮执行完成后没有产生任何 commit"
+  commit_count="$(git -C "$RELEASE_DIR" rev-list --count "$before_head..HEAD")"
+  [ "$commit_count" = 1 ] \
+    || fail "两轮执行完成后应该只产生一个发布提交，实际: $commit_count"
+  pass "恢复完成整个架构矩阵后，两轮执行合计只产生一个发布提交"
+
+  new_row_aarch64="$(manifest_get dbdog-web 6 aarch64)"
+  new_row_x86_64="$(manifest_get dbdog-web 6 x86_64)"
+  [ "$new_row_aarch64" = "$FAKE_ASSET_NAME_AARCH64" ] \
+    || fail "manifest aarch64 行的 artifact 未更新为新产物"
+  [ "$new_row_x86_64" = "$FAKE_ASSET_NAME_X86_64" ] \
+    || fail "manifest x86_64 行的 artifact 未更新为新产物"
+  [ "$(manifest_get dbdog-web 5 aarch64)" = "$NEW_VERSION" ] \
+    || fail "manifest aarch64 行的 version 未更新为新版本"
+  [ "$(manifest_get dbdog-web 5 x86_64)" = "$NEW_VERSION" ] \
+    || fail "manifest x86_64 行的 version 未更新为新版本"
+  pass "提交后 manifest 两个架构行都精确更新为各自的新产物/新版本"
+) || exit 1
+
+# ===========================================================================
+# 补充：兼容别名 BUILD_HOST 只在 uname -m 与请求架构一致时才作为回退。
+# ===========================================================================
+CASE3="$TEST_ROOT/case3"
+mkdir -p "$CASE3/release"
+git init -q "$CASE3/release"
+git -C "$CASE3/release" config user.name dbdog-contract-test
+git -C "$CASE3/release" config user.email dbdog-contract-test@example.invalid
+: >"$CASE3/release/manifest.tsv"
+git -C "$CASE3/release" add manifest.tsv
+git -C "$CASE3/release" commit -qm init
+
+(
+  RELEASE_DIR="$CASE3/release"
+  DBDOG_HOME="$CASE3/home"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export RELEASE_DIR DBDOG_HOME MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+  BUILD_HOST_AARCH64=""
+  BUILD_HOST_X86_64=""
+  BUILD_HOST="legacy-aarch64-only"
+
+  ssh() { # 局部桩：只答复 "uname -m"，模拟旧 BUILD_HOST 是一台真实 aarch64 机器
+    case "$*" in
+      "legacy-aarch64-only uname -m") echo aarch64 ;;
+      *) echo "unexpected legacy probe ssh call: $*" >&2; return 1 ;;
+    esac
+  }
+
+  resolve_build_host_for_arch aarch64
+  [ "$RESOLVED_BUILD_HOST" = "legacy-aarch64-only" ] \
+    || fail "旧 BUILD_HOST 在 uname -m 匹配请求架构时应该被接受为兼容回退"
+
+  # resolve_build_host_for_arch 对架构不匹配走的是 die()（exit），不是 return 1——
+  # 这是有意的：生产代码里它只会被 build_one_arch/publish_claim_or_upload_arch_asset
+  # 调用，架构不匹配就应该让整个发布硬失败，不是优雅返回给调用方处理。所以这里必须
+  # 用子 shell 隔离 exit，只让子 shell 死掉，不能把测试脚本自己也带死
+  # （同样的教训见 test-publish-agent-version-contracts.sh 对 load_agent_release_baseline 的调用方式）。
+  if (resolve_build_host_for_arch x86_64) 2>"$CASE3/legacy-mismatch.log"; then
+    fail "旧 BUILD_HOST 是 aarch64 机器时不应该被接受为 x86_64 的兼容回退"
+  fi
+  grep -Fq '与请求架构 x86_64 不一致' "$CASE3/legacy-mismatch.log" \
+    || { sed -n '1,50p' "$CASE3/legacy-mismatch.log" >&2; fail "架构不匹配时没有给出明确拒绝原因"; }
+) || exit 1
+pass "兼容别名 BUILD_HOST 只在 uname -m 精确匹配请求架构时才作为回退，不匹配时 fail closed"
+
+# ===========================================================================
+# 补充：noarch 产物（如 dbdog-mcp）不对应任何真实 CPU 架构，resolve_build_host_for_arch
+# 必须能为它解析出一个可用 builder，而不是落进"未知架构"拒绝分支（这是实现过程中
+# 真实踩到的回归：build_one_arch 对 noarch 一直无条件调用
+# resolve_build_host_for_arch，如果后者不认识 "noarch"，dbdog-mcp 这类现有 noarch
+# 模块的发布会在触碰任何构建前就先被拒绝）。
+# ===========================================================================
+CASE4="$TEST_ROOT/case4"
+mkdir -p "$CASE4/release"
+git init -q "$CASE4/release"
+git -C "$CASE4/release" config user.name dbdog-contract-test
+git -C "$CASE4/release" config user.email dbdog-contract-test@example.invalid
+: >"$CASE4/release/manifest.tsv"
+git -C "$CASE4/release" add manifest.tsv
+git -C "$CASE4/release" commit -qm init
+
+(
+  RELEASE_DIR="$CASE4/release"
+  DBDOG_HOME="$CASE4/home"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export RELEASE_DIR DBDOG_HOME MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  # 场景 A：只配置了 BUILD_HOST_AARCH64，没有专门给 noarch 配置什么——应该直接复用它。
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64=""
+  BUILD_HOST=""
+  resolve_build_host_for_arch noarch
+  [ "$RESOLVED_BUILD_HOST" = "fake-aarch64-builder" ] \
+    || fail "noarch 应该优先复用已配置的 BUILD_HOST_AARCH64"
+
+  # 场景 B：只配置了旧的单一 BUILD_HOST（未迁移到双执行器的老配置）——noarch 不需要
+  # 验证 uname -m（它本来就不对应任何 CPU 架构），应该直接可用。
+  BUILD_HOST_AARCH64=""
+  BUILD_HOST_X86_64=""
+  BUILD_HOST="legacy-only-builder"
+  resolve_build_host_for_arch noarch
+  [ "$RESOLVED_BUILD_HOST" = "legacy-only-builder" ] \
+    || fail "noarch 在只有旧 BUILD_HOST 时应该直接复用，不需要 uname -m 校验"
+
+  # 场景 C：什么都没配置——必须 fail closed，而不是当成"不支持的架构"报错。
+  BUILD_HOST_AARCH64=""
+  BUILD_HOST_X86_64=""
+  BUILD_HOST=""
+  if (resolve_build_host_for_arch noarch) 2>"$CASE4/noarch-unconfigured.log"; then
+    fail "noarch 在完全没有配置任何 builder 时不应该成功"
+  fi
+  grep -Fq '没有为 noarch 构建配置任何原生 builder' "$CASE4/noarch-unconfigured.log" \
+    || { sed -n '1,50p' "$CASE4/noarch-unconfigured.log" >&2; fail 'noarch 未配置 builder 时的拒绝原因不明确（不应该是「不支持的架构」）'; }
+) || exit 1
+pass "noarch 产物能正确解析出可用 builder（优先复用 aarch64/旧 BUILD_HOST），未配置任何 builder 时才 fail closed"
+
+# ===========================================================================
+# 补充：矩阵里任一架构缺少 builder，必须在触碰任何构建之前整体失败——即使排在
+# 前面的架构（aarch64）本来是有 builder、能构建成功的，也不能先真的构建它一遍。
+# ===========================================================================
+CASE5="$TEST_ROOT/case5"
+mkdir -p "$CASE5"
+manifest_fixture5="$CASE5/manifest.fixture.tsv"
+setup_src_repo "$CASE5/src/dbdog-web"
+source_sha5="$(git -C "$CASE5/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture5" "$OLD_VERSION" "$source_sha5"
+setup_release_repo "$CASE5/release" "$CASE5/release-bare.git" "$manifest_fixture5"
+
+(
+  DBDOG_HOME="$CASE5/home"
+  RELEASE_DIR="$CASE5/release"
+  SRC_ROOT="$CASE5/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  # aarch64 配了真实（fake）builder；x86_64 完全没配置——矩阵不完整，必须整体失败。
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64=""
+  BUILD_HOST=""
+  BUILD_WORK="$CASE5/build-work"
+  REPO_ROOT="$CASE5/repo-root"
+  TOOL_PATH=""
+
+  FAKE_STATE_DIR="$CASE5/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+
+  if (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE5/run.log" 2>&1; then
+    sed -n '1,200p' "$CASE5/run.log" >&2
+    fail "x86_64 缺少 builder 时事务流水线本应整体失败却成功完成"
+  fi
+  grep -Fq '没有为架构 x86_64 配置原生 builder' "$CASE5/run.log" \
+    || { sed -n '1,200p' "$CASE5/run.log" >&2; fail "x86_64 缺少 builder 时没有留下预期的诊断信息"; }
+  [ ! -e "$FAKE_STATE_DIR/count-build-aarch64" ] \
+    || fail "x86_64 缺少 builder 时，排在前面的 aarch64 不应该被真的构建（矩阵预检应先于任何构建）"
+) || exit 1
+pass "矩阵中任一架构缺少 builder 时，整个矩阵在触碰任何构建之前就整体失败（不会先构建排在前面的架构）"
+
+printf 'ALL PASS: 16 publish architecture transaction contract tests\n'
