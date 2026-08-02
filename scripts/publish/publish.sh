@@ -721,11 +721,27 @@ publish_arches_for_module() { # publish_arches_for_module <module> → 该模块
   manifest_arches "$1"
 }
 
+resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RESOLVED_RECIPE
+  # 存在 recipes/<module>-<arch>.sh 时精确选择该架构专属配方（目前只有
+  # dbdog-agent 拆分出 x86_64 配方，见 recipes/dbdog-agent-x86_64.sh），否则回退
+  # 到共享的 recipes/<module>.sh。其余模块的架构差异（如 ddprof）在同一份配方
+  # 内部用 ARCH 分支处理，没有拆分文件，也就没有对应的 <module>-<arch>.sh，
+  # 天然落进回退分支。
+  local m="$1" arch="$2"
+  local exact="$HERE/recipes/$m-$arch.sh"
+  if [ -f "$exact" ] && [ ! -L "$exact" ]; then
+    RESOLVED_RECIPE="$exact"
+  else
+    RESOLVED_RECIPE="$HERE/recipes/$m.sh"
+  fi
+}
+
 build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> → 向事务 TSV 追加一行，不上传、不改 manifest
   local m="$1" ver="$2" arch="$3" sha="" core="" kind agent_baseline_blob=""
-  local recipe="$HERE/recipes/$m.sh"
-  local txn_dir txn_tsv
-  [ -f "$recipe" ] || die "缺少构建配方: $recipe"
+  local recipe txn_dir txn_tsv
+  resolve_module_recipe "$m" "$arch"
+  recipe="$RESOLVED_RECIPE"
+  [ -f "$recipe" ] && [ ! -L "$recipe" ] || die "缺少构建配方: $recipe"
   case "$arch" in
     aarch64 | x86_64 | noarch) ;;
     *) die "[$m] 不支持的构建架构: $arch" ;;
@@ -801,9 +817,11 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
     *) die "[$m/$arch] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
   esac
   local expected_rpath
-  if [ "$m" = dbdog-agent ]; then
-    # Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个 build attempt；
-    # 它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的路径/owner/mode 门禁。
+  if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
+    # aarch64 Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个
+    # build attempt；它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的
+    # 路径/owner/mode 门禁。x86_64 Agent 配方（recipes/dbdog-agent-x86_64.sh）
+    # 没有这段历史包袱，和其它一方模块一样落在通用 BUILD_WORK/<module>/out 下。
     expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"

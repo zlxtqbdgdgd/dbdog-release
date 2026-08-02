@@ -312,6 +312,20 @@ grep -Fq 'require_exact_field "$build_info" integrations_core_git_sha "$PINNED_I
   "$RECIPE" || fail "canonical artifact verifier lost the integration core provenance gate"
 pass "canonical tarball verifier rechecks integration and split-core provenance"
 
+# Task 6 taught publish.sh to select recipes/dbdog-agent-x86_64.sh precisely for
+# dbdog-agent/x86_64 and to confine the aarch64 sealed attempt path to arch=aarch64.
+# Guard both edges of that refactor: the aarch64 sealed path constant must survive
+# byte-for-byte, and it must not silently start applying to other architectures.
+PUBLISH_SH="$SCRIPTS_DIR/publish/publish.sh"
+bash -n "$PUBLISH_SH"
+grep -Fq 'resolve_module_recipe "$m" "$arch"' "$PUBLISH_SH" ||
+  fail "build_one_arch no longer resolves the Agent recipe through the architecture-aware selector"
+grep -Fq 'if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then' "$PUBLISH_SH" ||
+  fail "the aarch64 sealed attempt directory is no longer scoped precisely to arch=aarch64"
+grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"' "$PUBLISH_SH" ||
+  fail "the aarch64 sealed attempt directory constant changed"
+pass "publish.sh keeps the aarch64 sealed attempt path exact and arch-scoped after adding x86_64 recipe selection"
+
 if [ -f "$WHEEL" ]; then
   if command -v sha256sum >/dev/null 2>&1; then
     actual_wheel_sha=$(sha256sum "$WHEEL" | awk '{ print $1 }')
