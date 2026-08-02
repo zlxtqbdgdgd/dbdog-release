@@ -127,6 +127,41 @@ if MANIFEST="$TEST_ROOT/conflict.tsv" manifest_get both 6 aarch64 >/dev/null 2>&
 fi
 pass 'manifest_get 同样拒绝精确/noarch 冲突'
 
+# ---- manifest_get：冲突的爆炸半径必须限定在被查询的模块，不能波及无关模块 ----
+# alpha 干净（只有一行 aarch64），beta 与 alpha 无关且自己有 aarch64+noarch 冲突。
+# 查 alpha 不该因为 beta 的冲突而失败；查 beta 失败时错误信息必须点名 beta，不能是 alpha。
+{
+  printf 'alpha\tfirst-party\tstack\tno\t1.0.0\talpha-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A"
+  printf 'beta\tthird-party\tstack\tno\t1.0.0\tbeta-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_B"
+  printf 'beta\tthird-party\tstack\tno\t1.0.0\tbeta-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_C"
+} >"$TEST_ROOT/blast-radius.tsv"
+# 必须同时检查退出码和值：manifest_selected_rows 按文件行序处理模块，alpha 排在 beta 前面时，
+# 冲突前已经把 alpha 那一行流式 print 给了下游 awk，即使外层整体判定失败、返回值仍可能"碰巧"
+# 是对的——只看 stdout 内容会漏掉「返回了失败状态」这个真正的 bug。
+if out="$(MANIFEST="$TEST_ROOT/blast-radius.tsv" manifest_get alpha 6 aarch64)"; then
+  [ "$out" = alpha-aarch64.tar.gz ] || fail "alpha 查询返回值错误: $out"
+else
+  fail '无关模块 beta 的精确/noarch 冲突波及了 alpha 的定向查询（exit 非 0）'
+fi
+pass 'manifest_get 冲突的爆炸半径限定在被查询的模块，不影响无关模块查询'
+out="$(MANIFEST="$TEST_ROOT/blast-radius.tsv" manifest_get beta 6 aarch64 2>&1)" && \
+  fail "manifest_get 未对 beta 自身的精确/noarch 冲突报错: $out"
+case "$out" in
+  *"模块 beta"*) ;;
+  *) fail "manifest_get 冲突错误信息没有点名真正冲突的模块 beta: $out" ;;
+esac
+case "$out" in
+  *alpha*) fail "manifest_get 冲突错误信息错误地牵连了无关模块 alpha: $out" ;;
+esac
+pass 'manifest_get 冲突错误信息精确指向真正冲突的模块'
+# 批量遍历场景（Task 3 用 manifest_selected_rows "" "$arch"）保持全表 fail-closed 语义不变：
+# 同一份 fixture 里 beta 的冲突仍然要让不带模块过滤的全表选择整体失败。
+if MANIFEST="$TEST_ROOT/blast-radius.tsv" DBDOG_HOST_ARCH_OVERRIDE=aarch64 manifest_selected_rows \
+  >/dev/null 2>&1; then
+  fail 'manifest_selected_rows 批量遍历时未对 beta 的冲突整体 fail closed'
+fi
+pass 'manifest_selected_rows 批量遍历场景仍保持全表 fail-closed 语义'
+
 # ---- manifest_selected_rows / manifest_get：目标架构完全缺失 ----
 printf 'onlyx86\tthird-party\tstack\tno\t1.0.0\tonlyx86-x86_64.tar.gz\t%s\t-\tx86_64\n' "$SHA_A" \
   >"$TEST_ROOT/missing.tsv"
@@ -162,4 +197,4 @@ arches="$(MANIFEST="$TEST_ROOT/arches.tsv" manifest_arches multi | tr '\n' ' ')"
 [ "$arches" = 'aarch64 x86_64 noarch ' ] || fail "manifest_arches 顺序错误: $arches"
 pass 'manifest_arches 按 aarch64 x86_64 noarch 稳定顺序输出'
 
-printf 'ALL PASS: 19 manifest architecture contract tests\n'
+printf 'ALL PASS: 22 manifest architecture contract tests\n'

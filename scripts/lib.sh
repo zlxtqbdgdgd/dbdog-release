@@ -406,9 +406,33 @@ manifest_get() { # manifest_get <module> <列号> [arch]；精确架构优先，
   else
     arch="$(host_arch)"
   fi
-  if ! manifest_selected_rows "" "$arch" \
-      | awk -F'\t' -v m="$m" -v c="$col" '$1 == m { print $c; found = 1 } END { exit !found }'; then
-    printf 'ERROR: manifest 里没有模块 %s 在架构 %s 下的唯一行（不存在，或与 noarch 行冲突，见上方具体原因）\n' \
+  # 故意不复用 manifest_selected_rows "" "$arch"：那个函数一次性遍历全表，任何一个
+  # 无关模块的精确/noarch 冲突都会让它的 END 循环整体 exit 1，连累这里按模块名的定向
+  # 查询失败，且外层错误信息会用被查询的模块名，误导成"这个模块自己有歧义"。这里的
+  # awk 只看 $1==m 这一个模块的行，冲突判定和错误信息都严格限定在这一个模块上。
+  if ! manifest_all_rows | awk -F'\t' -v m="$m" -v arch="$arch" -v c="$col" '
+      $1 == m {
+        if ($9 == arch) {
+          exact_col = $c; has_exact = 1
+        } else if (arch != "noarch" && $9 == "noarch") {
+          noarch_col = $c; has_noarch = 1
+        }
+      }
+      END {
+        if (has_exact && has_noarch) {
+          printf "模块 %s 同时存在架构 %s 的精确行和 noarch 行，拒绝猜测应选哪一行\n", \
+            m, arch > "/dev/stderr"
+          exit 1
+        } else if (has_exact) {
+          print exact_col
+        } else if (has_noarch) {
+          print noarch_col
+        } else {
+          exit 1
+        }
+      }
+    '; then
+    printf 'ERROR: manifest 里没有模块 %s 在架构 %s 下的唯一行（不存在，或该模块自己的精确行与 noarch 行冲突，见上方具体原因）\n' \
       "$m" "$arch" >&2
     return 1
   fi
