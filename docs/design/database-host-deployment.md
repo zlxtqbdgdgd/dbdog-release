@@ -177,7 +177,7 @@ ddprof 作为 `dbhost` 目标的第三方模块进入 release manifest 和统一
 - 目标机再次校验 release manifest SHA-256、ELF 架构、动态依赖和 `ddprof --version`；
 - dbdog 不重新编译或修改 ddprof。
 
-manifest 在现有八列后追加第九列 `arch`，旧列位置保持不变。取值只允许规范化后的 `x86_64`、`aarch64` 或 `noarch`；逻辑主键从 `module` 改为 `(module, arch)`。目标机先按本机架构精确选择，只有模块声明为 `noarch` 时才允许回退。旧 manifest 没有第九列时按 `noarch` 迁移，不能把未知架构当成本机架构。
+manifest 在现有八列后追加第九列 `arch`，旧列位置保持不变。取值只允许规范化后的 `x86_64`、`aarch64` 或 `noarch`；逻辑主键从 `module` 改为 `(module, arch)`。目标机先按本机架构精确选择，只有模块声明为 `noarch` 时才允许回退。旧 manifest 没有第九列时，只能从产物名的 `-x86_64.tar.gz`、`-aarch64.tar.gz` 或 `-noarch.tar.gz` 后缀确定性迁移；后缀缺失或冲突必须失败，不能把未知架构当成 `noarch` 或本机架构。
 
 Agent 同一版本的多架构产物必须来自同一组 Agent/Agent Core 源码锚，并作为一次模块发布原子更新，不能出现两个架构版本漂移。发布校验还必须拒绝重复 `(module, arch)`、同模块多版本和缺失目标架构的部分发布。
 
