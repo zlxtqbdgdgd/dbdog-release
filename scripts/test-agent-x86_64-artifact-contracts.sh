@@ -189,8 +189,9 @@ pass "x86_64 配方每次从固定 SHA 全新 checkout 并对确定性打包做�
 # ---------------------------------------------------------------------------
 # 场景 7：rpath / import / version 门禁齐备（brief Step 3 明确要求）。
 # ---------------------------------------------------------------------------
-grep -Fq 'verify_native_x86_64_elf' "$RECIPE_X86_64" || fail "x86_64 配方缺少 rpath/ELF 架构门禁"
-grep -Fq 'patchelf --print-rpath' "$RECIPE_X86_64" || fail "x86_64 配方没有读取 RPATH"
+grep -Fq 'verify_runtime_elf_arch' "$RECIPE_X86_64" || fail "x86_64 配方缺少 ELF 架构门禁"
+grep -Fq 'write_primary_linkage_report' "$RECIPE_X86_64" || fail "x86_64 配方没有解析真实 RPATH/RUNPATH/DT_NEEDED（见场景 16 的深度断言）"
+grep -Fq 'verify_no_path_leaks' "$RECIPE_X86_64" || fail "x86_64 配方没有做全树构建机路径泄漏扫描"
 grep -Fq 'verify_gaussdb_import' "$RECIPE_X86_64" || fail "x86_64 配方缺少 GaussDB import 门禁"
 grep -Fq 'import datadog_checks.gaussdb' "$RECIPE_X86_64" || fail "x86_64 配方没有真实 import GaussDB 集成模块"
 grep -Fq 'verify_agent_version_and_provenance' "$RECIPE_X86_64" || fail "x86_64 配方缺少 Agent version 门禁"
@@ -239,10 +240,305 @@ grep -Fq "$aarch64_core_sha" "$X86_64_README" \
   || fail "x86_64 README 没有记录固定的 integrations-core 源码锚"
 grep -Fq '/opt/dbdog-agent' "$X86_64_README" \
   || fail "x86_64 README 没有记录安装根"
-grep -Eiq 'password|passwd|secret|token' "$X86_64_README" \
+# 只匹配凭证语境；bare "token" 会误伤 RPATH/$ORIGIN 的正当 ELF 术语
+# "dynamic-loader token"（见下方"Linkage and path-leak gates"一节），因此收窄到
+# 凭证型用法，不整体禁用这个词。
+grep -Eiq 'password|passwd|secret|(access|auth|api|bearer)[ _-]?token|token[=:]' "$X86_64_README" \
   && fail "x86_64 README 疑似泄漏密码/密钥类字样"
 grep -Eiq '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$X86_64_README" \
   && fail "x86_64 README 疑似写入了具体主机 IP"
 pass "agent-build/x86_64/README.md 记录固定 SHA/安装根，未落地主机名/密码/IP"
+
+# ===========================================================================
+# 修复轮 1（评审 Important 1/2）：
+#   Important 1 — provenance/agent-data-plane.txt 不能是两行静态占位内容；ADP
+#     必须纳入 RUNTIME_BINARIES 与 ELF/rpath 门禁，且按 aarch64 语义生成
+#     （binary 存在性 + Omnibus 自己的 version-manifest.json 交叉验证 +
+#     binary sha256）。
+#   Important 2 — rpath 门禁不能是 4 前缀黑名单；必须对齐
+#     finalize-agent-runtime-v3.sh 的 write_primary_linkage_report（解析真实
+#     RPATH/RUNPATH token、DT_NEEDED 闭包）与 verify_no_path_leaks（全树字节级
+#     构建机路径泄漏扫描）。
+#
+# 下面的场景尽量真实执行配方里的纯函数（不需要 readelf/GNU readlink 的部分：
+# is_baseline_system_library、resolve_rpath_search_dir 的拒绝路径、
+# dt_needed_is_resolved_in_runtime、verify_no_path_leaks、
+# read_adp_version_manifest_entry——后者通过把 embedded/bin/python3 软链接到
+# 系统 python3 来复用真实的 JSON 解析/校验逻辑），而不是只 grep 注释或函数名。
+# readelf 编排本身（write_primary_linkage_report 的主循环）和 GNU
+# `readlink -m` 依赖的成功解析路径在本仓的 macOS 沙箱里无法真实执行（既没有
+# readelf，BSD readlink 也没有 -m），只能用精确的代码结构断言覆盖——这与本文件
+# 其余场景、以及 test-agent-artifact-contracts.sh 对 aarch64 配方的验证方式一致
+# （aarch64 配方同样从未在本沙箱里真实跑过，只做静态语法/结构检查）。
+# ===========================================================================
+
+TEST_ROOT2="$(mktemp -d "${TMPDIR:-/tmp}/dbdog-agent-x86-linkage.XXXXXX")"
+trap 'case "$TEST_ROOT2" in "${TMPDIR:-/tmp}"/dbdog-agent-x86-linkage.*) rm -rf -- "$TEST_ROOT2" ;; esac' EXIT
+
+# ---------------------------------------------------------------------------
+# 场景 10：RUNTIME_BINARIES 真的包含 agent-data-plane（不是靠 grep 猜测数组内容）。
+# ---------------------------------------------------------------------------
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  found=0
+  for b in "${RUNTIME_BINARIES[@]}"; do
+    [ "$b" = "embedded/bin/agent-data-plane" ] && found=1
+  done
+  [ "$found" = 1 ] || fail "RUNTIME_BINARIES 数组里没有 embedded/bin/agent-data-plane"
+  [ "${#RUNTIME_BINARIES[@]}" -ge 5 ] || fail "RUNTIME_BINARIES 少于 5 项，ADP 未被真正纳入"
+) || exit 1
+pass "source 配方后确认 RUNTIME_BINARIES 真实包含 agent-data-plane（并入 ELF/rpath 门禁范围）"
+
+# ---------------------------------------------------------------------------
+# 场景 11：is_baseline_system_library 真实执行——正确识别基础系统库与非基础库。
+# ---------------------------------------------------------------------------
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  is_baseline_system_library libc.so.6 || fail "libc.so.6 应被识别为基础系统库"
+  is_baseline_system_library ld-linux-x86-64.so.2 || fail "x86_64 动态加载器应被识别为基础系统库"
+  if is_baseline_system_library libdatadog-totally-not-a-system-lib.so.1 2>/dev/null; then
+    fail "非基础库被错误识别为基础系统库"
+  fi
+) || exit 1
+pass "is_baseline_system_library 真实执行：正确区分基础系统库与非基础库"
+
+# ---------------------------------------------------------------------------
+# 场景 12：resolve_rpath_search_dir 真实执行——拒绝绝对路径逃逸、拒绝非 ORIGIN
+# 相对路径、拒绝空 token（这三条判断都在触达 GNU `readlink -m` 之前完成，因此
+# 在没有 GNU coreutils 的沙箱里也能真实验证）。
+# ---------------------------------------------------------------------------
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  fixture_root="$TEST_ROOT2/rpath-fixture"
+  mkdir -p "$fixture_root"
+
+  if (resolve_rpath_search_dir "$fixture_root" "embedded/bin/agent" "/etc") \
+      2>"$TEST_ROOT2/escape.log"; then
+    fail "resolve_rpath_search_dir 没有拒绝逃逸到私有 runtime 之外的绝对路径"
+  fi
+  grep -Fq 'escapes the private runtime' "$TEST_ROOT2/escape.log" \
+    || fail "逃逸拒绝没有给出预期诊断信息"
+
+  if (resolve_rpath_search_dir "$fixture_root" "embedded/bin/agent" "../lib") \
+      2>"$TEST_ROOT2/relative.log"; then
+    fail "resolve_rpath_search_dir 没有拒绝非 \$ORIGIN 相对路径"
+  fi
+  grep -Fq 'relative non-ORIGIN' "$TEST_ROOT2/relative.log" \
+    || fail "非 ORIGIN 相对路径拒绝没有给出预期诊断信息"
+
+  if (resolve_rpath_search_dir "$fixture_root" "embedded/bin/agent" "") \
+      2>"$TEST_ROOT2/empty.log"; then
+    fail "resolve_rpath_search_dir 没有拒绝空 RPATH/RUNPATH 分量"
+  fi
+  grep -Fq 'empty RPATH/RUNPATH component' "$TEST_ROOT2/empty.log" \
+    || fail "空分量拒绝没有给出预期诊断信息"
+) || exit 1
+pass "resolve_rpath_search_dir 真实执行：拒绝绝对路径逃逸/非 ORIGIN 相对路径/空分量"
+
+# ---------------------------------------------------------------------------
+# 场景 13：dt_needed_is_resolved_in_runtime 真实执行——外部绝对路径 die，能在
+# 已解析 search dir 里找到的 soname 判定为已解析，找不到的判定为未解析。
+# ---------------------------------------------------------------------------
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  fixture_root="$TEST_ROOT2/needed-fixture"
+  mkdir -p "$fixture_root/embedded/lib"
+  : >"$fixture_root/embedded/lib/libpresent.so"
+
+  if (dt_needed_is_resolved_in_runtime "$fixture_root" "embedded/bin/agent" \
+      "/usr/lib/libexternal.so" "") 2>"$TEST_ROOT2/external.log"; then
+    fail "dt_needed_is_resolved_in_runtime 没有拒绝包含外部绝对路径的 DT_NEEDED"
+  fi
+  grep -Fq 'contains an external path' "$TEST_ROOT2/external.log" \
+    || fail "外部绝对路径拒绝没有给出预期诊断信息"
+
+  dt_needed_is_resolved_in_runtime "$fixture_root" "embedded/bin/agent" \
+    "libpresent.so" "$fixture_root/embedded/lib" \
+    || fail "存在于已解析 search dir 中的 soname 应判定为已解析"
+
+  if dt_needed_is_resolved_in_runtime "$fixture_root" "embedded/bin/agent" \
+      "libmissing.so" "$fixture_root/embedded/lib"; then
+    fail "不存在于任何已解析 search dir 中的 soname 不应判定为已解析"
+  fi
+) || exit 1
+pass "dt_needed_is_resolved_in_runtime 真实执行：外部绝对路径 fail closed，runtime 内闭包判定正确"
+
+# ---------------------------------------------------------------------------
+# 场景 14：verify_no_path_leaks 真实执行——整树字节级扫描抓到构建机私有路径
+# 泄漏（含运行期 $WORK 与固定前缀两类 needle），干净树放行。
+# ---------------------------------------------------------------------------
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  fixture_root="$TEST_ROOT2/leak-fixture"
+  mkdir -p "$fixture_root/dir"
+  WORK="/home/dbdog/work/dbdog-agent/some-unique-marker-$$"
+
+  printf 'clean content, no leaks\n' >"$fixture_root/dir/clean.txt"
+  if ! (verify_no_path_leaks "$fixture_root") 2>"$TEST_ROOT2/clean.log"; then
+    fail "干净的树被 verify_no_path_leaks 错误拒绝: $(cat "$TEST_ROOT2/clean.log")"
+  fi
+
+  printf 'leaked build path: %s/scratch\n' "$WORK" >"$fixture_root/dir/leak-work.txt"
+  if (verify_no_path_leaks "$fixture_root") 2>"$TEST_ROOT2/leak-work.log"; then
+    fail "verify_no_path_leaks 没有抓到运行期 \$WORK 路径泄漏"
+  fi
+  grep -Fq "$WORK" "$TEST_ROOT2/leak-work.log" \
+    || fail "\$WORK 泄漏诊断信息没有包含实际泄漏的路径"
+  rm -f "$fixture_root/dir/leak-work.txt"
+
+  printf 'leaked sealed-style path: /home/dbdog/work/dbdog-agent-anything/x\n' \
+    >"$fixture_root/dir/leak-prefix.txt"
+  if (verify_no_path_leaks "$fixture_root") 2>"$TEST_ROOT2/leak-prefix.log"; then
+    fail "verify_no_path_leaks 没有抓到固定前缀 /home/dbdog/work/dbdog-agent- 的泄漏"
+  fi
+) || exit 1
+pass "verify_no_path_leaks 真实执行：抓到 \$WORK 与固定前缀两类构建机路径泄漏，干净树放行"
+
+# ---------------------------------------------------------------------------
+# 场景 15：read_adp_version_manifest_entry 真实执行——把 fixture 的
+# embedded/bin/python3 软链接到系统 python3，直接跑配方里内嵌的真实 JSON 解析/
+# 校验逻辑（不是重新实现一份等价断言），覆盖合法记录、版本不匹配、记录缺失
+# 三种场景。
+# ---------------------------------------------------------------------------
+SYSTEM_PYTHON3="$(command -v python3 || true)"
+if [ -z "$SYSTEM_PYTHON3" ]; then
+  fail "本机缺少 python3，无法验证 read_adp_version_manifest_entry（配方本身运行时依赖 embedded python3，逻辑等价）"
+fi
+(
+  # shellcheck source=publish/recipes/dbdog-agent-x86_64.sh
+  source "$RECIPE_X86_64"
+  fixture_root="$TEST_ROOT2/adp-manifest-fixture"
+  mkdir -p "$fixture_root/embedded/bin"
+  ln -s "$SYSTEM_PYTHON3" "$fixture_root/embedded/bin/python3"
+
+  sha_a64="$(printf 'a%.0s' $(seq 1 64))"
+  cat >"$fixture_root/version-manifest.json" <<JSON
+{
+  "manifest_format": 2,
+  "software": {
+    "datadog-agent-data-plane": {
+      "locked_version": "$ADP_VERSION",
+      "source_type": "url",
+      "locked_source": {"sha256": "$sha_a64"}
+    }
+  }
+}
+JSON
+  info="$(read_adp_version_manifest_entry "$fixture_root")" \
+    || fail "合法 version-manifest.json 应该通过 ADP 记录校验"
+  parsed_version="${info%%$'\t'*}"
+  [ "$parsed_version" = "$ADP_VERSION" ] || fail "解析出的 ADP 版本与 ADP_VERSION 不一致"
+  case "$info" in *"$sha_a64"*) ;; *) fail "解析结果没有包含 locked_source.sha256" ;; esac
+
+  cat >"$fixture_root/version-manifest.json" <<JSON
+{"manifest_format": 2, "software": {"datadog-agent-data-plane": {"locked_version": "9.9.9", "source_type": "url", "locked_source": {"sha256": "$sha_a64"}}}}
+JSON
+  if (read_adp_version_manifest_entry "$fixture_root") 2>"$TEST_ROOT2/wrong-version.log"; then
+    fail "version-manifest.json 里 ADP 版本与 ADP_VERSION 不一致时应该拒绝"
+  fi
+
+  cat >"$fixture_root/version-manifest.json" <<'JSON'
+{"manifest_format": 2, "software": {}}
+JSON
+  if (read_adp_version_manifest_entry "$fixture_root") 2>"$TEST_ROOT2/missing-entry.log"; then
+    fail "version-manifest.json 缺少 datadog-agent-data-plane 记录时应该拒绝"
+  fi
+) || exit 1
+pass "read_adp_version_manifest_entry 真实执行：合法记录通过、版本不匹配/记录缺失均 fail closed"
+
+# ---------------------------------------------------------------------------
+# 场景 16：write_primary_linkage_report 的编排代码真实调用了上面这几个纯函数
+# 和 x86_64 专属的解释器白名单（不是留了个空壳）——readelf 本身在本沙箱不可用，
+# 断言精确到具体调用点，而不是泛泛 grep 函数名或注释。
+# ---------------------------------------------------------------------------
+grep -Fq 'resolved_search_dirs+=("$(resolve_rpath_search_dir "$root" "$relative" "$entry")")' "$RECIPE_X86_64" \
+  || fail "write_primary_linkage_report 没有把每个 RPATH/RUNPATH token 交给 resolve_rpath_search_dir 解析"
+grep -Fq 'if dt_needed_is_resolved_in_runtime "$root" "$relative" "$needed"' "$RECIPE_X86_64" \
+  || fail "write_primary_linkage_report 没有把每条 DT_NEEDED 交给 dt_needed_is_resolved_in_runtime 判定"
+grep -Fq '! is_baseline_system_library "$needed"' "$RECIPE_X86_64" \
+  || fail "write_primary_linkage_report 没有对非 runtime-resolved 的 DT_NEEDED 做基础系统库放行判断"
+grep -Fq '/lib64/ld-linux-x86-64.so.2 | /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2' "$RECIPE_X86_64" \
+  || fail "write_primary_linkage_report 缺少 x86_64 专属的 ELF 解释器白名单"
+grep -Fq 'unexpected ELF interpreter for $relative' "$RECIPE_X86_64" \
+  || fail "write_primary_linkage_report 没有对不在白名单内的解释器 fail closed"
+pass "write_primary_linkage_report 的编排代码真实调用 resolve_rpath_search_dir/dt_needed_is_resolved_in_runtime/is_baseline_system_library，且带 x86_64 专属解释器白名单"
+
+# ---------------------------------------------------------------------------
+# 场景 17：verify_canonical_artifact 要求 primary-elf-linkage.tsv 是产物成员，
+# 并对整包做往返复验（解包到临时目录、重新生成 linkage report、逐字节 cmp、
+# 重新跑一遍 verify_no_path_leaks）——不是只在打包前检查一次。
+# ---------------------------------------------------------------------------
+grep -Fq './provenance/primary-elf-linkage.tsv' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 的必需成员清单缺少 primary-elf-linkage.tsv"
+grep -Fq 'tar -xzf "$artifact" -C "$extract_root"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有把整个产物解包用于往返复验"
+grep -Fq 'write_primary_linkage_report "$extract_root" "$regenerated_report"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有对解包后的树重新生成 linkage report"
+grep -Fq 'cmp -s -- "$regenerated_report" "$packaged_report"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有把重新生成的 linkage report 与打包进产物的版本逐字节比对"
+grep -Fq 'verify_no_path_leaks "$extract_root"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有对解包后的树重新跑一遍路径泄漏扫描"
+pass "verify_canonical_artifact 对 primary-elf-linkage.tsv 和路径泄漏扫描做解包后往返复验"
+
+# ---------------------------------------------------------------------------
+# 场景 18：agent-data-plane 的 binary sha256/version 被交叉记入 build.txt 并在
+# verify_canonical_artifact 里重新核对——不是孤立地只存在于 agent-data-plane.txt。
+# ---------------------------------------------------------------------------
+grep -Fq 'agent_data_plane_binary_sha256=%s' "$RECIPE_X86_64" \
+  || fail "write_build_provenance 没有把 ADP binary sha256 写入 build.txt"
+grep -Fq '"$AGENT_DATA_PLANE_BINARY_SHA256"' "$RECIPE_X86_64" \
+  || fail "write_build_provenance 没有引用 AGENT_DATA_PLANE_BINARY_SHA256 全局变量"
+grep -Fq 'require_exact_field "$build_info" agent_data_plane_binary_sha256 "$adp_binary_sha"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有交叉核对 build.txt 与 agent-data-plane.txt 的 binary sha256"
+grep -Fq 'require_exact_field "$build_info" agent_data_plane_version "$ADP_VERSION"' "$RECIPE_X86_64" \
+  || fail "verify_canonical_artifact 没有核对 build.txt 的 agent_data_plane_version"
+pass "agent-data-plane 的 binary sha256/version 交叉记入 build.txt 并在产物复验时重新核对"
+
+# ---------------------------------------------------------------------------
+# 场景 19：ADP 身份（ADP_VERSION）在两架构间共享，但输入摘要的信任模型显式不同
+# ——不是同名字段静默换了语义却假装一致（评审用语：不许静默同名异义）。
+# ---------------------------------------------------------------------------
+aarch64_adp_version="$(recipe_readonly "$RECIPE_AARCH64" ADP_VERSION 2>/dev/null || true)"
+if [ -z "$aarch64_adp_version" ]; then
+  aarch64_adp_version="$(sed -n "s/^readonly ADP_VERSION=//p" "$SCRIPTS_DIR/publish/agent-build/finalize-agent-runtime-v3.sh")"
+fi
+x86_64_adp_version="$(recipe_readonly "$RECIPE_X86_64" ADP_VERSION)"
+[ -n "$aarch64_adp_version" ] || fail "无法从 aarch64 侧（finalize-agent-runtime-v3.sh）读出 ADP_VERSION"
+[ "$aarch64_adp_version" = "$x86_64_adp_version" ] \
+  || fail "两架构的 ADP_VERSION 不一致（aarch64=$aarch64_adp_version, x86_64=$x86_64_adp_version）"
+grep -Fq 'input_source_sha256_authority=measured_from_omnibus_version_manifest_not_independently_pinned' "$RECIPE_X86_64" \
+  || fail "x86_64 配方没有显式标注 ADP 输入摘要不是独立验证过的 pin（不许静默同名异义）"
+if grep -Fq 'ADP_INPUT_SHA256' "$RECIPE_X86_64"; then
+  fail "x86_64 配方不应该编造一个自称已核验的 ADP_INPUT_SHA256（本仓从未为 x86_64 独立验证过该值）"
+fi
+pass "两架构共享同一 ADP_VERSION 身份；x86_64 显式标注其输入摘要信任模型与 aarch64 不同，不假装同名同义"
+
+# ---------------------------------------------------------------------------
+# 场景 20：两仓 README 的同构声明与实际差异保持一致——必须明确提到 ADP 的信任
+# 模型差异与 rpath/DT_NEEDED 门禁的深度对齐，不能只字未提。
+# ---------------------------------------------------------------------------
+DBDOG_AGENT_X86_64_README="$RELEASE_DIR/../dbdog-agent/dbdog-deploy/build/x86_64/README.md"
+grep -Fq 'agent-data-plane' "$X86_64_README" \
+  || fail "release 仓 x86_64 README 没有提到 agent-data-plane"
+grep -Fq 'primary-elf-linkage' "$X86_64_README" \
+  || fail "release 仓 x86_64 README 没有提到 primary-elf-linkage 报告"
+grep -Eiq 'measured_from_omnibus_version_manifest_not_independently_pinned|从未独立验证|never independently verified' "$X86_64_README" \
+  || fail "release 仓 x86_64 README 没有显式说明 ADP 输入摘要的信任模型差异"
+if [ -f "$DBDOG_AGENT_X86_64_README" ]; then
+  grep -Fq 'agent-data-plane' "$DBDOG_AGENT_X86_64_README" \
+    || fail "dbdog-agent 仓 x86_64 README 没有提到 agent-data-plane"
+  grep -Fq 'primary-elf-linkage' "$DBDOG_AGENT_X86_64_README" \
+    || fail "dbdog-agent 仓 x86_64 README 没有提到 primary-elf-linkage 报告"
+  grep -Fq '从未' "$DBDOG_AGENT_X86_64_README" \
+    || fail "dbdog-agent 仓 x86_64 README 没有显式说明 ADP 输入摘要的信任模型差异"
+  pass "两仓 x86_64 README 都显式记录了 ADP 信任模型差异与 rpath/DT_NEEDED 门禁深度"
+else
+  pass "release 仓 x86_64 README 显式记录了 ADP 信任模型差异与 rpath/DT_NEEDED 门禁深度（dbdog-agent 仓 README 不在本仓工作树内，另行核对）"
+fi
 
 printf 'ALL PASS: Agent x86_64 canonical build contracts\n'

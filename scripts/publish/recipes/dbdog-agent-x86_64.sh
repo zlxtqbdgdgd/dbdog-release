@@ -79,11 +79,15 @@ readonly BUILDER_IDENTITY=native-x86_64-omnibus-v1
 readonly ARCHIVE_RECIPE=gnu_tar_find_sorted_fixed_mtime_root_owner_gzip_n_dual_build_compare
 readonly PUBLICATION_RECIPE=destination_local_tmpfile_root_owned_atomic_rename_no_clobber
 readonly REQUIRED_MIN_FREE_BYTES=$((20 * 1024 * 1024 * 1024))
+# Omnibus 默认会构建 agent-data-plane（ADP，见 dbdog-agent 仓
+# omnibus/config/software/datadog-agent-data-plane.rb），必须像 aarch64 一样纳入
+# RUNTIME_BINARIES 与 ELF/rpath/DT_NEEDED 门禁——不得静默漏掉（评审 Important 1）。
 readonly -a RUNTIME_BINARIES=(
   bin/agent/agent
   embedded/bin/system-probe
   embedded/bin/trace-agent
   embedded/bin/process-agent
+  embedded/bin/agent-data-plane
 )
 readonly -a PROVENANCE_FILES=(
   build.txt
@@ -94,7 +98,21 @@ readonly -a PROVENANCE_FILES=(
   agent-version.txt
   system-probe-version.txt
   gaussdb.txt
+  primary-elf-linkage.tsv
 )
+# ADP 是 Omnibus 通过 source url:/sha256: 拉取的独立预编译二进制（版本与两个
+#架构各自的 sha256 由 AGENT_DATA_PLANE_VERSION/AGENT_DATA_PLANE_HASH_LINUX_*
+# 环境变量驱动，参见 omnibus/config/software/datadog-agent-data-plane.rb），不是
+# 从 dbdog-agent 源码编译出来的。ADP_VERSION 与 aarch64 使用的身份保持一致
+# （Global Constraint：同一 dbdog 版本）；具体 sha256 由本配方从 Omnibus 自己生成
+# 的 version-manifest.json 里读出并记入 provenance（read_adp_version_manifest_entry），
+# 而不是像 aarch64 finalize-agent-runtime-v3.sh 那样额外交叉核对一份独立预置的
+# pinned 值——本仓从未为 x86_64 独立验证过官方 linux-amd64 输入 tar 的 sha256，
+# 编造一个自称"已核验"的值比明确记录这个信任模型差异更危险。见
+# scripts/publish/agent-build/x86_64/README.md 与 dbdog-agent 仓
+# dbdog-deploy/build/x86_64/README.md 的对应说明。
+readonly ADP_SOFTWARE_NAME=datadog-agent-data-plane
+readonly ADP_VERSION=1.2.2
 
 # 运行期由 main() 计算的“全局”（bash 函数默认写全局变量，供后续阶段函数复用；
 # 一律在 main() 里显式赋值一次，不使用 local，避免调用链更深的函数看不到）。
@@ -107,6 +125,8 @@ PROVENANCE_DIR=""
 GAUSSDB_WHEEL_PATH=""
 AGENT_BINARY_SHA256=""
 SYSTEM_PROBE_BINARY_SHA256=""
+AGENT_DATA_PLANE_BINARY_SHA256=""
+AGENT_DATA_PLANE_VERSION_ACTUAL=""
 
 validate_inputs() {
   local input_name value
@@ -132,8 +152,12 @@ validate_inputs() {
 
   export PATH="${TOOL_PATH:+$TOOL_PATH:}$PATH"
   local cmd
+  # patchelf is required for Omnibus's own internal build steps (it shells out
+  # to patchelf while packaging, same as the aarch64 pipeline); readelf is what
+  # *this* recipe uses to verify linkage post-build (see write_primary_linkage_report),
+  # matching finalize-agent-runtime-v3.sh's own choice of tool for that gate.
   for cmd in awk chmod cmp cp df file find git grep gzip id install mkdir mktemp mv \
-    objdump patchelf python3 readlink rm sha256sum sort stat tar uname wc xargs; do
+    objdump patchelf python3 readelf readlink rm sha256sum sort stat tar uname wc xargs; do
     require_cmd "$cmd"
   done
 }
@@ -297,20 +321,255 @@ install_gaussdb_wheel_offline() {
   log "已离线安装 $GAUSSDB_INTEGRATION_NAME $GAUSSDB_INTEGRATION_VERSION（wheel sha256 $GAUSSDB_WHEEL_SHA256）"
 }
 
-verify_native_x86_64_elf() {
-  local relbin file_info rpath
+verify_runtime_elf_arch() {
+  local relbin file_info
   for relbin in "${RUNTIME_BINARIES[@]}"; do
     file_info="$(LC_ALL=C file -b "$INSTALL_DIR/$relbin")"
     case "$file_info" in
       *ELF*64-bit*x86-64* | *ELF*64-bit*x86_64*) ;;
       *) die "$relbin 不是 x86_64 ELF: $file_info" ;;
     esac
-    rpath="$(patchelf --print-rpath "$INSTALL_DIR/$relbin" 2>/dev/null || true)"
-    case "$rpath" in
-      /home/* | /root/* | /tmp/* | "$WORK"*) die "$relbin 的 RPATH 泄漏构建机私有路径: $rpath" ;;
-    esac
   done
-  log "已核验 ${#RUNTIME_BINARIES[@]} 个核心二进制均为原生 x86_64 ELF，RPATH 未泄漏构建机路径（patchelf: $(patchelf --version 2>&1))"
+  log "已核验 ${#RUNTIME_BINARIES[@]} 个核心二进制均为 x86_64 ELF"
+}
+
+# ---- RPATH/RUNPATH/DT_NEEDED 闭包门禁（对齐 finalize-agent-runtime-v3.sh 的
+# write_primary_linkage_report / verify_no_path_leaks 语义，非字面复用——那两个
+# 函数硬编码了 aarch64 的解释器路径和 8 个 aarch64 专属 primary entry，本配方只
+# 覆盖 RUNTIME_BINARIES 里实际构建的组件，但校验深度一一对应：解析真实
+# RPATH/RUNPATH 并把每个 token 映射解析到 install root 内、要求 DT_NEEDED 要么是
+# 基础系统库要么在 runtime 内收敛、外加对整棵安装树的字节级构建机路径泄漏扫描）。
+# 下面三个纯字符串/文件系统函数（不解析 ELF）刻意拆出来，便于在没有 readelf 的
+# 环境（如本仓合同测试所在的 macOS 沙箱）里直接单测，见
+# scripts/test-agent-x86_64-artifact-contracts.sh。
+
+is_baseline_system_library() { # <soname>
+  case "$1" in
+    ld-linux-x86-64.so.2 | \
+      libc.so.6 | libm.so.6 | libpthread.so.0 | libdl.so.2 | librt.so.1 | \
+      libresolv.so.2 | libutil.so.1 | libanl.so.1 | libnsl.so.1 | libcrypt.so.1 | \
+      libgcc_s.so.1 | libatomic.so.1 | libcap.so.2 | libselinux.so.1 | \
+      libsystemd.so.0 | libudev.so.1 | libseccomp.so.2 | libelf.so.1 | \
+      libz.so.1 | liblzma.so.5 | libzstd.so.1 | libnuma.so.1)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+resolve_rpath_search_dir() { # <root> <relative binary path> <one RPATH/RUNPATH token> → 打印解析出的绝对目录，或 die
+  local root="$1" relative="$2" entry="$3" expanded mapped resolved
+  [ -n "$entry" ] || die "empty RPATH/RUNPATH component in $relative"
+  expanded="${entry//\$\{ORIGIN\}/$root/$(dirname -- "$relative")}"
+  expanded="${expanded//\$ORIGIN/$root/$(dirname -- "$relative")}"
+  case "$expanded" in *'$'*) die "unsupported dynamic-loader token in $relative: $entry" ;; esac
+  case "$expanded" in
+    /*)
+      case "$expanded" in
+        "$INSTALL_DIR") mapped="$root" ;;
+        "$INSTALL_DIR"/*) mapped="$root/${expanded#"$INSTALL_DIR"/}" ;;
+        "$root" | "$root"/*) mapped="$expanded" ;;
+        *) die "RPATH/RUNPATH escapes the private runtime in $relative: $entry" ;;
+      esac
+      ;;
+    *) die "relative non-ORIGIN RPATH/RUNPATH in $relative: $entry" ;;
+  esac
+  resolved="$(readlink -m -- "$mapped")"
+  case "$resolved" in
+    "$root" | "$root"/*) ;;
+    *) die "RPATH/RUNPATH resolves outside the private runtime in $relative: $entry" ;;
+  esac
+  [ -d "$resolved" ] || die "RPATH/RUNPATH directory is absent in $relative: $entry"
+  printf '%s\n' "$resolved"
+}
+
+dt_needed_is_resolved_in_runtime() { # <root> <relative binary path> <needed soname> <换行分隔的已解析 search dir 列表> → 0/1；越权路径 die
+  local root="$1" relative="$2" needed="$3" search_dirs="$4" mapped resolved
+  case "$needed" in
+    */*)
+      case "$needed" in
+        "$INSTALL_DIR"/*)
+          mapped="$root/${needed#"$INSTALL_DIR"/}"
+          if [ -e "$mapped" ] || [ -L "$mapped" ]; then return 0; fi
+          return 1
+          ;;
+        *) die "DT_NEEDED contains an external path in $relative: $needed" ;;
+      esac
+      ;;
+    *)
+      while IFS= read -r resolved; do
+        [ -n "$resolved" ] || continue
+        if [ -e "$resolved/$needed" ] || [ -L "$resolved/$needed" ]; then
+          return 0
+        fi
+      done <<<"$search_dirs"
+      return 1
+      ;;
+  esac
+}
+
+write_primary_linkage_report() { # <root> <output tsv>
+  local root="$1" output="$2"
+  local relative file dynamic program_headers interpreter search_fields search_field
+  local entry search_summary needed_fields needed needed_summary private_match binary_dir
+  local -a search_entries=()
+  local -a resolved_search_dirs=()
+
+  printf 'path\tinterpreter\trpath_or_runpath\tneeded\n' >"$output"
+  for relative in "${RUNTIME_BINARIES[@]}"; do
+    file="$root/$relative"
+    readelf --wide --file-header "$file" >/dev/null 2>&1 || \
+      die "primary entry is not a readable ELF: $relative"
+
+    dynamic="$(readelf --wide --dynamic "$file" 2>/dev/null)" || \
+      die "cannot read ELF dynamic section: $relative"
+    program_headers="$(readelf --wide --program-headers "$file" 2>/dev/null)" || \
+      die "cannot read ELF program headers: $relative"
+    interpreter="$(awk '/Requesting program interpreter/ {
+        line = $0
+        sub(/^.*Requesting program interpreter: /, "", line)
+        sub(/\].*$/, "", line)
+        sub(/^\[/, "", line)
+        print line
+      }' <<<"$program_headers")"
+    case "$interpreter" in *$'\n'*) die "multiple ELF interpreters found: $relative" ;; esac
+    if [ -z "$interpreter" ]; then
+      interpreter=none
+    else
+      case "$interpreter" in
+        /lib64/ld-linux-x86-64.so.2 | /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 | \
+          /usr/lib64/ld-linux-x86-64.so.2) ;;
+        *) die "unexpected ELF interpreter for $relative: $interpreter" ;;
+      esac
+    fi
+
+    search_fields="$(awk '/[(](RPATH|RUNPATH)[)]/ {
+        line = $0
+        sub(/^.*\[/, "", line)
+        sub(/\].*$/, "", line)
+        print line
+      }' <<<"$dynamic")"
+    search_summary=none
+    resolved_search_dirs=()
+    while IFS= read -r search_field; do
+      [ -n "$search_field" ] || continue
+      reject_control_characters "RPATH/RUNPATH for $relative" "$search_field"
+      case ":$search_field:" in *'::'*) die "empty RPATH/RUNPATH component in $relative" ;; esac
+      if [ "$search_summary" = none ]; then
+        search_summary="$search_field"
+      else
+        search_summary="$search_summary;$search_field"
+      fi
+      IFS=: read -r -a search_entries <<<"$search_field"
+      for entry in "${search_entries[@]:-}"; do
+        resolved_search_dirs+=("$(resolve_rpath_search_dir "$root" "$relative" "$entry")")
+      done
+    done <<<"$search_fields"
+
+    needed_fields="$(awk '/[(]NEEDED[)]/ {
+        line = $0
+        sub(/^.*\[/, "", line)
+        sub(/\].*$/, "", line)
+        print line
+      }' <<<"$dynamic")"
+    needed_summary=none
+    while IFS= read -r needed; do
+      [ -n "$needed" ] || continue
+      reject_control_characters "DT_NEEDED for $relative" "$needed"
+      if [ "$needed_summary" = none ]; then
+        needed_summary="$needed"
+      else
+        needed_summary="$needed_summary,$needed"
+      fi
+
+      private_match=false
+      if dt_needed_is_resolved_in_runtime "$root" "$relative" "$needed" \
+          "$(printf '%s\n' "${resolved_search_dirs[@]:-}")"; then
+        private_match=true
+      fi
+      if [ "$private_match" != true ] && ! is_baseline_system_library "$needed"; then
+        die "non-system DT_NEEDED is not resolved inside runtime: $relative -> $needed"
+      fi
+    done <<<"$needed_fields"
+
+    binary_dir="${file%/*}"
+    case "$binary_dir" in
+      "$root" | "$root"/*) ;;
+      *) die "primary ELF escaped runtime while checking linkage: $relative" ;;
+    esac
+    printf './%s\t%s\t%s\t%s\n' "$relative" "$interpreter" "$search_summary" "$needed_summary" >>"$output"
+  done
+}
+
+verify_no_path_leaks() { # <root>；对整棵树做字节级构建机私有路径扫描
+  local root="$1" file relative needle
+  local -a needles=("${WORK:-}" /home/dbdog/work/dbdog-agent- "${BUILD_WORK:-}")
+  while IFS= read -r -d '' file; do
+    relative="${file#"$root"/}"
+    for needle in "${needles[@]}"; do
+      [ -n "$needle" ] || continue
+      if grep -a -F -q -- "$needle" "$file"; then
+        die "forbidden path '$needle' leaked into runtime file: $relative"
+      fi
+    done
+  done < <(find "$root" -type f -print0 | sort -z)
+}
+
+read_adp_version_manifest_entry() { # <root> → 打印 "<locked_version>\t<locked_source_sha256>\t<manifest_sha256>"
+  local root="$1" output
+  local python="$root/embedded/bin/python3"
+  local manifest="$root/version-manifest.json"
+  [ -x "$python" ] || die "缺少 embedded python3，无法校验 version-manifest.json 中的 ADP 记录"
+  [ -f "$manifest" ] && [ ! -L "$manifest" ] || die "缺少 version-manifest.json"
+  output="$(
+    env -i HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+      "$python" -I -B - "$manifest" "$ADP_SOFTWARE_NAME" "$ADP_VERSION" <<'PYEOF'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+manifest_path = Path(sys.argv[1])
+software_name = sys.argv[2]
+expected_version = sys.argv[3]
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+payload = manifest_path.read_bytes()
+document = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+if type(document) is not dict:
+    raise SystemExit("version manifest root must be an object")
+software = document.get("software")
+if type(software) is not dict:
+    raise SystemExit("version manifest software must be an object")
+entry = software.get(software_name)
+if type(entry) is not dict:
+    raise SystemExit(f"missing object software/{software_name}")
+locked_version = entry.get("locked_version")
+if type(locked_version) is not str:
+    raise SystemExit(f"software/{software_name}/locked_version must be a string")
+if locked_version != expected_version:
+    raise SystemExit(
+        f"software/{software_name}/locked_version is {locked_version!r}, expected {expected_version!r}"
+    )
+locked_source = entry.get("locked_source")
+if type(locked_source) is not dict:
+    raise SystemExit(f"software/{software_name}/locked_source must be an object")
+source_sha256 = locked_source.get("sha256")
+if type(source_sha256) is not str or len(source_sha256) != 64:
+    raise SystemExit(f"software/{software_name}/locked_source/sha256 must be a 64-char string")
+print(f"{locked_version}\t{source_sha256}\t{hashlib.sha256(payload).hexdigest()}")
+PYEOF
+  )" || die "version-manifest.json 中的 $ADP_SOFTWARE_NAME 记录校验失败"
+  printf '%s\n' "$output"
 }
 
 verify_agent_version_and_provenance() {
@@ -392,10 +651,34 @@ write_runtime_manifest() {
 }
 
 write_agent_data_plane_provenance() {
+  # ADP 是 Omnibus 拉取的独立预编译二进制，不是从 Agent 源码编译的（见
+  # RUNTIME_BINARIES 上方的说明），按 aarch64 的 write_adp_provenance 语义生成：
+  # binary 存在性 + 可执行 + Omnibus 自己的 version-manifest.json 交叉验证 +
+  # binary sha256，而不是两行静态占位内容（评审 Important 1）。
+  local binary="$INSTALL_DIR/embedded/bin/agent-data-plane"
+  [ -f "$binary" ] && [ -x "$binary" ] && [ ! -L "$binary" ] || \
+    die "缺少 embedded/bin/agent-data-plane（Omnibus 默认会构建该组件）"
+  local info locked_version source_sha256 manifest_sha256 binary_sha256
+  info="$(read_adp_version_manifest_entry "$INSTALL_DIR")"
+  IFS=$'\t' read -r locked_version source_sha256 manifest_sha256 <<<"$info"
+  binary_sha256="$(sha256sum "$binary" | awk '{print $1}')"
   {
-    printf 'component=trace-agent\tpath=./embedded/bin/trace-agent\n'
-    printf 'component=process-agent\tpath=./embedded/bin/process-agent\n'
+    printf 'software_name=%s\n' "$ADP_SOFTWARE_NAME"
+    printf 'version=%s\n' "$locked_version"
+    printf 'binary_path=./embedded/bin/agent-data-plane\n'
+    printf 'binary_sha256=%s\n' "$binary_sha256"
+    printf 'version_manifest_path=./version-manifest.json\n'
+    printf 'version_manifest_sha256=%s\n' "$manifest_sha256"
+    printf 'input_source_sha256=%s\n' "$source_sha256"
+    # 与 aarch64 finalize-agent-runtime-v3.sh 的 write_adp_provenance 不同：这里
+    # 没有独立预置的 pinned input tar sha256 可交叉核对（本仓从未为 x86_64 单独
+    # 验证过官方 linux-amd64 输入 tar 的摘要）。above 的 input_source_sha256 是
+    # 从 Omnibus 自己生成的 version-manifest.json 里读出的、这次构建实际使用的
+    # 值，不是独立验证过的信任锚——显式记录这一点，不假装两边语义相同。
+    printf 'input_source_sha256_authority=measured_from_omnibus_version_manifest_not_independently_pinned\n'
   } >"$PROVENANCE_DIR/agent-data-plane.txt"
+  AGENT_DATA_PLANE_BINARY_SHA256="$binary_sha256"
+  AGENT_DATA_PLANE_VERSION_ACTUAL="$locked_version"
 }
 
 write_build_provenance() {
@@ -414,6 +697,8 @@ write_build_provenance() {
     printf 'integration_wheel_sha256=%s\n' "$GAUSSDB_WHEEL_SHA256"
     printf 'agent_binary_sha256=%s\n' "$AGENT_BINARY_SHA256"
     printf 'system_probe_binary_sha256=%s\n' "$SYSTEM_PROBE_BINARY_SHA256"
+    printf 'agent_data_plane_binary_sha256=%s\n' "$AGENT_DATA_PLANE_BINARY_SHA256"
+    printf 'agent_data_plane_version=%s\n' "$AGENT_DATA_PLANE_VERSION_ACTUAL"
     printf 'builder_identity=%s\n' "$BUILDER_IDENTITY"
     printf 'builder_image_digest=none\n'
     printf 'host_distribution=%s\n' "$(os_release_id)"
@@ -427,12 +712,21 @@ write_provenance_files() {
   rm -rf -- "$PROVENANCE_DIR"
   mkdir -p "$PROVENANCE_DIR"
 
+  # 结构性安全门禁先行：ELF 架构、完整 RPATH/RUNPATH 闭包 + DT_NEEDED 收敛
+  # （write_primary_linkage_report，落盘为 provenance/primary-elf-linkage.tsv），
+  # 再对整棵安装树做字节级构建机路径泄漏扫描（verify_no_path_leaks）——深度对齐
+  # finalize-agent-runtime-v3.sh 的同名门禁，而不是 4 个字面前缀的浅层黑名单
+  # （评审 Important 2）。
+  verify_runtime_elf_arch
+  write_primary_linkage_report "$INSTALL_DIR" "$PROVENANCE_DIR/primary-elf-linkage.tsv"
+  verify_no_path_leaks "$INSTALL_DIR"
+
   verify_agent_version_and_provenance
   verify_system_probe_version_and_provenance
   verify_gaussdb_import
+  write_agent_data_plane_provenance
   write_glibc_requirements
   write_runtime_manifest
-  write_agent_data_plane_provenance
   cp -- "$OMNIBUS_MARKER" "$PROVENANCE_DIR/omnibus.success"
   write_build_provenance
 
@@ -500,14 +794,13 @@ finalize_as_root() {
   omnibus_marker_matches "$OMNIBUS_MARKER" || die "Omnibus 完成标记与当前输入不一致，拒绝固化"
 
   install_gaussdb_wheel_offline
-  verify_native_x86_64_elf
   write_provenance_files
   stage_and_pack_deterministic_tar
 }
 
 verify_canonical_artifact() { # <artifact> <sidecar>
   local artifact="$1" sidecar="$2" work list actual_sha member duplicate
-  local build_info gaussdb_info agent_version_info system_probe_version_info
+  local build_info gaussdb_info agent_version_info system_probe_version_info adp_info
 
   [ -f "$artifact" ] && [ ! -L "$artifact" ] || die "canonical 产物不是实际文件: $artifact"
   [ -f "$sidecar" ] && [ ! -L "$sidecar" ] || die "canonical 产物缺少实际 sidecar: $sidecar"
@@ -530,7 +823,10 @@ verify_canonical_artifact() { # <artifact> <sidecar>
   for member in ./provenance/build.txt ./provenance/omnibus.success ./provenance/runtime.sha256 \
     ./provenance/glibc-requirements.tsv ./provenance/agent-data-plane.txt \
     ./provenance/agent-version.txt ./provenance/system-probe-version.txt ./provenance/gaussdb.txt \
-    ./bin/agent/agent ./embedded/bin/system-probe ./version-manifest.txt ./version-manifest.json; do
+    ./provenance/primary-elf-linkage.tsv \
+    ./bin/agent/agent ./embedded/bin/system-probe ./embedded/bin/trace-agent \
+    ./embedded/bin/process-agent ./embedded/bin/agent-data-plane \
+    ./version-manifest.txt ./version-manifest.json; do
     grep -Fxq -- "$member" "$list" || die "产物必须且只能包含一个 $member"
   done
 
@@ -538,12 +834,15 @@ verify_canonical_artifact() { # <artifact> <sidecar>
   gaussdb_info="$work/gaussdb.txt"
   agent_version_info="$work/agent-version.txt"
   system_probe_version_info="$work/system-probe-version.txt"
+  adp_info="$work/agent-data-plane.txt"
   tar -xOzf "$artifact" ./provenance/build.txt >"$build_info" || die '无法读取产物 build provenance'
   tar -xOzf "$artifact" ./provenance/gaussdb.txt >"$gaussdb_info" || die '无法读取 GaussDB provenance'
   tar -xOzf "$artifact" ./provenance/agent-version.txt >"$agent_version_info" || \
     die '无法读取 Agent version provenance'
   tar -xOzf "$artifact" ./provenance/system-probe-version.txt >"$system_probe_version_info" || \
     die '无法读取 system-probe version provenance'
+  tar -xOzf "$artifact" ./provenance/agent-data-plane.txt >"$adp_info" || \
+    die '无法读取 agent-data-plane provenance'
 
   require_exact_field "$build_info" format_version 2
   require_exact_field "$build_info" product dbdog-agent
@@ -594,6 +893,36 @@ verify_canonical_artifact() { # <artifact> <sidecar>
   [ "$(tar -xOzf "$artifact" ./embedded/bin/system-probe | sha256sum | awk '{print $1}')" = "$sp_binary_sha" ] || \
     die 'system-probe binary SHA-256 与 version provenance 不一致'
   require_exact_field "$build_info" system_probe_binary_sha256 "$sp_binary_sha"
+
+  require_exact_field "$adp_info" software_name "$ADP_SOFTWARE_NAME"
+  require_exact_field "$adp_info" version "$ADP_VERSION"
+  local adp_binary_sha
+  adp_binary_sha="$(read_exact_field "$adp_info" binary_sha256)"
+  [[ $adp_binary_sha =~ ^[0-9a-f]{64}$ ]] || die 'agent-data-plane provenance 含无效 binary_sha256'
+  [ "$(tar -xOzf "$artifact" ./embedded/bin/agent-data-plane | sha256sum | awk '{print $1}')" = "$adp_binary_sha" ] || \
+    die 'agent-data-plane binary SHA-256 与 provenance 不一致'
+  require_exact_field "$build_info" agent_data_plane_binary_sha256 "$adp_binary_sha"
+  require_exact_field "$build_info" agent_data_plane_version "$ADP_VERSION"
+  require_exact_field "$adp_info" input_source_sha256_authority \
+    measured_from_omnibus_version_manifest_not_independently_pinned
+
+  # 往返复验：把整个产物解包到临时目录，用同一套 readelf 门禁重新生成 primary
+  # ELF linkage report，必须与打包进产物的版本逐字节相同；再对解包后的整棵树重
+  # 跑一次构建机路径字节级扫描——防止"打包前检查过、打包后内容被篡改"的窗口，
+  # 与 finalize-agent-runtime-v3.sh 对 primary-elf-linkage.tsv 的往返复验同一语义
+  # （评审 Important 2）。
+  local extract_root regenerated_report packaged_report
+  extract_root="$work/extracted-root"
+  mkdir -p "$extract_root"
+  tar -xzf "$artifact" -C "$extract_root" || die '无法完整解包 canonical tarball 以做往返复验'
+  regenerated_report="$work/regenerated-primary-elf-linkage.tsv"
+  packaged_report="$work/provenance-primary-elf-linkage.tsv"
+  tar -xOzf "$artifact" ./provenance/primary-elf-linkage.tsv >"$packaged_report" || \
+    die '无法读取产物内的 primary-elf-linkage.tsv'
+  write_primary_linkage_report "$extract_root" "$regenerated_report"
+  cmp -s -- "$regenerated_report" "$packaged_report" || \
+    die '解包后重新生成的 primary ELF linkage report 与产物内打包的版本不一致'
+  verify_no_path_leaks "$extract_root"
 }
 
 main() {
