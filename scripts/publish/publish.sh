@@ -5,6 +5,8 @@
 #                                        # 默认发布所有有变更的一方模块；三方件需点名
 #   publish.sh regen-readme              # 按 manifest 重新生成 README 版本表
 #   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
+#   publish.sh migrate-manifest-v2 --write
+#                                        # 一次性迁移：manifest.tsv 八列旧格式 → 九列（含 arch）
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
 # 产物在构建机上完成架构/摘要校验并直传 GitHub；本机不再中转大文件。
@@ -715,6 +717,45 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
   update_manifest_row "$m" "$BUILT_VERSION" "$BUILT_ARTIFACT" "$BUILT_SHA256" "$srcsha"
 }
 
+# ---- manifest v2 迁移（一次性：八列旧格式 → 九列，第九列 arch）----
+publish_migrate_manifest_v2() { # publish_migrate_manifest_v2 <输出路径>；读 $MANIFEST（严格八列旧格式）
+  # 按 artifact 文件名后缀推导第九列 arch，写九列 v2 内容到 <输出路径>。只接受八列输入，
+  # 输入已经是九列或列数异常一律拒绝；未知 artifact 后缀 fail closed；未发布行
+  # （version/artifact/sha256 均为 "-"）本应由模块目标架构声明生成第九列，但当前迁移规则
+  # 未实现该场景（迁移时 manifest 里也确实没有这类行）——明确报错，不留死代码路径去猜。
+  # 注释与空行原样透传，只给数据行追加第九列，保证 git diff 只新增一列。
+  local out="$1"
+  [ -n "$out" ] || die "publish_migrate_manifest_v2 需要输出路径参数"
+  if ! awk -F'\t' -v OFS='\t' '
+      /^[[:space:]]*(#|$)/ { print; next }
+      {
+        if (NF != 8) {
+          printf "manifest 第 %d 行必须恰好八列（迁移前的 v1 旧格式；实际 %d 列）: %s\n", \
+            FNR, NF, $0 > "/dev/stderr"
+          exit 1
+        }
+        module = $1; artifact = $6
+        if (artifact == "-") {
+          printf "manifest 第 %d 行是未发布行（version/artifact/sha256=\"-\"），需要按模块 %s 的目标架构声明生成第九列，当前迁移规则未实现该场景，拒绝猜测: %s\n", \
+            FNR, module, $0 > "/dev/stderr"
+          exit 1
+        }
+        if (artifact ~ /-aarch64\.tar\.gz$/) { arch = "aarch64" }
+        else if (artifact ~ /-x86_64\.tar\.gz$/) { arch = "x86_64" }
+        else if (artifact ~ /-noarch\.tar\.gz$/) { arch = "noarch" }
+        else {
+          printf "manifest 第 %d 行 artifact 文件名没有受支持的架构后缀（只认 -aarch64/-x86_64/-noarch.tar.gz）: %s\n", \
+            FNR, artifact > "/dev/stderr"
+          exit 1
+        }
+        print $0, arch
+      }
+    ' "$MANIFEST" >"$out"; then
+    rm -f -- "$out"
+    return 1
+  fi
+}
+
 # ---- README 版本表 ----
 regen_readme() {
   local tbl="$SCRATCH/.version-table.md"
@@ -722,9 +763,9 @@ regen_readme() {
   {
     echo "更新于 $(date '+%Y-%m-%d %H:%M')（此表由 publish.sh 生成，权威数据在 manifest.tsv）"
     echo
-    echo "| 模块 | 类别 | 装在 | 版本 | 产物 |"
-    echo "| --- | --- | --- | --- | --- |"
-    manifest_rows | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s |\n", $1, $2, ($3=="stack" ? "全家桶机" : "DB 主机"), $5, $6 }'
+    echo "| 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |"
+    echo "| --- | --- | --- | --- | --- | --- |"
+    manifest_all_rows | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, ($3=="stack" ? "全家桶机" : "DB 主机"), $5, $6, $9 }'
   } >"$tbl"
   awk -v tbl="$tbl" '
     /<!-- VERSION-TABLE:BEGIN -->/ { print; while ((getline l < tbl) > 0) print l; skip=1; next }
@@ -942,13 +983,40 @@ cmd_prune() {
   prune_modules_to_manifest "$yes"
 }
 
+cmd_migrate_manifest_v2() { # 一次性迁移：manifest.tsv 八列旧格式 → 九列（含 arch），再重建 README
+  local write=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --write) write=1; shift ;;
+      *) die "migrate-manifest-v2 不认识参数: $1" ;;
+    esac
+  done
+  [ "$write" -eq 1 ] || die "migrate-manifest-v2 是一次性迁移，只支持 --write（没有试运行模式）"
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.migrate.XXXXXX")" || die "无法创建迁移临时文件"
+  if ! publish_migrate_manifest_v2 "$tmp"; then
+    rm -f -- "$tmp"
+    die "manifest v2 迁移失败（源 manifest 必须严格八列，且 artifact 后缀必须是 -aarch64/-x86_64/-noarch.tar.gz 之一）"
+  fi
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "迁移结果未通过 manifest_all_rows 严格校验，拒绝替换 manifest"
+  fi
+
+  mv -- "$tmp" "$MANIFEST"
+  regen_readme
+  log "manifest 已迁移到 v2（九列，含 arch），README 版本表已重建"
+}
+
 main() {
   case "${1:-plan}" in
     plan) cmd_plan ;;
     publish) shift; cmd_publish "$@" ;;
     regen-readme) regen_readme ;;
     prune) shift; cmd_prune "$@" ;;
-    *) die "用法: publish.sh plan|publish|regen-readme|prune" ;;
+    migrate-manifest-v2) shift; cmd_migrate_manifest_v2 "$@" ;;
+    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2" ;;
   esac
 }
 

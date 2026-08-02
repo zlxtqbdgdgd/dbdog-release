@@ -12,6 +12,8 @@ pass() { printf 'PASS: %s\n' "$*"; }
 
 # shellcheck disable=SC1091
 source "$SCRIPTS_DIR/lib.sh"
+# shellcheck disable=SC1091
+source "$SCRIPTS_DIR/publish/publish.sh"
 
 SHA_A=0000000000000000000000000000000000000000000000000000000000000001
 SHA_B=0000000000000000000000000000000000000000000000000000000000000002
@@ -197,4 +199,81 @@ arches="$(MANIFEST="$TEST_ROOT/arches.tsv" manifest_arches multi | tr '\n' ' ')"
 [ "$arches" = 'aarch64 x86_64 noarch ' ] || fail "manifest_arches 顺序错误: $arches"
 pass 'manifest_arches 按 aarch64 x86_64 noarch 稳定顺序输出'
 
-printf 'ALL PASS: 22 manifest architecture contract tests\n'
+# ---- publish_migrate_manifest_v2：三个确定后缀被迁移为对应第九列 arch（计划给定用例）----
+legacy="$TEST_ROOT/legacy.tsv"
+migrated="$TEST_ROOT/migrated.tsv"
+
+for spec in aarch64 x86_64 noarch; do
+  printf '%s\n' $'m\tthird-party\tstack\tno\t1\tm-1-'"$spec"$'.tar.gz\t'"$SHA_A"$'\t-' >"$legacy"
+  MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" \
+    || fail "已知后缀 $spec 未被 publish_migrate_manifest_v2 接受"
+  [ "$(awk -F'\t' '{print NF}' "$migrated")" = 9 ] || fail "迁移结果不是九列: $spec"
+  [ "$(cut -f9 "$migrated")" = "$spec" ] || fail "已知后缀 $spec 未映射到第九列 arch=$spec"
+done
+pass '三个确定后缀（-aarch64/-x86_64/-noarch.tar.gz）被迁移为对应第九列 arch'
+
+[ "$(MANIFEST="$migrated" manifest_all_rows | wc -l | tr -d ' ')" = 1 ] \
+  || fail '迁移结果未通过 manifest_all_rows 的严格九列校验'
+pass '迁移结果可直接通过 manifest_all_rows 严格校验'
+
+# ---- publish_migrate_manifest_v2：未知后缀 fail closed（计划给定用例）----
+printf '%s\n' $'m\tthird-party\tstack\tno\t1\tm-1.tar.gz\t'"$SHA_A"$'\t-' >"$legacy"
+if MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" >/dev/null 2>&1; then
+  fail '接受了未知后缀'
+fi
+pass '未知 artifact 后缀被 publish_migrate_manifest_v2 拒绝（fail closed）'
+
+# ---- publish_migrate_manifest_v2：只允许八列输入，九列或列数异常必须拒绝 ----
+printf '%s\n' $'m\tthird-party\tstack\tno\t1\tm-1-aarch64.tar.gz\t'"$SHA_A"$'\t-\taarch64' >"$legacy"
+if MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" >/dev/null 2>&1; then
+  fail '已经是九列的输入未被拒绝'
+fi
+pass '迁移函数拒绝已经是九列的输入'
+
+printf '%s\n' $'m\tthird-party\tstack\tno\t1\tm-1-aarch64.tar.gz\t'"$SHA_A" >"$legacy"
+if MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" >/dev/null 2>&1; then
+  fail '七列输入未被拒绝'
+fi
+pass '迁移函数拒绝列数异常（七列）的输入'
+
+# ---- publish_migrate_manifest_v2：未发布行（artifact=-）必须明确报错，不猜测目标架构 ----
+printf '%s\n' $'m\tthird-party\tstack\tno\t-\t-\t-\t-' >"$legacy"
+if MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" >/dev/null 2>&1; then
+  fail '未发布行（artifact=-）被错误迁移'
+fi
+pass '未发布行迁移时明确报错（当前未实现按模块目标架构声明生成），不留猜测路径'
+
+# ---- publish_migrate_manifest_v2：注释与空行原样保留，只给数据行加第九列 ----
+{
+  printf '# header comment\n'
+  printf '\n'
+  printf '%s\n' $'m\tthird-party\tstack\tno\t1\tm-1-aarch64.tar.gz\t'"$SHA_A"$'\t-'
+} >"$legacy"
+MANIFEST="$legacy" publish_migrate_manifest_v2 "$migrated" || fail '含注释/空行的迁移失败'
+[ "$(sed -n '1p' "$migrated")" = '# header comment' ] || fail '注释行未原样保留'
+[ "$(sed -n '2p' "$migrated")" = '' ] || fail '空行未原样保留'
+[ "$(sed -n '3p' "$migrated" | cut -f9)" = aarch64 ] || fail '数据行第九列未正确追加'
+pass '迁移只给数据行追加第九列，注释与空行原样保留'
+
+# ---- regen_readme：迁移后 README 版本表新增“架构”列，数据来自 manifest 第九列 ----
+readme_test_root="$TEST_ROOT/readme"
+mkdir -p "$readme_test_root"
+cat >"$readme_test_root/README.md" <<'EOF'
+# stub
+
+<!-- VERSION-TABLE:BEGIN -->
+placeholder
+<!-- VERSION-TABLE:END -->
+EOF
+printf 'm\tthird-party\tstack\tno\t1\tm-1-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A" \
+  >"$readme_test_root/manifest.tsv"
+(RELEASE_DIR="$readme_test_root" MANIFEST="$readme_test_root/manifest.tsv" regen_readme) \
+  || fail 'regen_readme 执行失败'
+grep -Fq '| 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |' "$readme_test_root/README.md" \
+  || fail 'README 版本表缺少架构列表头'
+grep -Fq '| m | third-party | 全家桶机 | 1 | m-1-aarch64.tar.gz | aarch64 |' \
+  "$readme_test_root/README.md" \
+  || fail 'README 版本表架构列未正确填充'
+pass 'regen_readme 生成的版本表新增架构列，数据取自 manifest 第九列'
+
+printf 'ALL PASS: 30 manifest architecture contract tests\n'
