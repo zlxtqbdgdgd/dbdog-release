@@ -70,20 +70,23 @@ if [ "${1:-}" = "api" ]; then
     *'.id'*) asset_shape=id-name-digest ;;
     *) echo "fake gh: 无法识别资产清单 --jq 投影: $jq_filter" >&2; exit 95 ;;
   esac
+  # 清单里的资产名一律读事务当次上传时记下的真实名字（见 ssh 桩里的写入注释），
+  # 不用调用清单查询这一刻的 FAKE_ASSET_NAME_*——两者在跨"轮次"复用同一个
+  # FAKE_STATE_DIR 的测试场景里可能已经不是同一个版本了。
   if [ -f "$FAKE_STATE_DIR/asset-aarch64" ]; then
-    read -r sz sh <"$FAKE_STATE_DIR/asset-aarch64"
+    IFS=$'\t' read -r nm sz sh <"$FAKE_STATE_DIR/asset-aarch64"
     if [ "$asset_shape" = name-size-digest ]; then
-      printf '%s\t%s\tsha256:%s\n' "${FAKE_ASSET_NAME_AARCH64:?}" "$sz" "$sh"
+      printf '%s\t%s\tsha256:%s\n' "$nm" "$sz" "$sh"
     else
-      printf '%s\t%s\tsha256:%s\n' 1001 "${FAKE_ASSET_NAME_AARCH64:?}" "$sh"
+      printf '%s\t%s\tsha256:%s\n' 1001 "$nm" "$sh"
     fi
   fi
   if [ -f "$FAKE_STATE_DIR/asset-x86_64" ]; then
-    read -r sz sh <"$FAKE_STATE_DIR/asset-x86_64"
+    IFS=$'\t' read -r nm sz sh <"$FAKE_STATE_DIR/asset-x86_64"
     if [ "$asset_shape" = name-size-digest ]; then
-      printf '%s\t%s\tsha256:%s\n' "${FAKE_ASSET_NAME_X86_64:?}" "$sz" "$sh"
+      printf '%s\t%s\tsha256:%s\n' "$nm" "$sz" "$sh"
     else
-      printf '%s\t%s\tsha256:%s\n' 1002 "${FAKE_ASSET_NAME_X86_64:?}" "$sh"
+      printf '%s\t%s\tsha256:%s\n' 1002 "$nm" "$sh"
     fi
   fi
   exit 0
@@ -172,9 +175,14 @@ case "$joined" in
     outcome_var="FAKE_UPLOAD_OUTCOME_${arch}"
     outcome="${!outcome_var:-fail}"
     if [ "$outcome" = "success" ]; then
+      # 记录真正被上传的资产名（当次调用时的 FAKE_ASSET_NAME_*），不是"随便一个
+      # 占位符，读的时候再拿当前环境变量现算"——调用方（同一次测试进程里的不同
+      # 轮次）可能在两次上传之间把 FAKE_ASSET_NAME_* 改成新版本的名字，如果清单
+      # 查询时才去读当前值，会把第一轮真实上传的旧资产错报成新版本的名字，产生
+      # "资产已存在"的假阳性，第二轮就会被误判成可以直接认领、不必真的上传。
       case "$arch" in
-        aarch64) printf '%s %s\n' "$FAKE_SIZE_AARCH64" "$FAKE_SHA_AARCH64" >"$FAKE_STATE_DIR/asset-aarch64" ;;
-        x86_64) printf '%s %s\n' "$FAKE_SIZE_X86_64" "$FAKE_SHA_X86_64" >"$FAKE_STATE_DIR/asset-x86_64" ;;
+        aarch64) printf '%s\t%s\t%s\n' "$FAKE_ASSET_NAME_AARCH64" "$FAKE_SIZE_AARCH64" "$FAKE_SHA_AARCH64" >"$FAKE_STATE_DIR/asset-aarch64" ;;
+        x86_64) printf '%s\t%s\t%s\n' "$FAKE_ASSET_NAME_X86_64" "$FAKE_SIZE_X86_64" "$FAKE_SHA_X86_64" >"$FAKE_STATE_DIR/asset-x86_64" ;;
       esac
       exit 0
     fi
@@ -915,4 +923,122 @@ write_gate_hook "$CASE8/release" pre-push "$allow_push8"
 ) || exit 1
 pass "commit 已完成、push 未做时中断重跑：重推同一个提交，零重建矩阵、零重复上传"
 
-printf 'ALL PASS: 22 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 评审 Critical：publish_resume_pending_push 必须要求 HEAD 真的领先本地已知的
+# origin/main 才能命中"待推送"。上一次发布已经完全成功（commit 和 push 都成
+# 功）之后是最常见的稳态：manifest/README 相对 HEAD 干净、HEAD 的提交信息形如
+# "publish: <module>@<version>"、manifest 里该模块每个架构都已经是这个版本——
+# 光凭这三条会把这个稳态误判成"待推送"，直接 no-op 返回成功，导致下一次真正该
+# 发布的新版本被静默跳过（不构建、不上传、manifest 也不会更新）。
+# ===========================================================================
+CASE9="$TEST_ROOT/case9"
+mkdir -p "$CASE9"
+manifest_fixture9="$CASE9/manifest.fixture.tsv"
+setup_src_repo "$CASE9/src/dbdog-web"
+source_sha9="$(git -C "$CASE9/src/dbdog-web" rev-parse --short=7 HEAD)"
+write_manifest "$manifest_fixture9" "$OLD_VERSION" "$source_sha9"
+setup_release_repo "$CASE9/release" "$CASE9/release-bare.git" "$manifest_fixture9"
+
+(
+  DBDOG_HOME="$CASE9/home"
+  RELEASE_DIR="$CASE9/release"
+  SRC_ROOT="$CASE9/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE9/build-work"
+  REPO_ROOT="$CASE9/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_STATE_DIR="$CASE9/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+
+  # ---- 第一轮：完全成功的正常发布（build+upload+commit+push 全部成功，没有任何
+  # hook 挡路）——制造"上一次发布已经完全成功"这个稳态起点。----
+  FAKE_ASSET_NAME_AARCH64="dbdog-web-$NEW_VERSION-aarch64.tar.gz"
+  FAKE_ASSET_NAME_X86_64="dbdog-web-$NEW_VERSION-x86_64.tar.gz"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  FAKE_VERSION="$NEW_VERSION"
+  export FAKE_ASSET_NAME_AARCH64 FAKE_ASSET_NAME_X86_64 FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64 FAKE_VERSION
+
+  (run_txn_pipeline dbdog-web "$NEW_VERSION") >"$CASE9/round1.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE9/round1.log" >&2; fail "第一轮（完全成功的正常发布）本身就应该成功，却失败了"; }
+  pass "第一轮：build/upload/commit/push 全部成功（无任何 hook 阻拦）"
+
+  after_round1_head9="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$(git -C "$CASE9/release-bare.git" rev-parse refs/heads/main)" = "$after_round1_head9" ] \
+    || fail "第一轮结束后 origin（bare 仓）应该已经和本地 HEAD 一致（push 真的成功了）"
+  [ "$(manifest_get dbdog-web 5 aarch64)" = "$NEW_VERSION" ] \
+    || fail "第一轮结束后 manifest 应该已经是 $NEW_VERSION"
+  [ "$(<"$FAKE_STATE_DIR/count-build-aarch64")" = 1 ] \
+    || fail "第一轮 aarch64 的构建次数不是 1"
+
+  # ---- 第二轮：稳态下的正常再发布（source 没变，但决定再发一个新版本，比如手工
+  # bump）——必须真的重新走 build/upload，不能被 publish_resume_pending_push 误判
+  # 成"上一次还没推"而直接 no-op 掉。----
+  bumped_v9="$(bump_version dbdog-web "$NEW_VERSION" patch)"
+  [ "$bumped_v9" = "0.1.2" ] || fail "测试 fixture 假设有误：bump_version 算出来的不是 0.1.2: $bumped_v9"
+
+  FAKE_ASSET_NAME_AARCH64="dbdog-web-$bumped_v9-aarch64.tar.gz"
+  FAKE_ASSET_NAME_X86_64="dbdog-web-$bumped_v9-x86_64.tar.gz"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/dbdog-web/out/$FAKE_ASSET_NAME_X86_64"
+  FAKE_VERSION="$bumped_v9"
+  export FAKE_ASSET_NAME_AARCH64 FAKE_ASSET_NAME_X86_64 FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64 FAKE_VERSION
+
+  (run_txn_pipeline dbdog-web "$bumped_v9") >"$CASE9/round2.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE9/round2.log" >&2; fail "第二轮（稳态下的正常再发布）应该真的走一遍发布流程却失败了"; }
+
+  grep -Fq '只是尚未推送；直接补 push' "$CASE9/round2.log" \
+    && { sed -n '1,200p' "$CASE9/round2.log" >&2; fail "第二轮被 publish_resume_pending_push 误判成「待推送」而 no-op 跳过了（稳态误命中）"; }
+  pass "第二轮：没有被误判成「待推送」，走了正常发布流程"
+
+  build_count_aarch64_r2="$(<"$FAKE_STATE_DIR/count-build-aarch64")"
+  build_count_x86_64_r2="$(<"$FAKE_STATE_DIR/count-build-x86_64")"
+  upload_count_aarch64_r2="$(<"$FAKE_STATE_DIR/count-upload-aarch64")"
+  upload_count_x86_64_r2="$(<"$FAKE_STATE_DIR/count-upload-x86_64")"
+  [ "$build_count_aarch64_r2" = 2 ] \
+    || fail "第二轮结束后 aarch64 的累计构建次数应该是 2（两轮各构建一次），实际: $build_count_aarch64_r2"
+  [ "$build_count_x86_64_r2" = 2 ] \
+    || fail "第二轮结束后 x86_64 的累计构建次数应该是 2，实际: $build_count_x86_64_r2"
+  [ "$upload_count_aarch64_r2" = 2 ] \
+    || fail "第二轮结束后 aarch64 的累计上传次数应该是 2，实际: $upload_count_aarch64_r2"
+  [ "$upload_count_x86_64_r2" = 2 ] \
+    || fail "第二轮结束后 x86_64 的累计上传次数应该是 2，实际: $upload_count_x86_64_r2"
+  pass "第二轮真的重新构建、重新上传了两个架构（不是复用第一轮的结果）"
+
+  [ "$(manifest_get dbdog-web 5 aarch64)" = "$bumped_v9" ] \
+    || fail "第二轮结束后 manifest aarch64 行应该是新版本 $bumped_v9"
+  [ "$(manifest_get dbdog-web 5 x86_64)" = "$bumped_v9" ] \
+    || fail "第二轮结束后 manifest x86_64 行应该是新版本 $bumped_v9"
+  [ "$(manifest_get dbdog-web 6 aarch64)" = "$FAKE_ASSET_NAME_AARCH64" ] \
+    || fail "第二轮结束后 manifest aarch64 行的 artifact 应该是新产物"
+  pass "第二轮结束后 manifest 两个架构行都落到了新版本"
+
+  final_head9="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$final_head9" != "$after_round1_head9" ] \
+    || fail "第二轮结束后应该产生了新的 commit"
+  [ "$(git -C "$RELEASE_DIR" rev-list --count "${after_round1_head9}..${final_head9}")" = 1 ] \
+    || fail "两轮总共应该恰好各产生一个 commit（第二轮相对第一轮只多一个）"
+  [ "$(git -C "$RELEASE_DIR" log --format=%s -1 "$after_round1_head9")" = "publish: dbdog-web@$NEW_VERSION" ] \
+    || fail "第一轮的提交信息应该是 publish: dbdog-web@$NEW_VERSION"
+  [ "$(git -C "$RELEASE_DIR" log --format=%s -1 "$final_head9")" = "publish: dbdog-web@$bumped_v9" ] \
+    || fail "第二轮的提交信息应该是 publish: dbdog-web@$bumped_v9"
+  [ "$(git -C "$CASE9/release-bare.git" rev-parse refs/heads/main)" = "$final_head9" ] \
+    || fail "第二轮结束后 origin（bare 仓）应该和本地 HEAD 一致"
+) || exit 1
+pass "稳态下（上一次发布已完全成功）再次发布同一模块：真实走 build/upload/bump，不会被误判成「待推送」而静默 no-op"
+
+printf 'ALL PASS: 27 publish architecture transaction contract tests\n'

@@ -930,7 +930,7 @@ publish_resume_pending_push() { # publish_resume_pending_push <module> → 0：H
   # 记录，没法用 build_one_arch 的短路机制识别"已经做过"；只能反过来看：HEAD 本
   # 身是不是一个还没推的 "publish: <module>@<version>" 提交。命中就只补
   # push+prune，完全不碰构建/上传/manifest，不会重建矩阵也不会重复上传。
-  local m="$1" head_msg v arch
+  local m="$1" head_msg v arch head_sha origin_sha
   git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md || return 1
   head_msg="$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD 2>/dev/null)" || return 1
   case "$head_msg" in
@@ -942,6 +942,18 @@ publish_resume_pending_push() { # publish_resume_pending_push <module> → 0：H
     [ -n "$arch" ] || continue
     [ "$(manifest_get "$m" 5 "$arch" 2>/dev/null)" = "$v" ] || return 1
   done < <(publish_arches_for_module "$m")
+
+  # 硬判据：上面三条在"上一次发布已经完全成功"这个最常见的稳态下也会全部成立
+  # （commit 和 push 都做完之后，HEAD 的提交信息、manifest 版本自然就是这样）——
+  # 光凭它们会把稳态误判成"待推送"，直接 no-op 跳过下一次真正该发布的新版本。
+  # 必须再确认 HEAD 真的领先本地已知的 origin/main 才能当成"待推送"：push 成功后
+  # git 会把本地这个 remote-tracking ref 前移到与 HEAD 一致，push 失败/从未 push
+  # 则不会。只用本地缓存的 ref 比较，不为此发起网络访问（不 fetch）；ref 读不到
+  # 就不敢确认，一律 fail closed 走正常流程。
+  head_sha="$(git -C "$RELEASE_DIR" rev-parse HEAD)" || return 1
+  origin_sha="$(git -C "$RELEASE_DIR" rev-parse origin/main 2>/dev/null)" || return 1
+  [ "$head_sha" != "$origin_sha" ] || return 1
+
   log "[$m] HEAD 已是本次发布提交（${head_msg}），只是尚未推送；直接补 push（不重建矩阵、不重新上传）"
   # 显式 || die，不指望调用方永远处在 set -e 会触发的位置——if/while 条件、
   # 命令替换等上下文里 set -e 对普通命令失效，但 die() 的 exit 不受这个影响，
