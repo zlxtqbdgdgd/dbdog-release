@@ -1041,4 +1041,196 @@ setup_release_repo "$CASE9/release" "$CASE9/release-bare.git" "$manifest_fixture
 ) || exit 1
 pass "稳态下（上一次发布已完全成功）再次发布同一模块：真实走 build/upload/bump，不会被误判成「待推送」而静默 no-op"
 
-printf 'ALL PASS: 27 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 场景 10：全新模块首发——manifest 里完全没有该模块任何行时，唯一合法登记路径是
+# publish.sh register-module：原子写入未发布声明行（每架构一行，version/artifact/
+# sha256/source_sha 全为 "-"），发布事务从声明行读目标架构矩阵，
+# publish_apply_arch_matrix_manifest_update 的既有 "(module,arch) 键更新" 语义把
+# 声明行原地替换成真实行，不需要额外的"插入新行"能力。
+# ===========================================================================
+CASE10="$TEST_ROOT/case10"
+mkdir -p "$CASE10"
+manifest_fixture10="$CASE10/manifest.fixture.tsv"
+setup_src_repo "$CASE10/src/dbdog-web"
+source_sha10="$(git -C "$CASE10/src/dbdog-web" rev-parse --short=7 HEAD)"
+# 混入一个已发布的无关模块，证明登记新模块不会挪动/触碰它的行。
+write_manifest "$manifest_fixture10" "$OLD_VERSION" "$source_sha10"
+setup_release_repo "$CASE10/release" "$CASE10/release-bare.git" "$manifest_fixture10"
+
+(
+  DBDOG_HOME="$CASE10/home"
+  RELEASE_DIR="$CASE10/release"
+  SRC_ROOT="$CASE10/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  BUILD_HOST_AARCH64="fake-aarch64-builder"
+  BUILD_HOST_X86_64="fake-x86_64-builder"
+  BUILD_HOST=""
+  BUILD_WORK="$CASE10/build-work"
+  REPO_ROOT="$CASE10/repo-root"
+  TOOL_PATH=""
+  PUBLISH_UPLOAD_MAX_ATTEMPTS=1
+  PUBLISH_UPLOAD_RETRY_DELAY_SECONDS=0
+
+  FAKE_STATE_DIR="$CASE10/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR"
+
+  # ---- 10a：register-module 参数校验（不接触 git，纯本地拒绝）----
+  if (cmd_register_module) >"$CASE10/badargs-none.log" 2>&1; then
+    fail "register-module 不带任何参数本应报用法错误却成功了"
+  fi
+  if (cmd_register_module ddprof) >"$CASE10/badargs-partial.log" 2>&1; then
+    fail "register-module 只给 module 本应报用法错误却成功了"
+  fi
+  if (cmd_register_module ddprof bogus-kind dbhost no --arch aarch64) \
+      >"$CASE10/badargs-kind.log" 2>&1; then
+    fail "register-module 接受了非法 kind"
+  fi
+  grep -Fq 'kind 只能是' "$CASE10/badargs-kind.log" \
+    || { sed -n '1,40p' "$CASE10/badargs-kind.log" >&2; fail "非法 kind 的报错不清楚"; }
+  if (cmd_register_module ddprof third-party bogus-target no --arch aarch64) \
+      >"$CASE10/badargs-target.log" 2>&1; then
+    fail "register-module 接受了非法 target"
+  fi
+  if (cmd_register_module ddprof third-party dbhost bogus-service --arch aarch64) \
+      >"$CASE10/badargs-service.log" 2>&1; then
+    fail "register-module 接受了非法 service"
+  fi
+  if (cmd_register_module ddprof third-party dbhost no) >"$CASE10/badargs-noarch.log" 2>&1; then
+    fail "register-module 在没有任何 --arch 时本应拒绝却成功了"
+  fi
+  if (cmd_register_module ddprof third-party dbhost no --arch aarch64 --arch aarch64) \
+      >"$CASE10/badargs-duparch.log" 2>&1; then
+    fail "register-module 接受了重复的 --arch"
+  fi
+  if (cmd_register_module ddprof third-party dbhost no --arch riscv64) \
+      >"$CASE10/badargs-badarch.log" 2>&1; then
+    fail "register-module 接受了不支持的架构"
+  fi
+  if (cmd_register_module '../evil' third-party dbhost no --arch aarch64) \
+      >"$CASE10/badargs-badname.log" 2>&1; then
+    fail "register-module 接受了不安全的模块名"
+  fi
+  pass "register-module 拒绝缺参数/非法 kind-target-service/零架构/重复架构/不支持架构/不安全模块名"
+
+  before_register_hashes="$(hashes_of "$RELEASE_DIR")"
+  before_register_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+
+  # 上面的失败尝试一个字节都不该落地。
+  after_badargs_hashes="$(hashes_of "$RELEASE_DIR")"
+  [ "$before_register_hashes" = "$after_badargs_hashes" ] \
+    || fail "register-module 参数校验失败的尝试改动了 manifest.tsv/README.md"
+
+  # ---- 10b：正式登记 ddprof（third-party/dbhost/no，aarch64+x86_64）----
+  cmd_register_module ddprof third-party dbhost no --arch aarch64 --arch x86_64 \
+    >"$CASE10/register.log" 2>&1 \
+    || { sed -n '1,80p' "$CASE10/register.log" >&2; fail "register-module 登记新模块本应成功却失败了"; }
+
+  [ "$(manifest_get ddprof 2 aarch64)" = third-party ] || fail "登记后 ddprof/aarch64 的 kind 不对"
+  [ "$(manifest_get ddprof 3 aarch64)" = dbhost ] || fail "登记后 ddprof/aarch64 的 target 不对"
+  [ "$(manifest_get ddprof 4 aarch64)" = no ] || fail "登记后 ddprof/aarch64 的 service 不对"
+  [ "$(manifest_get ddprof 5 aarch64)" = '-' ] || fail "登记后 ddprof/aarch64 的 version 应该是 -"
+  [ "$(manifest_get ddprof 6 aarch64)" = '-' ] || fail "登记后 ddprof/aarch64 的 artifact 应该是 -"
+  [ "$(manifest_get ddprof 7 aarch64)" = '-' ] || fail "登记后 ddprof/aarch64 的 sha256 应该是 -"
+  [ "$(manifest_get ddprof 8 aarch64)" = '-' ] || fail "登记后 ddprof/aarch64 的 source_sha 应该是 -"
+  [ "$(manifest_get ddprof 5 x86_64)" = '-' ] || fail "登记后 ddprof/x86_64 的 version 应该是 -"
+  pass "register-module 原子写入两条未发布声明行（kind/target/service 真实，version/artifact/sha256/source_sha 全为 -）"
+
+  [ "$(manifest_get dbdog-web 5 aarch64)" = "$OLD_VERSION" ] \
+    || fail "登记新模块不应该改动无关模块 dbdog-web 的既有行"
+  pass "登记新模块不触碰 manifest 里已存在的无关模块行"
+
+  grep -Fq '| ddprof | third-party | DB 主机 | - | - | aarch64 |' "$RELEASE_DIR/README.md" \
+    || { sed -n '1,50p' "$RELEASE_DIR/README.md" >&2; fail "README 版本表没有把未发布行的版本列如实显示为 -"; }
+  pass "regen_readme 把未发布声明行的版本列如实显示为 -（不做特殊标记）"
+
+  after_register_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$after_register_head" != "$before_register_head" ] \
+    || fail "register-module 成功后应该产生一个新的 git commit"
+  [ "$(git -C "$RELEASE_DIR" rev-list --count "${before_register_head}..${after_register_head}")" = 1 ] \
+    || fail "register-module 应该恰好产生一个 commit"
+  [ "$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD)" = 'register: ddprof (aarch64,x86_64) unpublished' ] \
+    || fail "register-module 的 commit message 不符合约定: $(git -C "$RELEASE_DIR" log -1 --format=%s HEAD)"
+  [ "$(git -C "$CASE10/release-bare.git" rev-parse refs/heads/main)" = "$after_register_head" ] \
+    || fail "register-module 应该已经 push 到 origin（bare 仓）"
+  pass "register-module 的登记是单个已推送的 commit（经发布器改 manifest 的合法路径）"
+
+  [ "$(publish_arches_for_module ddprof | tr '\n' ' ')" = 'aarch64 x86_64 ' ] \
+    || fail "publish_arches_for_module 未能从刚登记的声明行读出目标架构矩阵"
+  pass "publish_arches_for_module 从未发布声明行正确读出 ddprof 的目标架构矩阵"
+
+  # ---- 10c：重复登记必须拒绝，且不产生任何新改动/commit ----
+  if (cmd_register_module ddprof third-party dbhost no --arch aarch64) \
+      >"$CASE10/register-dup.log" 2>&1; then
+    fail "对已登记模块重复调用 register-module 本应拒绝却成功了"
+  fi
+  grep -Fq '已经' "$CASE10/register-dup.log" \
+    || { sed -n '1,40p' "$CASE10/register-dup.log" >&2; fail "重复登记的报错信息不清楚"; }
+  [ "$(git -C "$RELEASE_DIR" rev-parse HEAD)" = "$after_register_head" ] \
+    || fail "重复登记的失败尝试不应该产生任何新 commit"
+  pass "对已登记模块重复调用 register-module 拒绝，且不产生任何新改动"
+
+  # ---- 10d：登记之后走完整的架构矩阵发布事务（真实驱动 build_one_arch/
+  # publish_commit_arch_matrix），验证声明行被原子替换成真实行，且只产生一个
+  # 额外的发布 commit（登记的 commit 已经在 10b 里单独产生）。----
+  DDPROF_VERSION="0.26.0"
+  FAKE_ASSET_NAME_AARCH64="ddprof-$DDPROF_VERSION-aarch64.tar.gz"
+  FAKE_ASSET_NAME_X86_64="ddprof-$DDPROF_VERSION-x86_64.tar.gz"
+  FAKE_SIZE_AARCH64=3333
+  FAKE_SIZE_X86_64=4444
+  FAKE_SHA_AARCH64="$(printf 'c%.0s' $(seq 1 64))"
+  FAKE_SHA_X86_64="$(printf 'd%.0s' $(seq 1 64))"
+  FAKE_VERSION="$DDPROF_VERSION"
+  FAKE_REMOTE_PATH_AARCH64="$BUILD_WORK/ddprof/out/$FAKE_ASSET_NAME_AARCH64"
+  FAKE_REMOTE_PATH_X86_64="$BUILD_WORK/ddprof/out/$FAKE_ASSET_NAME_X86_64"
+  export FAKE_ASSET_NAME_AARCH64 FAKE_ASSET_NAME_X86_64 FAKE_SIZE_AARCH64 FAKE_SIZE_X86_64 \
+    FAKE_SHA_AARCH64 FAKE_SHA_X86_64 FAKE_VERSION FAKE_REMOTE_PATH_AARCH64 FAKE_REMOTE_PATH_X86_64
+  export FAKE_BUILD_X86_64_FAIL=0
+  export FAKE_UPLOAD_OUTCOME_aarch64=success
+  export FAKE_UPLOAD_OUTCOME_x86_64=success
+
+  # 三方件的版本由配方探测，真实 cmd_publish 对非 first-party 模块传空版本——这里
+  # 用同样的空串驱动 run_txn_pipeline，镜像生产路径。
+  (run_txn_pipeline ddprof "") >"$CASE10/publish.log" 2>&1 \
+    || { sed -n '1,200p' "$CASE10/publish.log" >&2; fail "全新模块首发的架构矩阵发布本应成功却失败了"; }
+  pass "登记后紧接着的架构矩阵发布（两个架构）成功完成"
+
+  [ "$(manifest_get ddprof 5 aarch64)" = "$DDPROF_VERSION" ] \
+    || fail "发布完成后 ddprof/aarch64 的声明行未被替换成真实版本"
+  [ "$(manifest_get ddprof 6 aarch64)" = "$FAKE_ASSET_NAME_AARCH64" ] \
+    || fail "发布完成后 ddprof/aarch64 的声明行未被替换成真实 artifact"
+  [ "$(manifest_get ddprof 7 aarch64)" = "$FAKE_SHA_AARCH64" ] \
+    || fail "发布完成后 ddprof/aarch64 的声明行未被替换成真实 sha256"
+  [ "$(manifest_get ddprof 5 x86_64)" = "$DDPROF_VERSION" ] \
+    || fail "发布完成后 ddprof/x86_64 的声明行未被替换成真实版本"
+  [ "$(manifest_get ddprof 6 x86_64)" = "$FAKE_ASSET_NAME_X86_64" ] \
+    || fail "发布完成后 ddprof/x86_64 的声明行未被替换成真实 artifact"
+  # kind/target/service（register-module 写入的列）在整个替换过程中原样保留。
+  [ "$(manifest_get ddprof 2 aarch64)" = third-party ] \
+    || fail "发布完成后 ddprof 的 kind 不应该被发布事务改动"
+  [ "$(manifest_get ddprof 3 aarch64)" = dbhost ] \
+    || fail "发布完成后 ddprof 的 target 不应该被发布事务改动"
+  pass "publish_apply_arch_matrix_manifest_update 的既有 (module,arch) 更新语义把两条声明行原子替换成真实行，kind/target/service 保持不变"
+
+  grep -Fq '| ddprof | third-party | DB 主机 | 0.26.0 |' "$RELEASE_DIR/README.md" \
+    || { sed -n '1,50p' "$RELEASE_DIR/README.md" >&2; fail "README 版本表没有更新为真实版本"; }
+  pass "regen_readme 把已发布的 ddprof 显示为真实版本"
+
+  final_head10="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$final_head10" != "$after_register_head" ] \
+    || fail "架构矩阵发布完成后应该产生新的 commit"
+  [ "$(git -C "$RELEASE_DIR" rev-list --count "${after_register_head}..${final_head10}")" = 1 ] \
+    || fail "登记之后的架构矩阵发布应该恰好只产生一个 commit"
+  [ "$(git -C "$RELEASE_DIR" log -1 --format=%s "$final_head10")" = "publish: ddprof@$DDPROF_VERSION" ] \
+    || fail "架构矩阵发布的 commit message 不符合既有约定"
+  [ "$(git -C "$CASE10/release-bare.git" rev-parse refs/heads/main)" = "$final_head10" ] \
+    || fail "架构矩阵发布完成后应该已经 push 到 origin（bare 仓）"
+  pass "全新模块首发全过程（register-module 一个 commit + 架构矩阵发布一个 commit）与既有事务保证完全一致"
+) || exit 1
+pass "全新模块首发：register-module 原子登记未发布声明行 → 架构矩阵发布把声明行原子替换成真实行，全程遵守既有事务不变式"
+
+printf 'ALL PASS: 42 publish architecture transaction contract tests\n'

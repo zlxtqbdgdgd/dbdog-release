@@ -7,6 +7,10 @@
 #   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
 #   publish.sh migrate-manifest-v2 --write
 #                                        # 一次性迁移：manifest.tsv 八列旧格式 → 九列（含 arch）
+#   publish.sh register-module <模块> <first-party|third-party> <stack|dbhost> <yes|no> \
+#     --arch <架构> [--arch <架构>]...    # 全新模块首发登记：原子写入未发布声明行
+#                                        # （每架构一行，version/artifact/sha256/source_sha 全为 -），
+#                                        # 之后照常 publish.sh publish <模块> --yes 完成首次真实发布
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
 # 产物在构建机上完成架构/摘要校验并直传 GitHub；本机不再中转大文件。
@@ -1422,6 +1426,103 @@ cmd_migrate_manifest_v2() { # 一次性迁移：manifest.tsv 八列旧格式 →
   log "manifest 已迁移到 v2（九列，含 arch），README 版本表已重建"
 }
 
+# ---- 新模块首发登记：manifest 里完全没有该模块任何行时，唯一合法登记路径 ----
+# 原子写入未发布声明行（每个目标架构一行，version/artifact/sha256/source_sha 全部
+# 写 "-"）。发布事务（build_one_arch/publish_arches_for_module/
+# publish_apply_arch_matrix_manifest_update）不需要为"首发"另开分支：
+# publish_arches_for_module 本来就是读 manifest 里该模块出现过的架构，声明行天然
+# 提供这个矩阵；真正发布时 publish_apply_arch_matrix_manifest_update 按既有的
+# "(module,arch) 键匹配就更新" 语义，把声明行原地替换成真实行——不需要新增"插入
+# 新行"的能力，也就不需要放松那个函数对未匹配键的 fail-closed 保护。
+cmd_register_module() { # register-module <module> <first-party|third-party> <stack|dbhost> <yes|no> --arch <架构> [--arch <架构>]...
+  local m="" kind="" target="" service=""
+  local -a arches=()
+  if [ $# -ge 4 ]; then
+    m="$1"; kind="$2"; target="$3"; service="$4"; shift 4
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --arch)
+        [ $# -ge 2 ] || die "register-module: --arch 需要参数"
+        arches+=("$2"); shift 2
+        ;;
+      *) die "register-module 不认识的参数: $1" ;;
+    esac
+  done
+  [ -n "$m" ] && [ -n "$kind" ] && [ -n "$target" ] && [ -n "$service" ] \
+    || die "用法: register-module <module> <first-party|third-party> <stack|dbhost> <yes|no> --arch <架构> [--arch <架构>]..."
+  case "$m" in
+    "" | "." | ".." | */* | *$'\n'* | *$'\r'* | *$'\t'*)
+      die "register-module 模块名不是安全的单层路径名: $m"
+      ;;
+  esac
+  case "$kind" in
+    first-party | third-party) ;;
+    *) die "register-module 的 kind 只能是 first-party|third-party，收到: $kind" ;;
+  esac
+  case "$target" in
+    stack | dbhost) ;;
+    *) die "register-module 的 target 只能是 stack|dbhost，收到: $target" ;;
+  esac
+  case "$service" in
+    yes | no) ;;
+    *) die "register-module 的 service 只能是 yes|no，收到: $service" ;;
+  esac
+  [ ${#arches[@]} -gt 0 ] || die "register-module 至少需要一个 --arch"
+
+  local -a normalized=()
+  local raw na seen dup
+  for raw in "${arches[@]}"; do
+    na="$(normalize_arch "$raw")" || die "register-module 不支持的架构: $raw"
+    dup=0
+    for seen in ${normalized[@]+"${normalized[@]}"}; do
+      [ "$seen" != "$na" ] || { dup=1; break; }
+    done
+    [ "$dup" -eq 0 ] || die "register-module 重复的 --arch: $na"
+    normalized+=("$na")
+  done
+
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md \
+    || die "manifest.tsv/README.md 有未提交的改动，拒绝在脏工作区上登记新模块"
+  manifest_all_rows >/dev/null \
+    || die "现有 manifest.tsv 未通过 manifest_all_rows 严格校验，拒绝在此基础上登记新模块"
+  if manifest_all_rows | awk -F'\t' -v m="$m" '$1==m{f=1} END{exit(f?0:1)}'; then
+    die "模块 $m 已经在 manifest 里登记过，拒绝重复登记（如需变更用发布流程更新已有行，不要手改 manifest）"
+  fi
+
+  # 固定按 aarch64/x86_64/noarch 输出声明行，和 manifest_arches 的既有顺序约定一致，
+  # 不依赖调用方传 --arch 的顺序。
+  local ordered="" order_arch cand
+  for order_arch in aarch64 x86_64 noarch; do
+    for cand in "${normalized[@]}"; do
+      [ "$cand" != "$order_arch" ] || ordered="$ordered${ordered:+ }$order_arch"
+    done
+  done
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.register.XXXXXX")" || die "无法创建 manifest 临时文件"
+  if ! cp -- "$MANIFEST" "$tmp"; then
+    rm -f -- "$tmp"
+    die "无法复制 manifest 到临时文件"
+  fi
+  for na in $ordered; do
+    printf '%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$m" "$kind" "$target" "$service" "$na" >>"$tmp"
+  done
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "register-module 写入的声明行未通过 manifest_all_rows 校验，拒绝落地"
+  fi
+  mv -- "$tmp" "$MANIFEST"
+
+  regen_readme
+  git -C "$RELEASE_DIR" add manifest.tsv README.md
+  git -C "$RELEASE_DIR" commit -m "register: ${m} (${ordered// /,}) unpublished" \
+    || die "register-module git commit 失败（manifest/README 已写入声明行但未提交）；确认工作区改动后手动 git add/commit，或 git checkout -- manifest.tsv README.md 撤销后重跑"
+  git -C "$RELEASE_DIR" push origin main \
+    || die "register-module push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main（重新执行 register-module 会因模块已登记而拒绝）"
+  log "已登记新模块 ${m}（${ordered}，未发布，version=-）"
+}
+
 main() {
   case "${1:-plan}" in
     plan) cmd_plan ;;
@@ -1429,7 +1530,8 @@ main() {
     regen-readme) regen_readme ;;
     prune) shift; cmd_prune "$@" ;;
     migrate-manifest-v2) shift; cmd_migrate_manifest_v2 "$@" ;;
-    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2" ;;
+    register-module) shift; cmd_register_module "$@" ;;
+    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2|register-module" ;;
   esac
 }
 

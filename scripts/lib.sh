@@ -307,6 +307,10 @@ manifest_modules() { # manifest_modules [target 过滤]
 }
 
 manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行；发布器与需要全部架构时用它
+  # 未发布声明行（新模块首发登记，见 publish.sh register-module）：version/artifact/
+  # sha256/source_sha 必须同时为 "-"，跳过 artifact 后缀校验；不允许半发布状态
+  # （比如 version="-" 但 artifact 已经是真实文件名）。同模块混合声明行与已发布真实
+  # 行由下面既有的"同模块 version 必须一致"校验天然拒绝，不需要专门再写一遍。
   awk -F'\t' '
     /^[[:space:]]*(#|$)/ { next }
     {
@@ -314,18 +318,26 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
         printf "manifest 第 %d 行必须恰好九列（实际 %d 列）\n", FNR, NF > "/dev/stderr"
         exit 1
       }
-      module = $1; artifact = $6; version = $5; source_sha = $8; arch = $9
+      module = $1; version = $5; artifact = $6; sha256 = $7; source_sha = $8; arch = $9
       if (arch != "aarch64" && arch != "x86_64" && arch != "noarch") {
         printf "manifest 第 %d 行架构非法（只允许 aarch64/x86_64/noarch）: %s\n", \
           FNR, arch > "/dev/stderr"
         exit 1
       }
-      suffix = "-" arch ".tar.gz"
-      if (length(artifact) <= length(suffix) ||
-          substr(artifact, length(artifact) - length(suffix) + 1) != suffix) {
-        printf "manifest 第 %d 行 artifact 文件名后缀与架构 %s 不一致: %s\n", \
-          FNR, arch, artifact > "/dev/stderr"
-        exit 1
+      if (version == "-") {
+        if (artifact != "-" || sha256 != "-" || source_sha != "-") {
+          printf "manifest 第 %d 行是未发布声明行（version=\"-\"），但 artifact/sha256/source_sha 未同时为 \"-\"（半发布状态不被接受）: %s\n", \
+            FNR, $0 > "/dev/stderr"
+          exit 1
+        }
+      } else {
+        suffix = "-" arch ".tar.gz"
+        if (length(artifact) <= length(suffix) ||
+            substr(artifact, length(artifact) - length(suffix) + 1) != suffix) {
+          printf "manifest 第 %d 行 artifact 文件名后缀与架构 %s 不一致: %s\n", \
+            FNR, arch, artifact > "/dev/stderr"
+          exit 1
+        }
       }
       key = module SUBSEP arch
       if (key in seen_arch) {
@@ -351,7 +363,7 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
       }
       print
     }
-  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构、(module, arch) 唯一、同模块 version/source_sha 一致）: $MANIFEST"
+  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构或整行为未发布声明、(module, arch) 唯一、同模块 version/source_sha 一致）: $MANIFEST"
 }
 
 manifest_selected_rows() { # manifest_selected_rows [target] [arch]；每个逻辑模块至多一行；[arch] 省略时用 host_arch

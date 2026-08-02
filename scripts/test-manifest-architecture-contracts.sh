@@ -114,6 +114,66 @@ if out="$(MANIFEST="$TEST_ROOT/source-skew.tsv" manifest_all_rows 2>&1)"; then
 fi
 pass '同模块跨架构 source_sha 必须一致'
 
+# ---- manifest_all_rows：未发布声明行（新模块首发登记）----
+# 新模块通过 register-module 登记时，在真正发布前 version/artifact/sha256/source_sha
+# 全部写 "-"；manifest_all_rows 必须接受这种行，且跳过对 "-" 的 artifact 后缀校验。
+printf 'newmod\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n' >"$TEST_ROOT/declared.tsv"
+out="$(MANIFEST="$TEST_ROOT/declared.tsv" manifest_all_rows)" \
+  || fail "全 '-' 的未发布声明行被错误拒绝: $out"
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] \
+  || fail "未发布声明行未原样透传: $out"
+pass 'manifest_all_rows 接受 version/artifact/sha256/source_sha 全为 "-" 的未发布声明行'
+
+{
+  printf 'newmod2\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n'
+  printf 'newmod2\tthird-party\tdbhost\tno\t-\t-\t-\t-\tx86_64\n'
+} >"$TEST_ROOT/declared-multi.tsv"
+[ "$(MANIFEST="$TEST_ROOT/declared-multi.tsv" manifest_arches newmod2 | tr '\n' ' ')" \
+  = 'aarch64 x86_64 ' ] \
+  || fail 'manifest_arches 未能从未发布声明行读出目标架构'
+pass '未发布声明行同样驱动 manifest_arches（发布事务从声明行读目标架构矩阵）'
+
+# ---- manifest_all_rows：未发布声明行必须四列同时为 "-"，不接受半发布状态 ----
+printf 'half1\tthird-party\tdbhost\tno\t-\thalf1-0.1.0-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A" \
+  >"$TEST_ROOT/half-artifact.tsv"
+if out="$(MANIFEST="$TEST_ROOT/half-artifact.tsv" manifest_all_rows 2>&1)"; then
+  fail "version=- 但 artifact 是真实值的半发布行未被拒绝: $out"
+fi
+pass 'version="-" 但 artifact 不是 "-" 的半发布行 fail closed'
+
+printf 'half2\tthird-party\tdbhost\tno\t-\t-\t%s\t-\taarch64\n' "$SHA_A" \
+  >"$TEST_ROOT/half-sha.tsv"
+if out="$(MANIFEST="$TEST_ROOT/half-sha.tsv" manifest_all_rows 2>&1)"; then
+  fail "version=- 但 sha256 是真实值的半发布行未被拒绝: $out"
+fi
+pass 'version="-" 但 sha256 不是 "-" 的半发布行 fail closed'
+
+printf 'half3\tthird-party\tdbhost\tno\t-\t-\t-\tdeadbee\taarch64\n' \
+  >"$TEST_ROOT/half-srcsha.tsv"
+if out="$(MANIFEST="$TEST_ROOT/half-srcsha.tsv" manifest_all_rows 2>&1)"; then
+  fail "version=- 但 source_sha 是真实值的半发布行未被拒绝: $out"
+fi
+pass 'version="-" 但 source_sha 不是 "-" 的半发布行 fail closed'
+
+# ---- manifest_all_rows：同模块不能一部分是声明行、一部分是真实行（首发事务是全架构原子替换）----
+{
+  printf 'mixed\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n'
+  printf 'mixed\tthird-party\tdbhost\tno\t1.0.0\tmixed-1.0.0-x86_64.tar.gz\t%s\t-\tx86_64\n' "$SHA_A"
+} >"$TEST_ROOT/mixed.tsv"
+if out="$(MANIFEST="$TEST_ROOT/mixed.tsv" manifest_all_rows 2>&1)"; then
+  fail "同模块混合声明行与真实行未被拒绝: $out"
+fi
+pass '同模块混合未发布声明行与已发布真实行 fail closed（version 不一致校验天然覆盖）'
+
+# ---- manifest_get / manifest_selected_rows：未发布声明行的字段原样可读（version="-"），
+# 由调用方按既有的 "-" 语义决定跳过——这是 upgrade.sh/check-upgrade.sh/agent-install.sh
+# 已经在用的既有约定，不是新协议。----
+[ "$(MANIFEST="$TEST_ROOT/declared.tsv" manifest_get newmod 5 aarch64)" = '-' ] \
+  || fail 'manifest_get 未如实返回未发布声明行的 version="-"'
+[ "$(MANIFEST="$TEST_ROOT/declared.tsv" manifest_selected_rows '' aarch64 | cut -f5)" = '-' ] \
+  || fail 'manifest_selected_rows 未如实返回未发布声明行的 version="-"'
+pass 'manifest_get/manifest_selected_rows 如实透传未发布声明行，version="-" 供既有跳过逻辑判断'
+
 # ---- manifest_selected_rows / manifest_get：精确行与 noarch 行同时存在时拒绝猜测 ----
 {
   printf 'both\tthird-party\tstack\tno\t1.0.0\tboth-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A"
@@ -312,4 +372,66 @@ printf '%s\n' "$plan_line" | grep -Fq -- "$plan_sha" \
   || fail "cmd_plan 未显示纯净的 source_sha: $plan_line"
 pass 'cmd_plan 的 manifest 记录列是纯 source_sha，无内嵌 tab 或被吞并的架构值'
 
-printf 'ALL PASS: 32 manifest architecture contract tests\n'
+# ---- 消费者跳过未发布模块：check-upgrade.sh 的枚举表把 version="-" 的模块显示为
+# "未发布"，且不计入需要升级的数量；upgrade.sh 对未发布模块（无论是默认无参枚举，
+# 还是显式点名）都优雅跳过，不尝试下载 "-"。这是 upgrade.sh/check-upgrade.sh 里
+# 原本就有的既有约定——manifest_all_rows 在 Task 5 之前会直接拒绝 artifact="-" 的行，
+# 这里锁定"声明行一旦能通过 manifest_all_rows，既有的跳过逻辑立即生效"。----
+consumer_root="$TEST_ROOT/consumer-skip"
+mkdir -p "$consumer_root/home"
+consumer_manifest="$consumer_root/manifest.tsv"
+{
+  # 已发布的 stack 模块，混在一起证明未发布模块不会连累无关模块的正常枚举。
+  printf 'published-mod\tthird-party\tstack\tno\t1.0.0\tpublished-mod-1.0.0-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A"
+  # 未发布的新模块声明行（对应 register-module 首发登记后、真正发布前的状态）。
+  printf 'unpublished-mod\tthird-party\tstack\tno\t-\t-\t-\t-\taarch64\n'
+} >"$consumer_manifest"
+# published-mod 装的是旧版本（0.9.0 != manifest 的 1.0.0），确保它会被 check-upgrade.sh
+# 标记为"需要处理"（带 ←），这样才能和 unpublished-mod 的"未发布"（不带 ←）形成对照——
+# "未安装"本身不计入 updates，不足以证明 unpublished-mod 是因为"未发布"才被跳过。
+mkdir -p "$consumer_root/home/modules/published-mod/published-mod-0.9.0"
+printf '0.9.0\n' >"$consumer_root/home/modules/published-mod/published-mod-0.9.0/.dbdog-manifest-version"
+ln -s published-mod-0.9.0 "$consumer_root/home/modules/published-mod/current"
+
+checker_out="$TEST_ROOT/check-upgrade.out"
+checker_rc=0
+MANIFEST="$consumer_manifest" DBDOG_HOME="$consumer_root/home" DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
+  bash "$SCRIPTS_DIR/check-upgrade.sh" >"$checker_out" 2>&1 || checker_rc=$?
+[ "$checker_rc" -eq 10 ] \
+  || { sed -n '1,80p' "$checker_out" >&2; fail "check-upgrade.sh 期望因 published-mod 版本不同而以 10 退出，实际 rc=$checker_rc"; }
+grep -Eq '^unpublished-mod .*未发布' "$checker_out" \
+  || { sed -n '1,80p' "$checker_out" >&2; fail 'check-upgrade.sh 没有把未发布模块显示为"未发布"'; }
+if grep -E '^unpublished-mod .*←' "$checker_out" >/dev/null; then
+  sed -n '1,80p' "$checker_out" >&2
+  fail 'check-upgrade.sh 把未发布模块误标记为需要处理（不应带 ← 标记）'
+fi
+grep -Eq '^published-mod .*←' "$checker_out" \
+  || { sed -n '1,80p' "$checker_out" >&2; fail 'check-upgrade.sh 应该仍然把已发布但版本不同的模块标记为需要处理'; }
+pass 'check-upgrade.sh 把 version="-" 的未发布模块显示为"未发布"且不计入需要升级的数量'
+
+# upgrade.sh 显式点名未发布模块：必须优雅跳过（exit 0、明确警告、不下载、不建目录），
+# 不打真实网络（不 fake curl——如果代码路径意外走到下载，测试会因为 curl 访问真实网络
+# 失败/挂起而暴露问题，而不是静默通过）。
+upgrade_named_out="$TEST_ROOT/upgrade-named.out"
+MANIFEST="$consumer_manifest" DBDOG_HOME="$consumer_root/home" DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
+  bash "$SCRIPTS_DIR/upgrade.sh" unpublished-mod >"$upgrade_named_out" 2>&1 \
+  || { sed -n '1,80p' "$upgrade_named_out" >&2; fail 'upgrade.sh 显式点名未发布模块本应优雅跳过（exit 0）却失败了'; }
+grep -Fq 'unpublished-mod 尚未发布，跳过' "$upgrade_named_out" \
+  || { sed -n '1,80p' "$upgrade_named_out" >&2; fail 'upgrade.sh 没有对未发布模块给出跳过提示'; }
+[ ! -e "$consumer_root/home/modules/unpublished-mod" ] \
+  || fail 'upgrade.sh 为未发布模块创建了模块目录，说明尝试了实际安装'
+pass 'upgrade.sh 显式点名未发布模块时优雅跳过，不下载、不建目录'
+
+# upgrade.sh 默认无参枚举：未发布模块即使在 manifest 里也绝不出现在升级计划里
+# （current 软链不存在，天然不会被无参默认枚举选中——这里额外断言日志没有提到它，
+# 锁定"未发布模块不会被默认枚举误当成目标"这条不变式）。
+upgrade_default_out="$TEST_ROOT/upgrade-default.out"
+MANIFEST="$consumer_manifest" DBDOG_HOME="$consumer_root/home-default" DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
+  bash "$SCRIPTS_DIR/upgrade.sh" >"$upgrade_default_out" 2>&1 || true
+if grep -Fq 'unpublished-mod' "$upgrade_default_out"; then
+  sed -n '1,80p' "$upgrade_default_out" >&2
+  fail 'upgrade.sh 默认无参枚举提到了未发布模块，本应完全跳过'
+fi
+pass 'upgrade.sh 默认无参枚举完全不涉及未发布模块（未安装且未发布，不会被选中）'
+
+printf 'ALL PASS: 42 manifest architecture contract tests\n'
