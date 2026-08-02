@@ -279,19 +279,150 @@ configure_ready_to_use_stack() {
   log "已生成可直接使用的本机配置（访问地址: ${app_url}；已有真实配置保持不变）"
 }
 
-# ---- manifest 访问 ----
-# 列：1 module, 2 kind, 3 target, 4 service, 5 version, 6 artifact, 7 sha256, 8 source_sha
-manifest_rows() { grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST"; }
-
-manifest_get() { # manifest_get <module> <列号>
-  local m="$1" col="$2"
-  manifest_rows | awk -F'\t' -v m="$m" -v c="$col" '$1==m {print $c; found=1} END {exit !found}' \
-    || die "manifest 里没有模块: $m"
+# ---- 架构规范化 ----
+normalize_arch() { # normalize_arch <raw> → aarch64|x86_64|noarch；只接受三个规范值与两个主机输入别名
+  case "$1" in
+    aarch64 | arm64) printf '%s\n' aarch64 ;;
+    x86_64 | amd64) printf '%s\n' x86_64 ;;
+    noarch) printf '%s\n' noarch ;;
+    *) return 1 ;;
+  esac
 }
+
+host_arch() { # host_arch → 规范化后的当前主机架构；DBDOG_HOST_ARCH_OVERRIDE 供测试/显式覆盖注入
+  local raw="${DBDOG_HOST_ARCH_OVERRIDE:-$(uname -m)}"
+  normalize_arch "$raw" || die "不支持的主机架构: $raw"
+}
+
+# ---- manifest 访问（v2：九列，第九列 arch）----
+# 列：1 module, 2 kind, 3 target, 4 service, 5 version, 6 artifact, 7 sha256, 8 source_sha, 9 arch
+# manifest_rows/manifest_modules 是旧的八列宽松读取，供尚未按架构改造的消费者使用；
+# manifest_all_rows/manifest_selected_rows/manifest_get/manifest_arches 是严格的 v2 合同，
+# 不对生产解析器保留宽松分支——manifest.tsv 未迁移到九列前，这些函数会 fail closed。
+manifest_rows() { grep -Ev '^[[:space:]]*(#|$)' "$MANIFEST"; }
 
 manifest_modules() { # manifest_modules [target 过滤]
   local t="${1:-}"
   manifest_rows | awk -F'\t' -v t="$t" 't=="" || $3==t {print $1}'
+}
+
+manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行；发布器与需要全部架构时用它
+  awk -F'\t' '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      if (NF != 9) {
+        printf "manifest 第 %d 行必须恰好九列（实际 %d 列）\n", FNR, NF > "/dev/stderr"
+        exit 1
+      }
+      module = $1; artifact = $6; version = $5; source_sha = $8; arch = $9
+      if (arch != "aarch64" && arch != "x86_64" && arch != "noarch") {
+        printf "manifest 第 %d 行架构非法（只允许 aarch64/x86_64/noarch）: %s\n", \
+          FNR, arch > "/dev/stderr"
+        exit 1
+      }
+      suffix = "-" arch ".tar.gz"
+      if (length(artifact) <= length(suffix) ||
+          substr(artifact, length(artifact) - length(suffix) + 1) != suffix) {
+        printf "manifest 第 %d 行 artifact 文件名后缀与架构 %s 不一致: %s\n", \
+          FNR, arch, artifact > "/dev/stderr"
+        exit 1
+      }
+      key = module SUBSEP arch
+      if (key in seen_arch) {
+        printf "manifest 第 %d 行与之前的行重复 (module=%s, arch=%s)\n", \
+          FNR, module, arch > "/dev/stderr"
+        exit 1
+      }
+      seen_arch[key] = 1
+      if (module in seen_version) {
+        if (seen_version[module] != version) {
+          printf "manifest 第 %d 行的 version 与模块 %s 之前的行不一致\n", \
+            FNR, module > "/dev/stderr"
+          exit 1
+        }
+        if (seen_source[module] != source_sha) {
+          printf "manifest 第 %d 行的 source_sha 与模块 %s 之前的行不一致\n", \
+            FNR, module > "/dev/stderr"
+          exit 1
+        }
+      } else {
+        seen_version[module] = version
+        seen_source[module] = source_sha
+      }
+      print
+    }
+  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构、(module, arch) 唯一、同模块 version/source_sha 一致）: $MANIFEST"
+}
+
+manifest_selected_rows() { # manifest_selected_rows [target] [arch]；每个逻辑模块至多一行；[arch] 省略时用 host_arch
+  local target="${1:-}" arch_in="${2:-}" arch
+  if [ -n "$arch_in" ]; then
+    # 显式传入的架构不合法时返回失败而不是 die：调用方（含 manifest_get）常在
+    # `if`/`||` 里探测这个失败，die 的 exit 会连调用脚本一起杀掉，无法被探测到。
+    if ! arch="$(normalize_arch "$arch_in")"; then
+      printf 'ERROR: 不支持的架构: %s\n' "$arch_in" >&2
+      return 1
+    fi
+  else
+    arch="$(host_arch)"
+  fi
+  manifest_all_rows | awk -F'\t' -v t="$target" -v arch="$arch" '
+    t == "" || $3 == t {
+      m = $1
+      if (!(m in order_index)) { order_index[m] = ++n; order[n] = m }
+      if ($9 == arch) {
+        exact[m] = $0; has_exact[m] = 1
+      } else if (arch != "noarch" && $9 == "noarch") {
+        noarch_row[m] = $0; has_noarch[m] = 1
+      }
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        m = order[i]
+        if (has_exact[m] && has_noarch[m]) {
+          printf "模块 %s 同时存在架构 %s 的精确行和 noarch 行，拒绝猜测应选哪一行\n", \
+            m, arch > "/dev/stderr"
+          exit 1
+        } else if (has_exact[m]) {
+          print exact[m]
+        } else if (has_noarch[m]) {
+          print noarch_row[m]
+        }
+        # 精确行与 noarch 行都不存在：该模块不适用于此架构，跳过，不输出也不报错。
+      }
+    }
+  '
+}
+
+manifest_get() { # manifest_get <module> <列号> [arch]；精确架构优先，仅回退显式 noarch；[arch] 省略时用 host_arch
+  local m="$1" col="$2" arch_in="${3:-}" arch
+  if [ -n "$arch_in" ]; then
+    # 同 manifest_selected_rows：这里也返回失败而不是 die，让显式探测（含本文件自己的
+    # 合同测试）能安全地用 `if manifest_get ...; then` 检测拒绝，不被 exit 带崩调用脚本。
+    if ! arch="$(normalize_arch "$arch_in")"; then
+      printf 'ERROR: 不支持的架构: %s\n' "$arch_in" >&2
+      return 1
+    fi
+  else
+    arch="$(host_arch)"
+  fi
+  if ! manifest_selected_rows "" "$arch" \
+      | awk -F'\t' -v m="$m" -v c="$col" '$1 == m { print $c; found = 1 } END { exit !found }'; then
+    printf 'ERROR: manifest 里没有模块 %s 在架构 %s 下的唯一行（不存在，或与 noarch 行冲突，见上方具体原因）\n' \
+      "$m" "$arch" >&2
+    return 1
+  fi
+}
+
+manifest_arches() { # manifest_arches <module> → 该模块出现的架构，固定按 aarch64 x86_64 noarch 顺序输出
+  local m="$1"
+  manifest_all_rows | awk -F'\t' -v m="$m" '
+    $1 == m { seen[$9] = 1 }
+    END {
+      split("aarch64 x86_64 noarch", order, " ")
+      for (i = 1; i <= 3; i++) if (order[i] in seen) print order[i]
+    }
+  '
 }
 
 agent_marker_value() { # <Agent marker 路径> <runtime 根>；输出 -（未安装）或 ?（损坏）
