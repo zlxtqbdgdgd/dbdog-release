@@ -1117,6 +1117,23 @@ setup_release_repo "$CASE10/release" "$CASE10/release-bare.git" "$manifest_fixtu
   fi
   pass "register-module 拒绝缺参数/非法 kind-target-service/零架构/重复架构/不支持架构/不安全模块名"
 
+  # 评审 Important 3：noarch 不能和具体架构（aarch64/x86_64）混登记——manifest_all_rows
+  # 是所有写入者共享的唯一校验点，register-module 应该借由它自然被拦，不需要自己另开
+  # 一套重复校验。
+  if (cmd_register_module noarch-mix third-party stack no --arch aarch64 --arch noarch) \
+      >"$CASE10/badargs-noarchmix.log" 2>&1; then
+    fail "register-module 接受了同一次调用里 aarch64 与 noarch 混用"
+  fi
+  # manifest_all_rows 自己的 die() 直接 exit，先于 cmd_register_module 那句包装
+  # 用的 die 生效（同 cmd_migrate_manifest_v2 里一样的既有模式：包装 die 本身在这条
+  # 失败路径下永远到不了，manifest_all_rows 自己的诊断信息才是真正打印出来的那条）。
+  grep -Fq '不得混用 noarch 与具体架构' "$CASE10/badargs-noarchmix.log" \
+    || { sed -n '1,40p' "$CASE10/badargs-noarchmix.log" >&2; fail "noarch 混用被拒绝，但没有指向 manifest_all_rows 这道共享校验"; }
+  if manifest_all_rows | awk -F'\t' '$1=="noarch-mix"{f=1} END{exit(f?0:1)}'; then
+    fail "noarch 混用注册失败后，manifest 里不应该残留任何 noarch-mix 的行"
+  fi
+  pass "register-module 在同一次调用里混用 noarch 与具体架构时被 manifest_all_rows 这道共享校验拒绝，且不残留任何声明行"
+
   before_register_hashes="$(hashes_of "$RELEASE_DIR")"
   before_register_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
 
@@ -1233,4 +1250,57 @@ setup_release_repo "$CASE10/release" "$CASE10/release-bare.git" "$manifest_fixtu
 ) || exit 1
 pass "全新模块首发：register-module 原子登记未发布声明行 → 架构矩阵发布把声明行原子替换成真实行，全程遵守既有事务不变式"
 
-printf 'ALL PASS: 42 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 场景 11（评审 Important 2）：manifest 里任何一个"已登记未发布"模块（声明行，
+# artifact="-"）都不能让 prune_modules_to_manifest 整体 die——它枚举全部模块时
+# 会走到未发布模块那一行，之前的实现要求 artifact 匹配 "<module>-[0-9]*"，
+# "-" 直接不匹配，导致整仓库的 prune 从此永久报错，直到该模块真正发布为止。
+# 未发布模块没有任何资产需要保护/清理，命中 artifact="-" 应该直接跳过。
+# ===========================================================================
+CASE11="$TEST_ROOT/case11"
+mkdir -p "$CASE11/release"
+manifest11="$CASE11/release/manifest.tsv"
+PRUNE_SHA_A="$(printf 'e%.0s' $(seq 1 64))"
+{
+  # 已发布模块：真实资产已经存在于（模拟）产物桶，prune 应该识别为"当前引用"，
+  # 既不清理也不报错。
+  printf 'published-mod\tthird-party\tstack\tno\t1.0.0\tpublished-mod-1.0.0-aarch64.tar.gz\t%s\t-\taarch64\n' \
+    "$PRUNE_SHA_A"
+  # 未发布模块：register-module 登记后、真正发布前的声明行，artifact="-"。
+  printf 'unpublished-mod\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n'
+} >"$manifest11"
+
+(
+  RELEASE_DIR="$CASE11/release"
+  DBDOG_HOME="$CASE11/home"
+  MANIFEST="$manifest11"
+  export RELEASE_DIR DBDOG_HOME MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  FAKE_STATE_DIR="$CASE11/state"
+  mkdir -p "$FAKE_STATE_DIR"
+  export FAKE_STATE_DIR FAKE_RELEASE_DIR="$RELEASE_DIR" FAKE_GH_TOKEN="unused-in-dry-run"
+  # 让共享假 gh 的资产清单只报告 published-mod 已经真实存在的那一份资产
+  # （aarch64 槽位复用共享脚本；unpublished-mod 完全没有资产，不占用 x86_64 槽位）。
+  printf 'published-mod-1.0.0-aarch64.tar.gz\t2048\t%s\n' "$PRUNE_SHA_A" \
+    >"$FAKE_STATE_DIR/asset-aarch64"
+
+  prune_out="$CASE11/prune.log"
+  # prune_modules_to_manifest 内部失败走 die()（直接 exit），不是普通返回非零状态——
+  # 必须用子 shell 包住调用本身，否则失败时会把 exit 一路带到这层 CASE11 子 shell，
+  # 跳过下面的 || 兜底，连诊断信息都来不及打印（同 test-publish-architecture-
+  # transaction.sh 里 resolve_build_host_for_arch 等其它 die 调用点的既有教训）。
+  if ! (prune_modules_to_manifest 0 published-mod unpublished-mod) >"$prune_out" 2>&1; then
+    sed -n '1,80p' "$prune_out" >&2
+    fail "manifest 含未发布模块（artifact=-）时 prune 试运行本应成功却失败了"
+  fi
+  grep -Fq '无可清理产物' "$prune_out" \
+    || { sed -n '1,80p' "$prune_out" >&2; fail "prune 试运行应该报告没有可清理的产物（唯一真实资产仍被 published-mod 引用）"; }
+  if grep -Fq 'manifest 当前资产名不属于该模块' "$prune_out"; then
+    fail "prune 仍然把未发布模块的 artifact=\"-\" 当成了非法资产名"
+  fi
+) || exit 1
+pass "manifest 里存在已登记未发布的模块（artifact=\"-\"）时，prune 试运行正确跳过它、不报错，且已发布模块的真实资产仍被正确保护"
+
+printf 'ALL PASS: 43 publish architecture transaction contract tests\n'

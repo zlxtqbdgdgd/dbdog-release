@@ -1257,6 +1257,11 @@ prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，�
     while IFS= read -r arch; do
       [ -n "$arch" ] || continue
       current="$(manifest_get "$m" 6 "$arch")"
+      # 未发布模块（register-module 登记的声明行，artifact="-"）没有任何资产可以
+      # 保护也没有任何资产可以清理；不能因为它不匹配 "<module>-[0-9]*" 就整体
+      # die——否则任何一个已登记未发布的模块存在，都会让 prune 永久报废，直到
+      # 该模块真正发布为止。
+      [ "$current" != "-" ] || continue
       case "$current" in
         "$m"-[0-9]*) ;;
         *) die "[$m/$arch] manifest 当前资产名不属于该模块，拒绝清理: $current" ;;

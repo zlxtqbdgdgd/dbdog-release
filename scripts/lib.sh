@@ -346,6 +346,26 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
         exit 1
       }
       seen_arch[key] = 1
+      # noarch 与具体架构（aarch64/x86_64）不能出现在同一个模块——manifest_selected_rows/
+      # manifest_get 一旦发现某模块精确架构行与 noarch 行并存就整体拒绝（无法猜测该选
+      # 哪一行），所以这种组合虽然能通过其它逐列校验，却会打死所有消费者对该模块的读取。
+      # 必须在写入侧（manifest_all_rows 是所有写入者共享的唯一校验点）就拒绝，而不是
+      # 分散到 register-module 等各个调用方各自零散判断。
+      if (arch == "noarch") {
+        if (module in seen_specific_arch) {
+          printf "manifest 第 %d 行：模块 %s 已经登记过具体架构（aarch64/x86_64），不能再混入 noarch 行\n", \
+            FNR, module > "/dev/stderr"
+          exit 1
+        }
+        seen_noarch_module[module] = 1
+      } else {
+        if (module in seen_noarch_module) {
+          printf "manifest 第 %d 行：模块 %s 已经登记过 noarch，不能再混入具体架构（%s）行\n", \
+            FNR, module, arch > "/dev/stderr"
+          exit 1
+        }
+        seen_specific_arch[module] = 1
+      }
       if (module in seen_version) {
         if (seen_version[module] != version) {
           printf "manifest 第 %d 行的 version 与模块 %s 之前的行不一致\n", \
@@ -363,7 +383,7 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
       }
       print
     }
-  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构或整行为未发布声明、(module, arch) 唯一、同模块 version/source_sha 一致）: $MANIFEST"
+  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构或整行为未发布声明、(module, arch) 唯一、同模块 version/source_sha 一致、同模块不得混用 noarch 与具体架构）: $MANIFEST"
 }
 
 manifest_selected_rows() { # manifest_selected_rows [target] [arch]；每个逻辑模块至多一行；[arch] 省略时用 host_arch

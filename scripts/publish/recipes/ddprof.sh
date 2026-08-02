@@ -104,8 +104,14 @@ main() {
     require_cmd "$cmd"
   done
 
-  [ "$ver" = "$PINNED_VERSION" ] || \
-    die "本配方只接受 VERSION=$PINNED_VERSION（收到 VERSION=${ver:-空}）；ddprof 固定版本，换版本前须离线核对官方新 sha256sum.txt 并更新配方内四个内容锁，禁止解析 latest 或在线 sha256sum.txt 作为权威"
+  # publish.sh 对三方件模块（kind != first-party）恒传空 VERSION（build_one_arch 的
+  # $ver 只对 first-party 模块由发布计划算出，三方件的真实版本由配方自己探测/钉死；
+  # 其余现有三方件配方头注释都写"VERSION 忽略/自动探测"）。ddprof 固定版本、拒绝
+  # latest，但必须放行生产会真实传入的空串，否则 publish.sh publish ddprof 会在第
+  # 一个架构就必死——空串和显式传入的 0.26.0 都视为"使用固定版本"，其余任何非空值
+  # （latest、其它版本号）仍然 fail closed。
+  [ -z "$ver" ] || [ "$ver" = "$PINNED_VERSION" ] || \
+    die "本配方只接受空 VERSION（三方件生产调用形态）或 VERSION=$PINNED_VERSION（收到 VERSION=$ver）；ddprof 固定版本，换版本前须离线核对官方新 sha256sum.txt 并更新配方内四个内容锁，禁止解析 latest 或在线 sha256sum.txt 作为权威"
 
   local asset_name pinned_tar_sha256 pinned_bin_sha256
   case "$arch" in

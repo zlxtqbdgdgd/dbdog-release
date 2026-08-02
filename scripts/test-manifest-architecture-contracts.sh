@@ -165,6 +165,47 @@ if out="$(MANIFEST="$TEST_ROOT/mixed.tsv" manifest_all_rows 2>&1)"; then
 fi
 pass '同模块混合未发布声明行与已发布真实行 fail closed（version 不一致校验天然覆盖）'
 
+# ---- manifest_all_rows：同模块不能混用 noarch 与具体架构（评审 Important 3）----
+# noarch 语义是"这个模块的产物不含机器码，任何架构都能用同一份"；一旦同一个模块
+# 又出现具体架构（aarch64/x86_64）行，manifest_selected_rows 的精确/noarch 冲突
+# 检测会直接把消费者读取该模块的每一次查询都拒绝掉——这种"能通过 manifest_all_rows
+# 但打死所有消费者"的组合必须在写入时就被 manifest_all_rows 本身拒绝，让所有写入者
+# （register-module、未来的其它路径）共享同一张网，而不是各自零散校验。
+{
+  printf 'noarchmix\tthird-party\tstack\tno\t1.0.0\tnoarchmix-1.0.0-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_A"
+  printf 'noarchmix\tthird-party\tstack\tno\t1.0.0\tnoarchmix-1.0.0-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_B"
+} >"$TEST_ROOT/noarch-then-specific.tsv"
+if out="$(MANIFEST="$TEST_ROOT/noarch-then-specific.tsv" manifest_all_rows 2>&1)"; then
+  fail "先 noarch 后具体架构的同模块混合未被拒绝: $out"
+fi
+pass '同模块先出现 noarch 行、再出现具体架构行 fail closed'
+
+{
+  printf 'noarchmix2\tthird-party\tstack\tno\t1.0.0\tnoarchmix2-1.0.0-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A"
+  printf 'noarchmix2\tthird-party\tstack\tno\t1.0.0\tnoarchmix2-1.0.0-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_B"
+} >"$TEST_ROOT/specific-then-noarch.tsv"
+if out="$(MANIFEST="$TEST_ROOT/specific-then-noarch.tsv" manifest_all_rows 2>&1)"; then
+  fail "先具体架构后 noarch 的同模块混合未被拒绝: $out"
+fi
+pass '同模块先出现具体架构行、再出现 noarch 行 fail closed（顺序无关，两个方向都拒绝）'
+
+{
+  printf 'noarchmix3\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n'
+  printf 'noarchmix3\tthird-party\tdbhost\tno\t-\t-\t-\t-\tnoarch\n'
+} >"$TEST_ROOT/noarch-mix-declared.tsv"
+if out="$(MANIFEST="$TEST_ROOT/noarch-mix-declared.tsv" manifest_all_rows 2>&1)"; then
+  fail "同模块未发布声明行混用 aarch64 与 noarch 未被拒绝: $out"
+fi
+pass '未发布声明行同样受 noarch/具体架构互斥约束（register-module 混合登记会被同一张网拦住）'
+
+# ---- manifest_all_rows：真实 manifest.tsv（7 个 aarch64 模块 + 1 个 noarch 模块，
+# 分属不同模块）不受 noarch 互斥校验影响 ----
+real_manifest="$RELEASE_DIR/manifest.tsv"
+[ -f "$real_manifest" ] || fail "找不到真实 manifest.tsv: $real_manifest"
+MANIFEST="$real_manifest" manifest_all_rows >/dev/null \
+  || fail '真实 manifest.tsv 被新的 noarch 互斥校验意外拒绝'
+pass '真实 manifest.tsv（各模块单一架构，noarch 与具体架构分属不同模块）通过新校验不受影响'
+
 # ---- manifest_get / manifest_selected_rows：未发布声明行的字段原样可读（version="-"），
 # 由调用方按既有的 "-" 语义决定跳过——这是 upgrade.sh/check-upgrade.sh/agent-install.sh
 # 已经在用的既有约定，不是新协议。----
@@ -189,23 +230,31 @@ if MANIFEST="$TEST_ROOT/conflict.tsv" manifest_get both 6 aarch64 >/dev/null 2>&
 fi
 pass 'manifest_get 同样拒绝精确/noarch 冲突'
 
-# ---- manifest_get：冲突的爆炸半径必须限定在被查询的模块，不能波及无关模块 ----
+# ---- manifest_get：beta 自身 noarch+aarch64 冲突的错误信息必须精确点名 beta ----
 # alpha 干净（只有一行 aarch64），beta 与 alpha 无关且自己有 aarch64+noarch 冲突。
-# 查 alpha 不该因为 beta 的冲突而失败；查 beta 失败时错误信息必须点名 beta，不能是 alpha。
+#
+# 注意（评审 Important 3 之后的行为变化）：beta 的 aarch64+noarch 混用现在会被
+# manifest_all_rows 在写入侧就整体拒绝（见上面新增的"同模块不能混用 noarch 与
+# 具体架构"用例）——manifest_get/manifest_selected_rows 都构建在 manifest_all_rows
+# 之上，因此 beta 这一种冲突不再只影响 beta 自己的查询，查 alpha 现在也会因为整份
+# manifest 被拒绝而失败。这是有意的：manifest_all_rows 是所有写入者共享的唯一校验
+# 点，一旦某个模块的 noarch/具体架构混用能通过它，就说明它已经被 register-module
+# 之外的手段写入了 manifest.tsv（违反"正式发布必须经 publish.sh"的项目规则）——
+# 这种情况下让整份 manifest 立刻整体报错（而不是悄悄只影响 beta 一个模块），更符合
+# 这个代码库一贯的"尽早、响亮地 fail closed"取向，也是评审明确要求的方案。
+# manifest_get 自身对 has_exact && has_noarch 的两两冲突检测代码原样保留，作为
+# manifest_all_rows 之外的第二道防线（防御性代码，正常路径下不会再被触发）。
 {
   printf 'alpha\tfirst-party\tstack\tno\t1.0.0\talpha-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_A"
   printf 'beta\tthird-party\tstack\tno\t1.0.0\tbeta-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_B"
   printf 'beta\tthird-party\tstack\tno\t1.0.0\tbeta-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_C"
 } >"$TEST_ROOT/blast-radius.tsv"
-# 必须同时检查退出码和值：manifest_selected_rows 按文件行序处理模块，alpha 排在 beta 前面时，
-# 冲突前已经把 alpha 那一行流式 print 给了下游 awk，即使外层整体判定失败、返回值仍可能"碰巧"
-# 是对的——只看 stdout 内容会漏掉「返回了失败状态」这个真正的 bug。
-if out="$(MANIFEST="$TEST_ROOT/blast-radius.tsv" manifest_get alpha 6 aarch64)"; then
-  [ "$out" = alpha-aarch64.tar.gz ] || fail "alpha 查询返回值错误: $out"
-else
-  fail '无关模块 beta 的精确/noarch 冲突波及了 alpha 的定向查询（exit 非 0）'
+if out="$(MANIFEST="$TEST_ROOT/blast-radius.tsv" manifest_get alpha 6 aarch64 2>&1)"; then
+  fail "beta 的 noarch/具体架构混用现在应该让整份 manifest 被拒绝，查 alpha 也不该成功: $out"
 fi
-pass 'manifest_get 冲突的爆炸半径限定在被查询的模块，不影响无关模块查询'
+grep -Fq '模块 beta' <<<"$out" \
+  || fail "alpha 查询失败时的报错信息应该点名真正有问题的模块 beta: $out"
+pass 'manifest_all_rows 对 beta 的 noarch/具体架构混用整体拒绝，查无关模块 alpha 时报错信息仍精确点名 beta'
 out="$(MANIFEST="$TEST_ROOT/blast-radius.tsv" manifest_get beta 6 aarch64 2>&1)" && \
   fail "manifest_get 未对 beta 自身的精确/noarch 冲突报错: $out"
 case "$out" in
@@ -250,14 +299,24 @@ lines="$(MANIFEST="$TEST_ROOT/manifest.tsv" manifest_selected_rows "" x86_64 | w
 pass 'manifest_selected_rows 每个逻辑模块至多一行'
 
 # ---- manifest_arches：固定顺序，不依赖文件中出现顺序 ----
+# 注意（评审 Important 3 之后的行为变化）：noarch 不能再与具体架构混用（见上面
+# 新增的互斥用例），所以这里不再用"一个模块同时有 x86_64/aarch64/noarch 三行"
+# 的 fixture 验证 noarch 排序——那种组合现在会被 manifest_all_rows 直接拒绝。
+# 拆成两个 fixture：multi 只用两个具体架构验证 aarch64 排在 x86_64 前面（文件里
+# x86_64 先出现）；only-noarch 单独验证 noarch-only 模块的输出。
 {
   printf 'multi\tfirst-party\tstack\tno\t1.0.0\tmulti-x86_64.tar.gz\t%s\t-\tx86_64\n' "$SHA_A"
   printf 'multi\tfirst-party\tstack\tno\t1.0.0\tmulti-aarch64.tar.gz\t%s\t-\taarch64\n' "$SHA_B"
-  printf 'multi\tfirst-party\tstack\tno\t1.0.0\tmulti-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_C"
 } >"$TEST_ROOT/arches.tsv"
 arches="$(MANIFEST="$TEST_ROOT/arches.tsv" manifest_arches multi | tr '\n' ' ')"
-[ "$arches" = 'aarch64 x86_64 noarch ' ] || fail "manifest_arches 顺序错误: $arches"
-pass 'manifest_arches 按 aarch64 x86_64 noarch 稳定顺序输出'
+[ "$arches" = 'aarch64 x86_64 ' ] || fail "manifest_arches 顺序错误: $arches"
+pass 'manifest_arches 按 aarch64 x86_64 稳定顺序输出（不依赖文件中出现顺序）'
+
+printf 'only-noarch\tfirst-party\tstack\tno\t1.0.0\tonly-noarch-1.0.0-noarch.tar.gz\t%s\t-\tnoarch\n' "$SHA_C" \
+  >"$TEST_ROOT/only-noarch.tsv"
+[ "$(MANIFEST="$TEST_ROOT/only-noarch.tsv" manifest_arches only-noarch | tr '\n' ' ')" = 'noarch ' ] \
+  || fail 'manifest_arches 对 noarch-only 模块输出错误'
+pass 'manifest_arches 对 noarch-only 模块（不与具体架构混用）正确输出 noarch'
 
 # ---- publish_migrate_manifest_v2：三个确定后缀被迁移为对应第九列 arch（计划给定用例）----
 legacy="$TEST_ROOT/legacy.tsv"
@@ -434,4 +493,60 @@ if grep -Fq 'unpublished-mod' "$upgrade_default_out"; then
 fi
 pass 'upgrade.sh 默认无参枚举完全不涉及未发布模块（未安装且未发布，不会被选中）'
 
-printf 'ALL PASS: 42 manifest architecture contract tests\n'
+# ---- 评审 Important 4：check-upgrade.sh 不能把 Agent runtime marker 当成所有
+# target=dbhost 模块的已装版本——ddprof 等非 Agent 的 dbhost 模块必须借用 stack
+# 模块同一套已装状态源（MODULES_DIR/<模块>/current），而不是 Agent 的
+# .dbdog-release-version；否则 ddprof 发布后，DB 主机会永远把 Agent 的版本号当成
+# ddprof 的"已装"版本，显示"版本不同 ←"、纳入 exit 10，且提示"升级 Agent"这个和
+# ddprof 完全无关的操作，永不自愈。----
+agent_mix_root="$TEST_ROOT/agent-target-mix"
+agent_runtime="$agent_mix_root/agent-runtime"
+mkdir -p "$agent_runtime"
+agent_mix_manifest="$agent_mix_root/manifest.tsv"
+AGENT_MARKER_VERSION="9.99.0-dbdog.1"
+AGENT_MANIFEST_VERSION="7.81.0-dbdog.4"
+DDPROF_SHA="$(printf 'f%.0s' $(seq 1 64))"
+{
+  printf 'dbdog-agent\tfirst-party\tdbhost\tno\t%s\tdbdog-agent-%s-aarch64.tar.gz\t%s\tagent:1,core:1\taarch64\n' \
+    "$AGENT_MANIFEST_VERSION" "$AGENT_MANIFEST_VERSION" "$SHA_A"
+  printf 'ddprof\tthird-party\tdbhost\tno\t0.26.0\tddprof-0.26.0-aarch64.tar.gz\t%s\t-\taarch64\n' \
+    "$DDPROF_SHA"
+} >"$agent_mix_manifest"
+# Agent 的 runtime marker 存在（版本号故意和 dbdog-agent 的 manifest 行、ddprof 的
+# manifest 行都不同，这样一旦 ddprof 误借用它就会立刻在"已装"列露出破绽）。
+printf '%s\n' "$AGENT_MARKER_VERSION" >"$agent_runtime/.dbdog-release-version"
+printf '%s\n' "$SHA_B" >"$agent_runtime/.dbdog-artifact-sha256"
+
+agent_mix_out="$TEST_ROOT/agent-target-mix.out"
+agent_mix_rc=0
+AGENT_RUNTIME_DIR="$agent_runtime" MANIFEST="$agent_mix_manifest" \
+  DBDOG_HOME="$agent_mix_root/home" DBDOG_HOST_ARCH_OVERRIDE=aarch64 \
+  bash "$SCRIPTS_DIR/check-upgrade.sh" >"$agent_mix_out" 2>&1 || agent_mix_rc=$?
+[ "$agent_mix_rc" -eq 10 ] \
+  || { sed -n '1,80p' "$agent_mix_out" >&2; fail "check-upgrade.sh 期望因 Agent 版本不同而以 10 退出，实际 rc=$agent_mix_rc"; }
+
+ddprof_line="$(grep '^ddprof ' "$agent_mix_out" || true)"
+[ -n "$ddprof_line" ] || { sed -n '1,80p' "$agent_mix_out" >&2; fail "输出里找不到 ddprof 这一行"; }
+case "$ddprof_line" in
+  *"$AGENT_MARKER_VERSION"*)
+    fail "ddprof 的已装列借用了 Agent runtime marker 的版本号: $ddprof_line" ;;
+esac
+case "$ddprof_line" in
+  *'←'*)
+    fail "ddprof 被误标记为需要处理（不应该借 Agent 版本号触发「版本不同」）: $ddprof_line" ;;
+esac
+printf '%s\n' "$ddprof_line" | grep -Fq '未安装/由专属流程管理' \
+  || { sed -n '1,80p' "$agent_mix_out" >&2; fail "ddprof（非 Agent 的 dbhost 模块，没有 MODULES_DIR/current）应该显示未安装/由专属流程管理: $ddprof_line"; }
+pass "ddprof（target=dbhost 但不是 dbdog-agent）不借用 Agent runtime marker，未安装时显示专属提示，不被误判为「版本不同」"
+
+agent_line="$(grep '^dbdog-agent ' "$agent_mix_out" || true)"
+[ -n "$agent_line" ] || { sed -n '1,80p' "$agent_mix_out" >&2; fail "输出里找不到 dbdog-agent 这一行"; }
+printf '%s\n' "$agent_line" | grep -Fq "$AGENT_MARKER_VERSION" \
+  || { sed -n '1,80p' "$agent_mix_out" >&2; fail "dbdog-agent 自己的已装列应该仍然读取 Agent runtime marker: $agent_line"; }
+printf '%s\n' "$agent_line" | grep -Fq '版本不同' \
+  || { sed -n '1,80p' "$agent_mix_out" >&2; fail "dbdog-agent 自己的版本不同判定不应该受影响: $agent_line"; }
+grep -Fq 'sudo scripts/upgrade.sh dbdog-agent' "$agent_mix_out" \
+  || { sed -n '1,80p' "$agent_mix_out" >&2; fail "dbdog-agent 真的版本不同时，仍应该提示升级 Agent"; }
+pass "dbdog-agent 自身仍然正确读取 Agent runtime marker、版本不同时仍计入 agent_updates 并提示升级 Agent（本次修复未改变 Agent 自己的行为）"
+
+printf 'ALL PASS: 44 manifest architecture contract tests\n'

@@ -136,6 +136,17 @@ grep -Fxq 'https://github.com/DataDog/ddprof/releases/download/v0.26.0/ddprof-0.
   "$CURL_LOG" || fail "aarch64 没有请求官方 arm64-linux.tar.xz: $(cat "$CURL_LOG")"
 pass "x86_64/aarch64 各自请求正确的官方资产文件名，未搞反"
 
+# ---- VERSION=""（publish.sh 对三方件的恒定生产调用形态）必须被接受，等价于固定版本 ----
+# publish.sh cmd_publish 的架构矩阵循环对非 first-party 模块恒传 ver=""（build_one_arch
+# "$m" "$ver" "$arch" 里 $ver 对三方件永远是空串，见其它三方件配方头注释"VERSION 忽略/
+# 自动探测"）。ddprof 配方虽然固定版本、拒绝 latest，但绝不能把生产会真实传入的空串也
+# 一并拒绝——否则 publish.sh publish ddprof 会在第一个架构就必死。
+: >"$CURL_LOG"
+run_recipe "" x86_64 "$FIXTURE_DIR" "$TEST_ROOT/work-empty-ver" >/dev/null 2>&1 || true
+grep -Fxq 'https://github.com/DataDog/ddprof/releases/download/v0.26.0/ddprof-0.26.0-amd64-linux.tar.xz' \
+  "$CURL_LOG" || fail "VERSION=\"\"（publish.sh 对三方件的生产调用形态）没有被当作固定版本驱动到正确下载路径: $(cat "$CURL_LOG")"
+pass 'VERSION=""（publish.sh 对三方件恒传的生产调用形态）被接受，等价于固定版本 0.26.0'
+
 # ---- tar 摘要不匹配：fail closed，且不产出任何产物 ----
 work_bad="$TEST_ROOT/work-bad-tar"
 out=""
