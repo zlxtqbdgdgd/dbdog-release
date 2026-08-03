@@ -11,6 +11,10 @@
 #     --arch <架构> [--arch <架构>]...    # 全新模块首发登记：原子写入未发布声明行
 #                                        # （每架构一行，version/artifact/sha256/source_sha 全为 -），
 #                                        # 之后照常 publish.sh publish <模块> --yes 完成首次真实发布
+#   publish.sh register-arch <模块> --arch <架构> [--arch <架构>]...
+#                                        # 给已登记模块补未发布架构声明行（kind/target/service
+#                                        # 从现有行复制）；用于已发布模块扩展第二架构。
+#                                        # DBDOG_PUBLISH_SKIP_PUSH=1 时只本地 commit，不 push。
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
 # 产物在构建机上完成架构/摘要校验并直传 GitHub；本机不再中转大文件。
@@ -23,7 +27,27 @@ BUCKET_TAG="artifacts"
 SCRATCH="$RELEASE_DIR/scratch"
 
 CONF="$HERE/publish.conf"
-[ -f "$CONF" ] && source "$CONF"
+# 合同测试会在 source 本文件前预设 SRC_ROOT/BUILD_HOST_* 等；publish.conf 不得覆盖它们。
+_preset_src_root="${SRC_ROOT-}"
+_preset_repo_root="${REPO_ROOT-}"
+_preset_build_work="${BUILD_WORK-}"
+_preset_tool_path="${TOOL_PATH-}"
+_preset_build_host="${BUILD_HOST-}"
+_preset_build_host_aarch64="${BUILD_HOST_AARCH64-}"
+_preset_build_host_x86_64="${BUILD_HOST_X86_64-}"
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$CONF"
+fi
+[ -n "${_preset_src_root}" ] && SRC_ROOT="$_preset_src_root"
+[ -n "${_preset_repo_root}" ] && REPO_ROOT="$_preset_repo_root"
+[ -n "${_preset_build_work}" ] && BUILD_WORK="$_preset_build_work"
+[ -n "${_preset_tool_path}" ] && TOOL_PATH="$_preset_tool_path"
+[ -n "${_preset_build_host}" ] && BUILD_HOST="$_preset_build_host"
+[ -n "${_preset_build_host_aarch64}" ] && BUILD_HOST_AARCH64="$_preset_build_host_aarch64"
+[ -n "${_preset_build_host_x86_64}" ] && BUILD_HOST_X86_64="$_preset_build_host_x86_64"
+unset _preset_src_root _preset_repo_root _preset_build_work _preset_tool_path \
+  _preset_build_host _preset_build_host_aarch64 _preset_build_host_x86_64
 SRC_ROOT="${SRC_ROOT:-$(cd "$RELEASE_DIR/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-/home/z1/dbdog/repo}"
 BUILD_WORK="${BUILD_WORK:-/home/z1/dbdog-release-build}"
@@ -104,10 +128,11 @@ load_agent_release_baseline() {
         allowed["release_prefix_key"] = 1
         allowed["dbdog_version_template"] = 1
         allowed["dbdog_revision_initial"] = 1
+        allowed["dbdog_revision_current"] = 1
         allowed["dbdog_revision_reset_on_official_baseline_change"] = 1
         allowed["release_build_must_use_explicit_source_commits"] = 1
         allowed["release_json_current_milestone_is_prefix_authority"] = 1
-        expected = 20
+        expected = 21
       }
       {
         if (NF != 2 || $1 == "" || $2 == "" || !($1 in allowed) || seen[$1]++) bad = 1
@@ -169,6 +194,12 @@ load_agent_release_baseline() {
     || die "Agent dbdog 版本模板不符合发布政策"
   [ "$(agent_baseline_value dbdog_revision_initial)" = "1" ] \
     || die "Agent 本地打包修订必须从 1 开始"
+  local revision_current
+  revision_current="$(agent_baseline_value dbdog_revision_current)"
+  [[ "$revision_current" =~ ^[1-9][0-9]*$ ]] \
+    || die "Agent dbdog_revision_current 必须是正整数: $revision_current"
+  [ "$revision_current" -ge 1 ] \
+    || die "Agent dbdog_revision_current 不能小于 dbdog_revision_initial"
   [ "$(agent_baseline_value dbdog_revision_reset_on_official_baseline_change)" = "true" ] \
     || die "Agent 官方基线变化时必须重置本地打包修订"
   [ "$(agent_baseline_value release_build_must_use_explicit_source_commits)" = "true" ] \
@@ -627,14 +658,36 @@ fetch_remote_artifact() { # <远端绝对路径> <本地文件>；校验远端 S
     || die "取回后的产物 SHA-256 与构建机不一致"
 }
 
-manifest_module_field() { # manifest_module_field <module> <列号>；取该模块任意一行的指定列
-  # 只用于按模块恒定、不随架构变化的列（kind/target/service/version/source_sha——
-  # manifest_all_rows 已经强制同模块跨架构行的 version/source_sha 一致；kind/target/
-  # service 从未按架构区分过）。不要用它读 artifact/sha256，那两列按架构各不相同。
+manifest_module_field() { # manifest_module_field <module> <列号>；取该模块模块级字段
+  # 只用于按模块恒定、不随架构变化的列（kind/target/service/version/source_sha）。
+  # 允许同一模块混有已发布行与未发布声明行时：version/source_sha 优先取已发布行
+  # （非 "-"）；kind/target/service 取任意一行（manifest_all_rows 已强制一致）。
+  # 不要用它读 artifact/sha256，那两列按架构各不相同。
   local m="$1" col="$2" value
-  value="$(manifest_all_rows | awk -F'\t' -v m="$m" -v c="$col" '$1==m {print $c; exit}')"
+  value="$(manifest_all_rows | awk -F'\t' -v m="$m" -v c="$col" '
+      $1 == m {
+        if (c == 5 || c == 8) {
+          if ($c != "-") { print $c; found = 1; exit }
+          if (!pending) pending = $c
+        } else {
+          print $c; found = 1; exit
+        }
+      }
+      END {
+        if (!found && pending != "") print pending
+      }
+    ')"
   [ -n "$value" ] || { printf 'ERROR: manifest 中没有模块 %s\n' "$m" >&2; return 1; }
   printf '%s\n' "$value"
+}
+
+publish_maybe_push_main() { # publish_maybe_push_main <失败提示>
+  local fail_msg="$1"
+  if [ "${DBDOG_PUBLISH_SKIP_PUSH:-}" = "1" ]; then
+    log "DBDOG_PUBLISH_SKIP_PUSH=1：跳过 git push origin main（本地已提交）"
+    return 0
+  fi
+  git -C "$RELEASE_DIR" push origin main || die "$fail_msg"
 }
 
 # ---- 原生 builder 解析（每个架构独立执行器；旧 BUILD_HOST 只在自证同架构时兼容回退）----
@@ -1565,9 +1618,98 @@ cmd_register_module() { # register-module <module> <first-party|third-party> <st
   git -C "$RELEASE_DIR" add manifest.tsv README.md
   git -C "$RELEASE_DIR" commit -m "register: ${m} (${ordered// /,}) unpublished" \
     || die "register-module git commit 失败（manifest/README 已写入声明行但未提交）；确认工作区改动后手动 git add/commit，或 git checkout -- manifest.tsv README.md 撤销后重跑"
-  git -C "$RELEASE_DIR" push origin main \
-    || die "register-module push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main（重新执行 register-module 会因模块已登记而拒绝）"
+  publish_maybe_push_main \
+    "register-module push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main（重新执行 register-module 会因模块已登记而拒绝）"
   log "已登记新模块 ${m}（${ordered}，未发布，version=-）"
+}
+
+cmd_register_arch() { # register-arch <module> --arch <架构> [--arch <架构>]...
+  # 给已存在模块追加未发布架构声明行；kind/target/service 从现有行复制。
+  local m=""
+  local -a arches=()
+  if [ $# -ge 1 ]; then
+    m="$1"; shift
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --arch)
+        [ $# -ge 2 ] || die "register-arch: --arch 需要参数"
+        arches+=("$2"); shift 2
+        ;;
+      *) die "register-arch 不认识的参数: $1" ;;
+    esac
+  done
+  [ -n "$m" ] || die "用法: register-arch <module> --arch <架构> [--arch <架构>]..."
+  case "$m" in
+    "" | "." | ".." | */* | *$'\n'* | *$'\r'* | *$'\t'*)
+      die "register-arch 模块名不是安全的单层路径名: $m"
+      ;;
+  esac
+  [ ${#arches[@]} -gt 0 ] || die "register-arch 至少需要一个 --arch"
+
+  local -a normalized=()
+  local raw na seen dup
+  for raw in "${arches[@]}"; do
+    na="$(normalize_arch "$raw")" || die "register-arch 不支持的架构: $raw"
+    dup=0
+    for seen in ${normalized[@]+"${normalized[@]}"}; do
+      [ "$seen" != "$na" ] || { dup=1; break; }
+    done
+    [ "$dup" -eq 0 ] || die "register-arch 重复的 --arch: $na"
+    normalized+=("$na")
+  done
+
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md \
+    || die "manifest.tsv/README.md 有未提交的改动，拒绝在脏工作区上登记架构"
+  manifest_all_rows >/dev/null \
+    || die "现有 manifest.tsv 未通过 manifest_all_rows 严格校验，拒绝在此基础上登记架构"
+  if ! manifest_all_rows | awk -F'\t' -v m="$m" '$1==m{f=1} END{exit(f?0:1)}'; then
+    die "模块 $m 尚未在 manifest 里登记；新模块请用 register-module"
+  fi
+
+  local existing_arches kind target service
+  existing_arches="$(manifest_arches "$m")"
+  kind="$(manifest_module_field "$m" 2)"
+  target="$(manifest_module_field "$m" 3)"
+  service="$(manifest_module_field "$m" 4)"
+
+  local -a to_add=()
+  for na in "${normalized[@]}"; do
+    if printf '%s\n' "$existing_arches" | grep -Fxq -- "$na"; then
+      die "模块 $m 已经登记过架构 $na，拒绝重复登记"
+    fi
+    to_add+=("$na")
+  done
+
+  local ordered="" order_arch cand
+  for order_arch in aarch64 x86_64 noarch; do
+    for cand in "${to_add[@]}"; do
+      [ "$cand" != "$order_arch" ] || ordered="$ordered${ordered:+ }$order_arch"
+    done
+  done
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.register.XXXXXX")" || die "无法创建 manifest 临时文件"
+  if ! cp -- "$MANIFEST" "$tmp"; then
+    rm -f -- "$tmp"
+    die "无法复制 manifest 到临时文件"
+  fi
+  for na in $ordered; do
+    printf '%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$m" "$kind" "$target" "$service" "$na" >>"$tmp"
+  done
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "register-arch 写入的声明行未通过 manifest_all_rows 校验，拒绝落地"
+  fi
+  mv -- "$tmp" "$MANIFEST"
+
+  regen_readme
+  git -C "$RELEASE_DIR" add manifest.tsv README.md
+  git -C "$RELEASE_DIR" commit -m "register-arch: ${m} (+${ordered// /,}) unpublished" \
+    || die "register-arch git commit 失败（manifest/README 已写入声明行但未提交）；确认工作区改动后手动 git add/commit，或 git checkout -- manifest.tsv README.md 撤销后重跑"
+  publish_maybe_push_main \
+    "register-arch push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main"
+  log "已为模块 ${m} 登记架构 ${ordered}（未发布，version=-）"
 }
 
 main() {
@@ -1578,7 +1720,8 @@ main() {
     prune) shift; cmd_prune "$@" ;;
     migrate-manifest-v2) shift; cmd_migrate_manifest_v2 "$@" ;;
     register-module) shift; cmd_register_module "$@" ;;
-    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2|register-module" ;;
+    register-arch) shift; cmd_register_arch "$@" ;;
+    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2|register-module|register-arch" ;;
   esac
 }
 

@@ -155,15 +155,26 @@ if out="$(MANIFEST="$TEST_ROOT/half-srcsha.tsv" manifest_all_rows 2>&1)"; then
 fi
 pass 'version="-" 但 source_sha 不是 "-" 的半发布行 fail closed'
 
-# ---- manifest_all_rows：同模块不能一部分是声明行、一部分是真实行（首发事务是全架构原子替换）----
+# ---- manifest_all_rows：允许已发布行 + 未发布声明行并存（register-arch 给已发布模块补架构）----
 {
-  printf 'mixed\tthird-party\tdbhost\tno\t-\t-\t-\t-\taarch64\n'
-  printf 'mixed\tthird-party\tdbhost\tno\t1.0.0\tmixed-1.0.0-x86_64.tar.gz\t%s\t-\tx86_64\n' "$SHA_A"
+  printf 'mixed\tthird-party\tdbhost\tno\t1.0.0\tmixed-1.0.0-aarch64.tar.gz\t%s\tsrc1\taarch64\n' "$SHA_A"
+  printf 'mixed\tthird-party\tdbhost\tno\t-\t-\t-\t-\tx86_64\n'
 } >"$TEST_ROOT/mixed.tsv"
-if out="$(MANIFEST="$TEST_ROOT/mixed.tsv" manifest_all_rows 2>&1)"; then
-  fail "同模块混合声明行与真实行未被拒绝: $out"
+out="$(MANIFEST="$TEST_ROOT/mixed.tsv" manifest_all_rows)" \
+  || fail "同模块已发布行+未发布声明行被错误拒绝: $out"
+[ "$(MANIFEST="$TEST_ROOT/mixed.tsv" manifest_arches mixed | tr '\n' ' ')" = 'aarch64 x86_64 ' ] \
+  || fail '混合行未能驱动 manifest_arches'
+pass '同模块混合未发布声明行与已发布真实行被接受（用于扩展第二架构）'
+
+# 已发布行之间 version 仍必须一致
+{
+  printf 'mixedbad2\tthird-party\tdbhost\tno\t1.0.0\tmixedbad2-1.0.0-aarch64.tar.gz\t%s\tsrc1\taarch64\n' "$SHA_A"
+  printf 'mixedbad2\tthird-party\tdbhost\tno\t2.0.0\tmixedbad2-2.0.0-x86_64.tar.gz\t%s\tsrc1\tx86_64\n' "$SHA_B"
+} >"$TEST_ROOT/mixed-version-skew.tsv"
+if out="$(MANIFEST="$TEST_ROOT/mixed-version-skew.tsv" manifest_all_rows 2>&1)"; then
+  fail "两条已发布行 version 不一致未被拒绝: $out"
 fi
-pass '同模块混合未发布声明行与已发布真实行 fail closed（version 不一致校验天然覆盖）'
+pass '同模块多条已发布行 version 不一致仍 fail closed'
 
 # ---- manifest_all_rows：同模块不能混用 noarch 与具体架构（评审 Important 3）----
 # noarch 语义是"这个模块的产物不含机器码，任何架构都能用同一份"；一旦同一个模块

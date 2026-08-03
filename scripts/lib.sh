@@ -306,10 +306,12 @@ manifest_modules() { # manifest_modules [target 过滤]
 }
 
 manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行；发布器与需要全部架构时用它
-  # 未发布声明行（新模块首发登记，见 publish.sh register-module）：version/artifact/
-  # sha256/source_sha 必须同时为 "-"，跳过 artifact 后缀校验；不允许半发布状态
-  # （比如 version="-" 但 artifact 已经是真实文件名）。同模块混合声明行与已发布真实
-  # 行由下面既有的"同模块 version 必须一致"校验天然拒绝，不需要专门再写一遍。
+  # 未发布声明行（register-module / register-arch）：version/artifact/sha256/source_sha
+  # 必须同时为 "-"，跳过 artifact 后缀校验；不允许半发布状态。
+  # 允许同一模块同时存在已发布真实行与未发布声明行（给已发布模块补新架构），但：
+  #   - 所有已发布行的 version/source_sha 必须彼此一致；
+  #   - kind/target/service 在该模块全部行上必须一致；
+  #   - 仍禁止 noarch 与具体架构混用。
   awk -F'\t' '
     /^[[:space:]]*(#|$)/ { next }
     {
@@ -317,7 +319,8 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
         printf "manifest 第 %d 行必须恰好九列（实际 %d 列）\n", FNR, NF > "/dev/stderr"
         exit 1
       }
-      module = $1; version = $5; artifact = $6; sha256 = $7; source_sha = $8; arch = $9
+      module = $1; kind = $2; target = $3; service = $4
+      version = $5; artifact = $6; sha256 = $7; source_sha = $8; arch = $9
       if (arch != "aarch64" && arch != "x86_64" && arch != "noarch") {
         printf "manifest 第 %d 行架构非法（只允许 aarch64/x86_64/noarch）: %s\n", \
           FNR, arch > "/dev/stderr"
@@ -365,24 +368,39 @@ manifest_all_rows() { # manifest_all_rows → 严格九列的全部非注释行�
         }
         seen_specific_arch[module] = 1
       }
-      if (module in seen_version) {
-        if (seen_version[module] != version) {
-          printf "manifest 第 %d 行的 version 与模块 %s 之前的行不一致\n", \
-            FNR, module > "/dev/stderr"
-          exit 1
-        }
-        if (seen_source[module] != source_sha) {
-          printf "manifest 第 %d 行的 source_sha 与模块 %s 之前的行不一致\n", \
+      if (module in seen_kind) {
+        if (seen_kind[module] != kind || seen_target[module] != target || seen_service[module] != service) {
+          printf "manifest 第 %d 行的 kind/target/service 与模块 %s 之前的行不一致\n", \
             FNR, module > "/dev/stderr"
           exit 1
         }
       } else {
-        seen_version[module] = version
-        seen_source[module] = source_sha
+        seen_kind[module] = kind
+        seen_target[module] = target
+        seen_service[module] = service
+      }
+      # 已发布行之间 version/source_sha 必须一致；未发布声明行（全 "-"）不参与该比对，
+      # 以便 register-arch 给已发布模块补新架构后，下一次矩阵发布原子替换声明行。
+      if (version != "-") {
+        if (module in seen_published_version) {
+          if (seen_published_version[module] != version) {
+            printf "manifest 第 %d 行的 version 与模块 %s 之前的已发布行不一致\n", \
+              FNR, module > "/dev/stderr"
+            exit 1
+          }
+          if (seen_published_source[module] != source_sha) {
+            printf "manifest 第 %d 行的 source_sha 与模块 %s 之前的已发布行不一致\n", \
+              FNR, module > "/dev/stderr"
+            exit 1
+          }
+        } else {
+          seen_published_version[module] = version
+          seen_published_source[module] = source_sha
+        }
       }
       print
     }
-  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构或整行为未发布声明、(module, arch) 唯一、同模块 version/source_sha 一致、同模块不得混用 noarch 与具体架构）: $MANIFEST"
+  ' "$MANIFEST" || die "manifest 校验失败（恰好九列、架构合法、artifact 后缀匹配架构或整行为未发布声明、(module, arch) 唯一、同模块已发布行 version/source_sha 一致、kind/target/service 一致、同模块不得混用 noarch 与具体架构）: $MANIFEST"
 }
 
 manifest_selected_rows() { # manifest_selected_rows [target] [arch]；每个逻辑模块至多一行；[arch] 省略时用 host_arch

@@ -1468,6 +1468,18 @@ start_and_verify() {
   fi
 }
 
+agent_preflight_artifact_only() { # <tarball> <version>
+  # 只做本机架构产物门禁：下载后的 archive 成员、解包 ELF/ldd/version/provenance。
+  # 不写 /opt、/etc，不停 systemd，不碰数据库。
+  local package="$1" version="$2" stage
+  validate_archive_members "$package"
+  stage="$WORK_DIR/preflight-runtime"
+  mkdir -p "$stage"
+  tar --no-same-owner -xzf "$package" -C "$stage"
+  validate_runtime_tree "$stage" "$version"
+  log "DBDOG_AGENT_PREFLIGHT_ONLY=1：artifact 门禁通过（version=$version arch=$AGENT_HOST_ARCH）；未改配置、未停服务"
+}
+
 main() {
   case "${1:-}" in
     "") ;;
@@ -1488,6 +1500,11 @@ main() {
   [ "$version" != - ] || die "dbdog-agent 尚未发布"
   log "dbdog-agent 目标版本: $version"
   package="$(download_artifact "$artifact" "$sha256")"
+  if [ "${DBDOG_AGENT_PREFLIGHT_ONLY:-}" = "1" ]; then
+    agent_preflight_artifact_only "$package" "$version"
+    INSTALL_SUCCEEDED=1
+    return 0
+  fi
   validate_archive_members "$package"
   prepare_runtime "$package" "$version" "$sha256"
 

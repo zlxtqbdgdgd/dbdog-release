@@ -1436,4 +1436,63 @@ write_gate_hook "$CASE12/release" pre-push "$allow_push12"
 ) || exit 1
 pass "裸跑（不点名模块）push 失败后再次裸跑重试：正确补推同一提交，零重建矩阵、零重复上传，origin 不再静默落后"
 
-printf 'ALL PASS: 44 publish architecture transaction contract tests\n'
+# ===========================================================================
+# 场景 13：register-arch 给已发布模块补未发布架构声明行；SKIP_PUSH 只本地 commit。
+# ===========================================================================
+CASE13="$TEST_ROOT/case13"
+mkdir -p "$CASE13"
+manifest_fixture13="$CASE13/manifest.fixture.tsv"
+PUBLISHED_SHA13="$(printf 'f%.0s' $(seq 1 64))"
+{
+  printf '# test\n'
+  printf 'expandme\tfirst-party\tdbhost\tno\t1.0.0\texpandme-1.0.0-aarch64.tar.gz\t%s\tabc1234\taarch64\n' \
+    "$PUBLISHED_SHA13"
+} >"$manifest_fixture13"
+setup_release_repo "$CASE13/release" "$CASE13/release-bare.git" "$manifest_fixture13"
+
+(
+  DBDOG_HOME="$CASE13/home"
+  RELEASE_DIR="$CASE13/release"
+  SRC_ROOT="$CASE13/src"
+  MANIFEST="$RELEASE_DIR/manifest.tsv"
+  export DBDOG_HOME RELEASE_DIR SRC_ROOT MANIFEST
+  # shellcheck source=publish/publish.sh
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  before_arch="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  (cmd_register_arch expandme --arch x86_64) >"$CASE13/register-arch.log" 2>&1 \
+    || { sed -n '1,80p' "$CASE13/register-arch.log" >&2; fail "register-arch 给已发布模块补 x86_64 失败"; }
+  [ "$(manifest_get expandme 5 aarch64)" = '1.0.0' ] \
+    || fail "register-arch 不应改动已发布 aarch64 行的 version"
+  [ "$(manifest_get expandme 5 x86_64)" = '-' ] \
+    || fail "register-arch 应为 x86_64 写入未发布声明行"
+  [ "$(manifest_module_field expandme 5)" = '1.0.0' ] \
+    || fail "manifest_module_field 在混合行下应优先返回已发布 version"
+  [ "$(manifest_arches expandme | tr '\n' ' ')" = 'aarch64 x86_64 ' ] \
+    || fail "register-arch 后 manifest_arches 应包含两个架构"
+  [ "$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD)" = 'register-arch: expandme (+x86_64) unpublished' ] \
+    || fail "register-arch commit message 不符合约定"
+  after_arch="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$after_arch" != "$before_arch" ] || fail "register-arch 应产生新 commit"
+  [ "$(git -C "$CASE13/release-bare.git" rev-parse refs/heads/main)" = "$after_arch" ] \
+    || fail "register-arch 默认应 push 到 origin"
+  pass "register-arch 给已发布模块追加未发布架构声明行并 push"
+
+  if (cmd_register_arch expandme --arch x86_64) >"$CASE13/register-arch-dup.log" 2>&1; then
+    fail "重复 register-arch 同一架构本应拒绝"
+  fi
+  pass "register-arch 拒绝重复登记同一架构"
+
+  before_skip_origin="$(git -C "$CASE13/release-bare.git" rev-parse refs/heads/main)"
+  (DBDOG_PUBLISH_SKIP_PUSH=1 cmd_register_module other first-party dbhost no --arch aarch64 --arch x86_64) \
+    >"$CASE13/skip-push.log" 2>&1 \
+    || { sed -n '1,80p' "$CASE13/skip-push.log" >&2; fail "DBDOG_PUBLISH_SKIP_PUSH=1 的 register-module 失败"; }
+  grep -Fq '跳过 git push' "$CASE13/skip-push.log" \
+    || { sed -n '1,40p' "$CASE13/skip-push.log" >&2; fail "SKIP_PUSH 没有留下跳过 push 的日志"; }
+  [ "$(git -C "$CASE13/release-bare.git" rev-parse refs/heads/main)" = "$before_skip_origin" ] \
+    || fail "SKIP_PUSH 后 origin 不应前进"
+  pass "DBDOG_PUBLISH_SKIP_PUSH=1 时 register-module 只本地 commit 不 push"
+) || exit 1
+pass "register-arch 扩展已发布模块架构矩阵 + SKIP_PUSH 本地登记"
+
+printf 'ALL PASS: 47 publish architecture transaction contract tests\n'

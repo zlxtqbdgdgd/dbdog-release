@@ -135,6 +135,26 @@ grep -Fq '不支持的主机架构: riscv64' "$RISCV64_OUT" || \
   fail "riscv64 没有给出清晰的 fail-closed 诊断信息"
 pass "manifest 双架构行按 DBDOG_HOST_ARCH_OVERRIDE/host_arch 精确选包下载，未知架构在下载前 fail closed"
 
+# ---- DBDOG_AGENT_PREFLIGHT_ONLY：只跑 artifact 门禁，必须在 cutover/配置之前返回 ----
+MAIN_BODY="$(awk '/^main\(\)/ { scan=1 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq 'DBDOG_AGENT_PREFLIGHT_ONLY' <<<"$MAIN_BODY" || \
+  fail "main() 没有识别 DBDOG_AGENT_PREFLIGHT_ONLY"
+grep -Fq 'agent_preflight_artifact_only' <<<"$MAIN_BODY" || \
+  fail "main() 没有调用 agent_preflight_artifact_only"
+PREFLIGHT_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'agent_preflight_artifact_only' | head -1 | cut -d: -f1)"
+CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^[[:space:]]*cutover$' | head -1 | cut -d: -f1)"
+[ -n "$PREFLIGHT_LINE" ] && [ -n "$CUTOVER_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$CUTOVER_LINE" ] || \
+  fail "PREFLIGHT_ONLY 路径没有排在 cutover 之前"
+PREFLIGHT_FN="$(awk '/^agent_preflight_artifact_only\(\)/ { scan=1 } /^main\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq 'validate_archive_members' <<<"$PREFLIGHT_FN" || \
+  fail "preflight 没有校验 archive 成员"
+grep -Fq 'validate_runtime_tree' <<<"$PREFLIGHT_FN" || \
+  fail "preflight 没有校验 runtime/provenance/ELF/version"
+if grep -Eq 'cutover|resolve_inputs|render_install_state|bootstrap_gaussdb|start_and_verify' <<<"$PREFLIGHT_FN"; then
+  fail "preflight 函数错误地包含了会改配置/停服务的步骤"
+fi
+pass "DBDOG_AGENT_PREFLIGHT_ONLY 只做 artifact 门禁，且排在 cutover 之前"
+
 PROC="$TEST_ROOT/proc"
 PID=4242
 DATA="$TEST_ROOT/gauss/data"
