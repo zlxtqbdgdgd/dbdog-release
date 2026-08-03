@@ -6,3 +6,6 @@ scripts/publish/publish.conf
 # cmd_register_module 的 mktemp 临时文件（manifest.tsv.matrix.*、.migrate.*、
 # .register.*）；正常情况下会被各自的 mv 消费掉，只在中断时残留。
 manifest.tsv.*
+
+# local Claude/Codex worktrees
+.claude/worktrees
