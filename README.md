@@ -21,6 +21,8 @@ dbdog 的二进制发布仓：公网构建产物经此分发到只读 GitHub 的
 | node | third-party | 全家桶机 | 20.18.1 | node-20.18.1-aarch64.tar.gz | aarch64 |
 | goose | third-party | 全家桶机 | 3.27.3 | goose-3.27.3-aarch64.tar.gz | aarch64 |
 | dbdog-agent | first-party | DB 主机 | - | - | x86_64 |
+| ddprof | third-party | DB 主机 | - | - | aarch64 |
+| ddprof | third-party | DB 主机 | - | - | x86_64 |
 <!-- VERSION-TABLE:END -->
 
 ## 当前可用范围
