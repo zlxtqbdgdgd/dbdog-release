@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dbdog-release 多架构发布改造现状</title>
+  <style>
+    :root {
+      --ink: #1a1f24;
+      --muted: #5c6770;
+      --line: #d7dde3;
+      --paper: #f7f5f1;
+      --card: #ffffff;
+      --accent: #0b6e4f;
+      --accent-soft: #dcefe7;
+      --warn: #8a5a00;
+      --warn-soft: #fff1d6;
+      --danger: #9b2c2c;
+      --danger-soft: #fde8e8;
+      --code: #243447;
+      --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+      --sans: "Source Sans 3", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", sans-serif;
+      --serif: "Source Serif 4", "Noto Serif SC", "Songti SC", Georgia, serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #e7efe9 0%, transparent 55%),
+        linear-gradient(180deg, #fbfaf7 0%, var(--paper) 40%, #f3f0ea 100%);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+
+    .wrap {
+      width: min(980px, calc(100% - 2.5rem));
+      margin: 0 auto;
+      padding: 2.5rem 0 4rem;
+    }
+
+    header.hero {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 1.75rem;
+      margin-bottom: 2rem;
+    }
+
+    .eyebrow {
+      font-size: 0.78rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      font-weight: 700;
+      margin: 0 0 0.6rem;
+    }
+
+    h1 {
+      font-family: var(--serif);
+      font-weight: 650;
+      font-size: clamp(1.8rem, 3.5vw, 2.45rem);
+      line-height: 1.15;
+      margin: 0 0 0.75rem;
+      letter-spacing: -0.02em;
+    }
+
+    .lede {
+      margin: 0;
+      max-width: 46rem;
+      color: var(--muted);
+      font-size: 1.05rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem 1rem;
+      margin-top: 1.25rem;
+      font-size: 0.92rem;
+      color: var(--muted);
+    }
+
+    .meta code {
+      font-family: var(--mono);
+      font-size: 0.84em;
+      background: #ece8e1;
+      padding: 0.12rem 0.4rem;
+      border-radius: 4px;
+      color: var(--code);
+    }
+
+    nav.toc {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.65rem;
+      margin: 1.75rem 0 2.25rem;
+    }
+
+    nav.toc a {
+      text-decoration: none;
+      color: var(--ink);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.85rem 0.95rem;
+      transition: border-color 160ms ease, transform 160ms ease;
+    }
+
+    nav.toc a:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    nav.toc strong {
+      display: block;
+      font-size: 0.95rem;
+      margin-bottom: 0.2rem;
+    }
+
+    nav.toc span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.4rem 1.5rem 1.55rem;
+      margin-bottom: 1.1rem;
+      box-shadow: 0 1px 0 rgba(26, 31, 36, 0.03);
+    }
+
+    section h2 {
+      font-family: var(--serif);
+      font-size: 1.35rem;
+      margin: 0 0 0.85rem;
+      letter-spacing: -0.015em;
+    }
+
+    section h3 {
+      font-size: 1.02rem;
+      margin: 1.2rem 0 0.45rem;
+    }
+
+    p, li { color: #2a323a; }
+    p { margin: 0.45rem 0; }
+    ul, ol { margin: 0.4rem 0 0.2rem; padding-left: 1.25rem; }
+    li { margin: 0.28rem 0; }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0.75rem 0 0.25rem;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      border-radius: 999px;
+      padding: 0.22rem 0.7rem;
+      font-size: 0.8rem;
+      font-weight: 650;
+      border: 1px solid transparent;
+    }
+
+    .pill.ok { background: var(--accent-soft); color: var(--accent); }
+    .pill.warn { background: var(--warn-soft); color: var(--warn); }
+    .pill.todo { background: var(--danger-soft); color: var(--danger); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.8rem 0 0.2rem;
+      font-size: 0.92rem;
+    }
+
+    th, td {
+      border-top: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      padding: 0.65rem 0.55rem;
+    }
+
+    th {
+      font-size: 0.78rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 700;
+      border-top: none;
+    }
+
+    pre, code { font-family: var(--mono); }
+    pre {
+      background: #17212b;
+      color: #e8eef5;
+      border-radius: 10px;
+      padding: 0.95rem 1rem;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      line-height: 1.45;
+      margin: 0.7rem 0 0.2rem;
+    }
+
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: #f3faf6;
+      padding: 0.75rem 0.95rem;
+      border-radius: 0 8px 8px 0;
+      margin: 0.85rem 0 0.2rem;
+      color: #234;
+      font-size: 0.95rem;
+    }
+
+    .callout.warn {
+      border-left-color: #c4871a;
+      background: #fff8ea;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.85rem;
+      margin-top: 0.7rem;
+    }
+
+    .mini {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.85rem 0.95rem;
+      background: #fbfaf8;
+    }
+
+    .mini h3 { margin-top: 0; }
+
+    footer {
+      margin-top: 1.5rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    @media (max-width: 820px) {
+      nav.toc { grid-template-columns: 1fr 1fr; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .wrap { width: min(980px, calc(100% - 1.5rem)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <p class="eyebrow">dbdog-release · status report</p>
+      <h1>多架构发布改造：改前、目标、已做、剩余</h1>
+      <p class="lede">
+        围绕「数据库主机一键部署」三条实施计划中的第一条——多架构发布基础——
+        说明 <code>origin/main</code> 上的旧状态、我们要改什么、本地分支已经改了什么，以及还没完成的部分。
+      </p>
+      <div class="meta">
+        <span>分支 <code>worktree-multi-arch-release-foundation</code></span>
+        <span>tip <code>cf1ba6c</code></span>
+        <span>对照基线 <code>origin/main</code> = <code>d804ed3</code></span>
+        <span>日期 2026-08-03</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="目录">
+      <a href="#before"><strong>01 改之前</strong><span>八列 manifest，只有 aarch64</span></a>
+      <a href="#goal"><strong>02 要改什么</strong><span>三阶段交付里的 Plan 1</span></a>
+      <a href="#done"><strong>03 已改什么</strong><span>本地分支代码与声明行</span></a>
+      <a href="#left"><strong>04 还剩什么</strong><span>发布、冒烟、后两阶段</span></a>
+    </nav>
+
+    <section id="before">
+      <h2 id="1-改之前是什么样">1. 改之前是什么样</h2>
+      <div class="pill-row">
+        <span class="pill todo">远端 main 仍是旧状态</span>
+        <span class="pill warn">本地曾做后被 reset 丢掉过</span>
+      </div>
+      <p>
+        改造前的权威状态就是现在的 <code>origin/main</code>（<code>d804ed3</code>，
+        <code>publish: dbdog-web@0.1.12</code>）。特征如下：
+      </p>
+      <ul>
+        <li><strong>manifest 八列</strong>：<code>module / kind / target / service / version / artifact / sha256 / source_sha</code>，没有架构列。</li>
+        <li><strong>事实上一架构</strong>：Agent 与大多数模块只发 <code>aarch64</code>；安装侧也按 AArch64 假设工作。</li>
+        <li><strong>没有 ddprof 模块</strong>：原生 Continuous Profiling 的官方二进制尚未进入 release manifest。</li>
+        <li><strong>发布事务按模块逐架构即时上传改表</strong>：不足以保证「同模块多架构原子一次提交」。</li>
+        <li><strong>没有数据库主机一键部署的权威设计落盘</strong>：<code>docs/design/</code> 下的总设计与三份实施计划还不在 main 上。</li>
+      </ul>
+
+      <h3 id="改前-manifest-节选">改前 manifest（节选）</h3>
+<pre># 八列，无 arch
+dbdog-server   ...  0.1.10   dbdog-server-0.1.10-aarch64.tar.gz   ...
+dbdog-web      ...  0.1.12   dbdog-web-0.1.12-aarch64.tar.gz      ...
+dbdog-mcp      ...  0.1.8    dbdog-mcp-0.1.8-noarch.tar.gz        ...
+dbdog-agent    ...  7.81.0-dbdog.4  dbdog-agent-...-aarch64.tar.gz ...
+# 无 ddprof 行
+# 无 dbdog-agent x86_64 行</pre>
+
+      <div class="callout warn">
+        上一轮 agent 曾在本地做到 tip <code>d43d7ef</code>，随后本地 main 被
+        <code>Reset to origin/main</code>，远端从未收到这批改动。本次是在 worktree
+        从该 tip 恢复后继续推进。
+      </div>
+    </section>
+
+    <section id="goal">
+      <h2 id="2-我们要改的是什么">2. 我们要改的是什么</h2>
+      <p>
+        总设计把「数据库主机一键部署 + 原生 profiling」拆成三个连续计划，避免一次改发布格式、数据库接入和生命周期：
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>阶段</th>
+            <th>计划文档</th>
+            <th>目标</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Plan 1</td>
+            <td><code>2026-08-02-multi-architecture-release-foundation.md</code></td>
+            <td>manifest v2、多架构发布事务、ddprof、Agent x86_64、目标机按 arch 选包</td>
+            <td>代码基本完成，正式发布未做</td>
+          </tr>
+          <tr>
+            <td>Plan 2</td>
+            <td><code>2026-08-02-database-host-dbm-deployment.md</code></td>
+            <td>三引擎发现、DBM 安装事务；不改数据库启动链</td>
+            <td>仅有计划</td>
+          </tr>
+          <tr>
+            <td>Plan 3</td>
+            <td><code>2026-08-02-native-profiling-lifecycle.md</code></td>
+            <td>launcher / CM / systemd 生命周期与 profiling 事务</td>
+            <td>仅有计划</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 id="plan-1-的合同-要改成的形态">Plan 1 的合同（要改成的形态）</h3>
+      <ul>
+        <li>manifest 九列，主键 <code>(module, arch)</code>；取值只允许 <code>aarch64 / x86_64 / noarch</code>。</li>
+        <li>目标机精确选本机架构；只有显式 <code>noarch</code> 才回退。</li>
+        <li>同一模块全部目标架构构建、校验、上传完成后，才一次更新 manifest/README 并提交。</li>
+        <li>官方 ddprof v0.26.0 双架构进入 release，不重新编译。</li>
+        <li>Agent aarch64/x86_64 同源码锚、同版本，经原生 builder 出货。</li>
+        <li>提供只读 artifact 冒烟：<code>DBDOG_AGENT_PREFLIGHT_ONLY=1</code>。</li>
+      </ul>
+    </section>
+
+    <section id="done">
+      <h2 id="3-已经改了什么">3. 已经改了什么</h2>
+      <div class="pill-row">
+        <span class="pill ok">仅在本地分支</span>
+        <span class="pill ok">合同测试通过</span>
+        <span class="pill warn">未 push 到 origin</span>
+      </div>
+      <p>
+        相对 <code>origin/main</code>，本地分支约 <strong>+7500 / -170</strong> 行（30 个文件）。
+        可分成「上一轮已落地的 Plan 1 主体」和「本轮补齐的缺口」两层。
+      </p>
+
+      <div class="grid-2">
+        <div class="mini">
+          <h3 id="上一轮已落地-tasks-1-6">上一轮已落地（Tasks 1–6）</h3>
+          <ul>
+            <li>manifest v2 迁移与严格校验（<code>lib.sh</code>）</li>
+            <li>安装 / 升级 / 诊断 / fingerprint 按主机 arch 选包</li>
+            <li>多架构发布事务与中断恢复</li>
+            <li><code>register-module</code> 新模块未发布声明行</li>
+            <li>官方 ddprof recipe（v0.26.0 固定 digest）</li>
+            <li>Agent x86_64 canonical build 配方与门禁</li>
+            <li>三份实施计划 + 总设计文档落盘</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <h3 id="本轮补齐-cf1ba6c-及登记提交">本轮补齐（cf1ba6c 及登记提交）</h3>
+          <ul>
+            <li><code>register-arch</code>：给已发布模块补架构</li>
+            <li>允许「已发布行 + 未发布声明行」混排</li>
+            <li>Agent 基线接受 <code>dbdog_revision_current</code></li>
+            <li><code>DBDOG_AGENT_PREFLIGHT_ONLY</code> 只做产物门禁</li>
+            <li><code>DBDOG_PUBLISH_SKIP_PUSH=1</code> 支持本地登记</li>
+            <li>已本地登记 Agent x86_64、ddprof 双架构声明行</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3 id="当前本地-manifest-agent-ddprof">当前本地 manifest（Agent / ddprof）</h3>
+<pre>dbdog-agent  ...  7.81.0-dbdog.4  ...-aarch64.tar.gz  ...  aarch64   ← 已发布
+dbdog-agent  ...  -               -                   ...  x86_64    ← 未发布声明
+ddprof       ...  -               -                   ...  aarch64   ← 未发布声明
+ddprof       ...  -               -                   ...  x86_64    ← 未发布声明</pre>
+
+      <h3 id="本轮相关提交">本轮相关提交</h3>
+      <table>
+        <thead>
+          <tr><th>Commit</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>c3cb8f7</code></td><td>忽略本地 <code>.claude/worktrees</code></td></tr>
+          <tr><td><code>f120f17</code></td><td><code>register-arch: dbdog-agent (+x86_64) unpublished</code></td></tr>
+          <tr><td><code>48bbf6b</code></td><td><code>register: ddprof (aarch64,x86_64) unpublished</code></td></tr>
+          <tr><td><code>cf1ba6c</code></td><td>补齐 register-arch / preflight / 基线合约与测试</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        合同测试现状：manifest architecture、publish architecture transaction（47）、
+        agent version、ddprof/x86_64 artifact、preflight 静态断言均通过。
+        <code>test-agent-install-contracts.sh</code> 仍有一个已知基线失败（密码复杂度用例）。
+      </div>
+    </section>
+
+    <section id="left">
+      <h2 id="4-还剩什么">4. 还剩什么</h2>
+      <div class="pill-row">
+        <span class="pill todo">Plan 1 Completion Gate 未过</span>
+        <span class="pill todo">Plan 2 / 3 未开工</span>
+      </div>
+
+      <h3 id="a-环境与权限-堵住正式发布">A. 环境与权限（堵住正式发布）</h3>
+      <ul>
+        <li>builder SSH：<code>dbdog-build</code> / <code>dbdog-build-x86</code> 当前连接被对端关闭。</li>
+        <li>远端写权限：当前账号对 <code>zlxtqbdgdgd/dbdog-release</code> push 被拒。</li>
+        <li>本地 Agent 仓缺少官方 tag <code>7.81.0</code> 时，<code>publish.sh plan</code> 会在基线校验处失败（与本次代码改动无关，是源仓标签完整性问题）。</li>
+      </ul>
+
+      <h3 id="b-plan-1-尚未执行的操作-task-7">B. Plan 1 尚未执行的操作（Task 7）</h3>
+      <ol>
+        <li>把本分支合入 / 推到可作为发布基线的 <code>main</code>。</li>
+        <li><code>publish.sh publish ddprof --yes</code> —— 双架构真实上传并替换声明行。</li>
+        <li><code>publish.sh publish dbdog-agent --bump patch --yes</code> —— 同版本 aarch64/x86_64 原子发布。</li>
+        <li>在 aarch64 / x86_64 测试机跑：
+          <code>sudo DBDOG_AGENT_PREFLIGHT_ONLY=1 ./scripts/upgrade.sh dbdog-agent</code></li>
+        <li>刷新 <code>agent-history</code>，跑全量合同测试 + <code>prune</code> 闭环。</li>
+      </ol>
+
+      <h3 id="c-后续计划-plan-1-完成后再做">C. 后续计划（Plan 1 完成后再做）</h3>
+      <ul>
+        <li><strong>Plan 2</strong>：数据库主机 DBM 一键部署（发现 / 选择 / managed-files / 三引擎适配）。</li>
+        <li><strong>Plan 3</strong>：原生 profiling 生命周期（launcher、CM contract、systemd / gs_ctl）。</li>
+      </ul>
+
+      <h3 id="一句话结论">一句话结论</h3>
+      <p>
+        <strong>发布系统与合同层的代码改造已在本地分支完成，并写好了 Agent x86_64 / ddprof 的未发布声明行；
+        还没做的是真正把产物构建上传进桶、把提交推上 <code>origin/main</code>，以及后两阶段的安装器与 profiling 生命周期实现。</strong>
+      </p>
+    </section>
+
+    <footer>
+      生成自本地 worktree
+      <code>dbdog-release/.claude/worktrees/multi-arch-release-foundation</code>。
+      本文不替代三份实施计划原文；细节以
+      <code>docs/design/archive/2026-08-02-*.md</code> 为准。
+    </footer>
+  </div>
+</body>
+</html>
