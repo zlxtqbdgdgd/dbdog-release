@@ -44,6 +44,7 @@ write_baseline() {
     printf 'release_prefix_key\tagent_official_version\n'
     printf 'dbdog_version_template\t${agent_official_version}-dbdog.${revision}\n'
     printf 'dbdog_revision_initial\t1\n'
+    printf 'dbdog_revision_current\t1\n'
     printf 'dbdog_revision_reset_on_official_baseline_change\ttrue\n'
     printf 'release_build_must_use_explicit_source_commits\ttrue\n'
     printf 'release_json_current_milestone_is_prefix_authority\tfalse\n'

@@ -5,6 +5,16 @@
 #                                        # 默认发布所有有变更的一方模块；三方件需点名
 #   publish.sh regen-readme              # 按 manifest 重新生成 README 版本表
 #   publish.sh prune [--yes]             # 只保留 manifest 当前引用（默认试运行）
+#   publish.sh migrate-manifest-v2 --write
+#                                        # 一次性迁移：manifest.tsv 八列旧格式 → 九列（含 arch）
+#   publish.sh register-module <模块> <first-party|third-party> <stack|dbhost> <yes|no> \
+#     --arch <架构> [--arch <架构>]...    # 全新模块首发登记：原子写入未发布声明行
+#                                        # （每架构一行，version/artifact/sha256/source_sha 全为 -），
+#                                        # 之后照常 publish.sh publish <模块> --yes 完成首次真实发布
+#   publish.sh register-arch <模块> --arch <架构> [--arch <架构>]...
+#                                        # 给已登记模块补未发布架构声明行（kind/target/service
+#                                        # 从现有行复制）；用于已发布模块扩展第二架构。
+#                                        # DBDOG_PUBLISH_SKIP_PUSH=1 时只本地 commit，不 push。
 #
 # 依赖：ssh 可达构建机、gh 已登录（gh auth status）、各源仓与本仓是同级目录。
 # 产物在构建机上完成架构/摘要校验并直传 GitHub；本机不再中转大文件。
@@ -17,11 +27,40 @@ BUCKET_TAG="artifacts"
 SCRATCH="$RELEASE_DIR/scratch"
 
 CONF="$HERE/publish.conf"
-[ -f "$CONF" ] && source "$CONF"
+# 合同测试会在 source 本文件前预设 SRC_ROOT/BUILD_HOST_* 等；publish.conf 不得覆盖它们。
+_preset_src_root="${SRC_ROOT-}"
+_preset_repo_root="${REPO_ROOT-}"
+_preset_build_work="${BUILD_WORK-}"
+_preset_tool_path="${TOOL_PATH-}"
+_preset_build_host="${BUILD_HOST-}"
+_preset_build_host_aarch64="${BUILD_HOST_AARCH64-}"
+_preset_build_host_x86_64="${BUILD_HOST_X86_64-}"
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$CONF"
+fi
+[ -n "${_preset_src_root}" ] && SRC_ROOT="$_preset_src_root"
+[ -n "${_preset_repo_root}" ] && REPO_ROOT="$_preset_repo_root"
+[ -n "${_preset_build_work}" ] && BUILD_WORK="$_preset_build_work"
+[ -n "${_preset_tool_path}" ] && TOOL_PATH="$_preset_tool_path"
+[ -n "${_preset_build_host}" ] && BUILD_HOST="$_preset_build_host"
+[ -n "${_preset_build_host_aarch64}" ] && BUILD_HOST_AARCH64="$_preset_build_host_aarch64"
+[ -n "${_preset_build_host_x86_64}" ] && BUILD_HOST_X86_64="$_preset_build_host_x86_64"
+unset _preset_src_root _preset_repo_root _preset_build_work _preset_tool_path \
+  _preset_build_host _preset_build_host_aarch64 _preset_build_host_x86_64
 SRC_ROOT="${SRC_ROOT:-$(cd "$RELEASE_DIR/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-/home/z1/dbdog/repo}"
 BUILD_WORK="${BUILD_WORK:-/home/z1/dbdog-release-build}"
 TOOL_PATH="${TOOL_PATH:-}"
+
+# 未真正配置构建执行器时 publish.conf.example 里留下的占位值；BUILD_HOST 与
+# BUILD_HOST_X86_64 都可能是它，任何一处出现都必须 fail closed，不能当成真机。
+BUILD_HOST_PLACEHOLDER="z1@CHANGE-ME"
+
+# 事务目录固定在这里（gitignored），mode 0700。build_one_arch 追加构建行；
+# publish_commit_arch_matrix 消费后清理。跨进程重启仍可在这里找到未完成的事务
+# （见 publish_txn_dir / publish_txn_init）。
+PUBLISH_TXN_ROOT="$RELEASE_DIR/scratch/publish-txn"
 
 # 大产物上传容易跨过 gh 默认的短 HTTP 超时。调用者仍可显式覆盖，但不接受
 # gh 无法解释的值，避免发布跑到上传阶段才以模糊错误退出。
@@ -89,10 +128,11 @@ load_agent_release_baseline() {
         allowed["release_prefix_key"] = 1
         allowed["dbdog_version_template"] = 1
         allowed["dbdog_revision_initial"] = 1
+        allowed["dbdog_revision_current"] = 1
         allowed["dbdog_revision_reset_on_official_baseline_change"] = 1
         allowed["release_build_must_use_explicit_source_commits"] = 1
         allowed["release_json_current_milestone_is_prefix_authority"] = 1
-        expected = 20
+        expected = 21
       }
       {
         if (NF != 2 || $1 == "" || $2 == "" || !($1 in allowed) || seen[$1]++) bad = 1
@@ -154,6 +194,12 @@ load_agent_release_baseline() {
     || die "Agent dbdog 版本模板不符合发布政策"
   [ "$(agent_baseline_value dbdog_revision_initial)" = "1" ] \
     || die "Agent 本地打包修订必须从 1 开始"
+  local revision_current
+  revision_current="$(agent_baseline_value dbdog_revision_current)"
+  [[ "$revision_current" =~ ^[1-9][0-9]*$ ]] \
+    || die "Agent dbdog_revision_current 必须是正整数: $revision_current"
+  [ "$revision_current" -ge 1 ] \
+    || die "Agent dbdog_revision_current 不能小于 dbdog_revision_initial"
   [ "$(agent_baseline_value dbdog_revision_reset_on_official_baseline_change)" = "true" ] \
     || die "Agent 官方基线变化时必须重置本地打包修订"
   [ "$(agent_baseline_value release_build_must_use_explicit_source_commits)" = "true" ] \
@@ -253,7 +299,7 @@ source_checkout_matches_origin() { # <repo>
 
 refresh_first_party_origins() {
   local m kind
-  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || continue
     fetch_source_origin "$m"
@@ -267,7 +313,7 @@ refresh_first_party_origins() {
 
 assert_first_party_checkouts_current() {
   local m kind stale=0
-  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h _recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || continue
     if ! source_checkout_matches_origin "$m"; then
@@ -284,7 +330,7 @@ assert_first_party_checkouts_current() {
 }
 
 changed_first_party() {
-  while IFS=$'\t' read -r m kind _t _s _v _a _h recorded; do
+  while IFS=$'\t' read -r m kind _t _s _v _a _h recorded _arch; do
     [ "$kind" = "first-party" ] || continue
     [ -d "$SRC_ROOT/$m/.git" ] || { warn "源仓不存在: $SRC_ROOT/${m}，跳过 $m"; continue; }
     if [ "$m" = "dbdog-agent" ]; then
@@ -479,7 +525,7 @@ remote_artifact_metadata() { # <远端绝对路径>；设置 REMOTE_ARTIFACT_SIZ
   esac
 }
 
-verify_remote_artifact_arch() { # <远端产物> <aarch64|noarch> <module>
+verify_remote_artifact_arch() { # <远端产物> <aarch64|x86_64|noarch> <module>
   local remote_path="$1" expected="$2" module="$3"
   # 大型 Agent 包的解包和逐文件扫描可能长时间没有 stdout；主动发送 SSH
   # keepalive，避免中间网络设备把仍在运行的只读检查误判为空闲连接。
@@ -560,12 +606,6 @@ upload_release_asset_from_builder() { # <module> <远端产物> <asset> <size> <
   done
 }
 
-update_manifest_row() { # <module> <version> <artifact> <sha256> <source_sha>
-  awk -F'\t' -v OFS='\t' -v m="$1" -v v="$2" -v a="$3" -v h="$4" -v s="$5" \
-    '!/^#/ && $1==m { $5=v; $6=a; $7=h; $8=s } { print }' \
-    "$MANIFEST" >"$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
-}
-
 fetch_remote_artifact() { # <远端绝对路径> <本地文件>；校验远端 SHA，支持断点续传
   local remote_path="$1" dest="$2" remote_q metadata remote_size remote_sha
   local local_size=0 local_sha="" remote_prefix_sha=""
@@ -618,13 +658,155 @@ fetch_remote_artifact() { # <远端绝对路径> <本地文件>；校验远端 S
     || die "取回后的产物 SHA-256 与构建机不一致"
 }
 
-build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUILT_ARTIFACT/BUILT_SHA256
-  local m="$1" ver="$2" sha="" core="" kind agent_baseline_blob=""
-  local recipe="$HERE/recipes/$m.sh"
-  [ -f "$recipe" ] || die "缺少构建配方: $recipe"
-  [ -n "${BUILD_HOST:-}" ] && [ "$BUILD_HOST" != "z1@CHANGE-ME" ] \
-    || die "publish.conf 未配置 BUILD_HOST（cp publish.conf.example publish.conf）"
-  kind="$(manifest_get "$m" 2)"
+manifest_module_field() { # manifest_module_field <module> <列号>；取该模块模块级字段
+  # 只用于按模块恒定、不随架构变化的列（kind/target/service/version/source_sha）。
+  # 允许同一模块混有已发布行与未发布声明行时：version/source_sha 优先取已发布行
+  # （非 "-"）；kind/target/service 取任意一行（manifest_all_rows 已强制一致）。
+  # 不要用它读 artifact/sha256，那两列按架构各不相同。
+  local m="$1" col="$2" value
+  value="$(manifest_all_rows | awk -F'\t' -v m="$m" -v c="$col" '
+      $1 == m {
+        if (c == 5 || c == 8) {
+          if ($c != "-") { print $c; found = 1; exit }
+          if (!pending) pending = $c
+        } else {
+          print $c; found = 1; exit
+        }
+      }
+      END {
+        if (!found && pending != "") print pending
+      }
+    ')"
+  [ -n "$value" ] || { printf 'ERROR: manifest 中没有模块 %s\n' "$m" >&2; return 1; }
+  printf '%s\n' "$value"
+}
+
+publish_maybe_push_main() { # publish_maybe_push_main <失败提示>
+  local fail_msg="$1"
+  if [ "${DBDOG_PUBLISH_SKIP_PUSH:-}" = "1" ]; then
+    log "DBDOG_PUBLISH_SKIP_PUSH=1：跳过 git push origin main（本地已提交）"
+    return 0
+  fi
+  git -C "$RELEASE_DIR" push origin main || die "$fail_msg"
+}
+
+# ---- 原生 builder 解析（每个架构独立执行器；旧 BUILD_HOST 只在自证同架构时兼容回退）----
+resolve_build_host_for_arch() { # resolve_build_host_for_arch <aarch64|x86_64|noarch> → 设置 RESOLVED_BUILD_HOST
+  local arch="$1" configured="" varname="" legacy_arch=""
+  case "$arch" in
+    aarch64) configured="${BUILD_HOST_AARCH64:-}"; varname=BUILD_HOST_AARCH64 ;;
+    x86_64) configured="${BUILD_HOST_X86_64:-}"; varname=BUILD_HOST_X86_64 ;;
+    noarch)
+      # noarch 产物不含机器码，用哪台已登记的原生机构建都一样；优先复用 aarch64 的
+      # builder（历史上唯一的 BUILD_HOST 就是 aarch64 机），没配置才试 x86_64。
+      configured="${BUILD_HOST_AARCH64:-}"; varname=BUILD_HOST_AARCH64
+      if [ -z "$configured" ] || [ "$configured" = "$BUILD_HOST_PLACEHOLDER" ]; then
+        configured="${BUILD_HOST_X86_64:-}"; varname=BUILD_HOST_X86_64
+      fi
+      ;;
+    *) die "不支持为架构 $arch 解析原生 builder" ;;
+  esac
+  if [ -n "$configured" ] && [ "$configured" != "$BUILD_HOST_PLACEHOLDER" ]; then
+    RESOLVED_BUILD_HOST="$configured"
+    return 0
+  fi
+  if [ "$arch" = "noarch" ]; then
+    # noarch 不对应任何真实 CPU 架构，不需要（也没法）验证 uname -m；只要旧
+    # BUILD_HOST 存在就可以直接复用，不用 QEMU、不把未登记的 VM 当 builder。
+    [ -n "${BUILD_HOST:-}" ] && [ "$BUILD_HOST" != "$BUILD_HOST_PLACEHOLDER" ] \
+      || die "没有为 noarch 构建配置任何原生 builder（BUILD_HOST_AARCH64/BUILD_HOST_X86_64 或兼容的 BUILD_HOST），拒绝构建（cp publish.conf.example publish.conf 后按架构填写）"
+    RESOLVED_BUILD_HOST="$BUILD_HOST"
+    return 0
+  fi
+  # 兼容回退：旧的单一 BUILD_HOST，只有在它对这个架构自证是原生机时才可用；
+  # 不用 QEMU、不把未登记的 VM 当 builder，没有对应 builder 就整体 fail closed。
+  [ -n "${BUILD_HOST:-}" ] && [ "$BUILD_HOST" != "$BUILD_HOST_PLACEHOLDER" ] \
+    || die "没有为架构 $arch 配置原生 builder（${varname} 或兼容的 BUILD_HOST），拒绝构建（cp publish.conf.example publish.conf 后按架构填写）"
+  legacy_arch="$(ssh "$BUILD_HOST" uname -m | tail -n1)" \
+    || die "无法读取 BUILD_HOST（${BUILD_HOST}）架构，拒绝把它当作 $arch 的兼容 builder"
+  legacy_arch="$(normalize_arch "$legacy_arch" 2>/dev/null)" \
+    || die "BUILD_HOST（${BUILD_HOST}）架构无法规范化，拒绝把它当作 $arch 的兼容 builder"
+  [ "$legacy_arch" = "$arch" ] \
+    || die "BUILD_HOST（${BUILD_HOST}，实际架构 ${legacy_arch}）与请求架构 $arch 不一致，拒绝跨架构构建；请配置 ${varname}"
+  RESOLVED_BUILD_HOST="$BUILD_HOST"
+}
+
+publish_ensure_arch_builders() { # publish_ensure_arch_builders <module>；该模块全部目标架构必须都有可用原生 builder
+  # 逐架构预检，不产生任何构建/上传副作用（resolve_build_host_for_arch 只读配置、
+  # 最多探一次 uname -m）。任一架构缺少 builder 就在这里 die，早于对该模块任何
+  # 一个架构调用 build_one_arch——避免排在前面的架构先真的构建了一遍，才发现矩阵
+  # 因为后面某个架构没有 builder 而注定无法完整提交。
+  local m="$1" arch
+  while IFS= read -r arch; do
+    [ -n "$arch" ] || continue
+    resolve_build_host_for_arch "$arch"
+  done < <(publish_arches_for_module "$m")
+}
+
+# ---- 事务目录（gitignored scratch/publish-txn/<module>-<version>-<release-head>/，mode 0700）----
+publish_txn_dir() { # publish_txn_dir <module> <version> → 事务目录路径（不创建，不写文件）
+  local m="$1" v="$2" head
+  case "$m" in "" | */* | *$'\n'* | *$'\t'*) die "事务目录模块名非法: $m" ;; esac
+  case "$v" in */* | *$'\n'* | *$'\t'*) die "事务目录版本号非法: $v" ;; esac
+  head="$(git -C "$RELEASE_DIR" rev-parse HEAD)" \
+    || die "无法读取发布仓 HEAD，拒绝定位事务目录"
+  printf '%s/%s-%s-%s\n' "$PUBLISH_TXN_ROOT" "$m" "${v:-unversioned}" "$head"
+}
+
+publish_txn_init() { # publish_txn_init <module> <version> → 创建/复用事务目录（0700），校验 release-head 未漂移
+  local m="$1" v="$2" dir head_file head
+  dir="$(publish_txn_dir "$m" "$v")"
+  head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  head_file="$dir/release-head"
+  if [ -f "$head_file" ]; then
+    [ "$(<"$head_file")" = "$head" ] \
+      || die "[$m] 事务目录已记录不同的 release HEAD，拒绝复用: $dir"
+  else
+    printf '%s\n' "$head" >"$head_file"
+    chmod 0600 "$head_file"
+  fi
+  printf '%s\n' "$dir"
+}
+
+publish_arches_for_module() { # publish_arches_for_module <module> → 该模块 manifest 中的目标架构（一行一个）
+  manifest_arches "$1"
+}
+
+resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RESOLVED_RECIPE
+  # 存在 recipes/<module>-<arch>.sh 时精确选择该架构专属配方（目前只有
+  # dbdog-agent 拆分出 x86_64 配方，见 recipes/dbdog-agent-x86_64.sh），否则回退
+  # 到共享的 recipes/<module>.sh。其余模块的架构差异（如 ddprof）在同一份配方
+  # 内部用 ARCH 分支处理，没有拆分文件，也就没有对应的 <module>-<arch>.sh，
+  # 天然落进回退分支。
+  local m="$1" arch="$2"
+  local exact="$HERE/recipes/$m-$arch.sh"
+  if [ -f "$exact" ] && [ ! -L "$exact" ]; then
+    RESOLVED_RECIPE="$exact"
+  else
+    RESOLVED_RECIPE="$HERE/recipes/$m.sh"
+  fi
+}
+
+build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> → 向事务 TSV 追加一行，不上传、不改 manifest
+  local m="$1" ver="$2" arch="$3" sha="" core="" kind agent_baseline_blob=""
+  local recipe txn_dir txn_tsv
+  resolve_module_recipe "$m" "$arch"
+  recipe="$RESOLVED_RECIPE"
+  [ -f "$recipe" ] && [ ! -L "$recipe" ] || die "缺少构建配方: $recipe"
+  case "$arch" in
+    aarch64 | x86_64 | noarch) ;;
+    *) die "[$m] 不支持的构建架构: $arch" ;;
+  esac
+
+  txn_dir="$(publish_txn_init "$m" "$ver")"
+  txn_tsv="$txn_dir/txn.tsv"
+
+  # kind/sha/Agent 基线门禁必须在短路判断之前算出来——短路只是"跳过重新构建"，
+  # 不是"跳过校验"：Agent 的官方基线合法性（agent_version_uses_loaded_baseline）
+  # 每次调用都要重新核实，不能因为事务里已经有一行记录就假定基线没变过。
+  kind="$(manifest_get "$m" 2 "$arch")"
   if [ "$kind" = "first-party" ]; then
     if [ "$m" = "dbdog-agent" ]; then
       load_agent_release_baseline
@@ -639,80 +821,405 @@ build_one() { # <module> <version(三方件传空)> → 设置 BUILT_VERSION/BUI
     fi
   fi
 
-  local build_arch
-  build_arch="$(ssh "$BUILD_HOST" uname -m | tail -n1)" \
-    || die "[$m] 无法读取构建机架构"
-  [ "$build_arch" = "$ARCH" ] \
-    || die "[$m] 构建机架构是 $build_arch，不能发布为 $ARCH"
+  # 这次调用如果真的构建，理应记录的 source_sha——短路前用它核对事务里已经记录的
+  # 那一行是否仍然对应当前源码/当前基线；真正构建完成后也复用同一份计算结果写进
+  # 事务行，两处不用两套口径，避免分裂。
+  local live_srcsha="-"
+  if [ "$kind" = "first-party" ]; then
+    if [ "$m" = "dbdog-agent" ]; then
+      live_srcsha="$(agent_loaded_source_fingerprint)"
+    else
+      live_srcsha="$(live_sha "$m")"
+    fi
+  fi
 
-  log "[$m] 构建于 $BUILD_HOST ..."
+  if [ -f "$txn_tsv" ]; then
+    local existing_srcsha
+    existing_srcsha="$(awk -F'\t' -v m="$m" -v a="$arch" \
+      '$1==m && $2==a { print $7; exit }' "$txn_tsv")"
+    if [ -n "$existing_srcsha" ]; then
+      [ "$existing_srcsha" = "$live_srcsha" ] || \
+        die "[$m/$arch] 事务已记录的构建使用了旧的 source_sha（事务记录=${existing_srcsha}，当前源码=${live_srcsha}），源码/基线在事务开始后发生了漂移，拒绝复用陈旧构建；清理事务目录后重新发布: $txn_dir"
+      log "[$m/$arch] 事务已记录该架构的构建结果，且 source_sha 与当前源码一致，跳过重复构建（同一事务目录内恢复）"
+      return 0
+    fi
+  fi
+
+  resolve_build_host_for_arch "$arch"
+  local BUILD_HOST="$RESOLVED_BUILD_HOST"
+
+  log "[$m/$arch] 构建于 $BUILD_HOST ..."
   local out recipe_stdout
   if ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
         "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
-        ARCH="$ARCH" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
+        ARCH="$arch" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
         PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}" bash -s <"$recipe")"; then
-    die "[$m] 远端构建配方执行失败"
+    die "[$m/$arch] 远端构建配方执行失败"
   fi
   out="$(printf '%s\n' "$recipe_stdout" | tail -n1)"
   BUILT_VERSION="${out%%$'\t'*}"
   local rpath="${out#*$'\t'}"
-  [ -n "$BUILT_VERSION" ] && [ "$rpath" != "$out" ] || die "[$m] 配方输出不合约定（应为 版本<TAB>产物路径）: $out"
+  [ -n "$BUILT_VERSION" ] && [ "$rpath" != "$out" ] || die "[$m/$arch] 配方输出不合约定（应为 版本<TAB>产物路径）: $out"
   if [ "$kind" = "first-party" ] && [ "$BUILT_VERSION" != "$ver" ]; then
-    die "[$m] 配方返回版本与发布计划不一致: 计划=$ver，实际=$BUILT_VERSION"
+    die "[$m/$arch] 配方返回版本与发布计划不一致: 计划=${ver}，实际=$BUILT_VERSION"
   fi
 
-  mkdir -p "$SCRATCH"
   BUILT_ARTIFACT="$(basename "$rpath")"
   case "$BUILT_ARTIFACT" in
     "$m"-*) ;;
-    *) die "[$m] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
+    *) die "[$m/$arch] 产物名不属于该模块: $BUILT_ARTIFACT" ;;
   esac
   local expected_rpath
-  if [ "$m" = dbdog-agent ]; then
-    # Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个 build attempt；
-    # 它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的路径/owner/mode 门禁。
+  if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
+    # aarch64 Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个
+    # build attempt；它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的
+    # 路径/owner/mode 门禁。x86_64 Agent 配方（recipes/dbdog-agent-x86_64.sh）
+    # 没有这段历史包袱，和其它一方模块一样落在通用 BUILD_WORK/<module>/out 下。
     expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
   fi
   [ "$rpath" = "$expected_rpath" ] || \
-    die "[$m] 配方产物不在约定的远端 out 目录: $rpath"
+    die "[$m/$arch] 配方产物不在约定的远端 out 目录: $rpath"
   local artifact_arch
   case "$BUILT_ARTIFACT" in
-    *-"$ARCH".tar.gz) artifact_arch="$ARCH" ;;
+    *-"$arch".tar.gz) artifact_arch="$arch" ;;
     *-noarch.tar.gz) artifact_arch="noarch" ;;
-    *) die "[$m] 产物名没有受支持的架构后缀: $BUILT_ARTIFACT" ;;
+    *) die "[$m/$arch] 产物名没有受支持的架构后缀: $BUILT_ARTIFACT" ;;
   esac
   remote_artifact_metadata "$rpath"
   verify_remote_artifact_arch "$rpath" "$artifact_arch" "$m"
   BUILT_SHA256="$REMOTE_ARTIFACT_SHA256"
 
   if [ "$m" = "dbdog-agent" ]; then
-    # Agent 构建耗时很长；上传前重读基线，避免等待期间有人换锚，导致版本/manifest
+    # Agent 构建耗时很长；记录事务前重读基线，避免等待期间有人换锚，导致版本/事务
     # 记录与刚构建完成的实际 SHA 不一致。
     load_agent_release_baseline
     [ "$AGENT_RELEASE_SOURCE_COMMIT" = "$sha" ] \
       && [ "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT" = "$core" ] \
       && [ "$(git -C "$SRC_ROOT/dbdog-agent" hash-object \
         dbdog-deploy/RELEASE-BASELINE.tsv)" = "$agent_baseline_blob" ] \
-      || die "[$m] 构建期间发布基线发生变化，拒绝上传；请按新基线重新构建"
+      || die "[$m/$arch] 构建期间发布基线发生变化，拒绝记录事务；请按新基线重新构建"
     agent_version_uses_loaded_baseline "$BUILT_VERSION" \
-      || die "[$m] 构建版本已不属于当前官方基线，拒绝上传: $BUILT_VERSION"
+      || die "[$m/$arch] 构建版本已不属于当前官方基线，拒绝记录事务: $BUILT_VERSION"
   fi
+
+  # 复用函数开头算好的 live_srcsha（短路判断用的是同一个值），不再重新计算一遍，
+  # 避免两处口径分裂；Agent 分支上面的基线复读门禁已经确认它没有在构建期间失效。
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$m" "$arch" "$BUILT_VERSION" "$rpath" "$REMOTE_ARTIFACT_SIZE" "$BUILT_SHA256" "$live_srcsha" \
+    >>"$txn_tsv"
+  log "[$m/$arch] 已记录事务行（未上传、未改 manifest）"
+}
+
+# ---- 恢复认领：release HEAD、module、version、source SHA、arch、远端绝对路径、size、
+# sha 全部与事务记录一致，且 manifest 仍指向旧版本，才允许把远端已存在的同名资产当
+# 成本次事务自己上传的产物；任一项不一致就 return 1（调用方 fail closed，不删除资产）。
+publish_verify_recovery_claim() { # <module> <arch> <version> <remote_path> <size> <sha> <source_sha> <txn_dir>；调用前 BUILD_HOST 已按 arch 解析
+  local module="$1" arch="$2" version="$3" remote_path="$4" size="$5" sha="$6"
+  local source_sha="$7" txn_dir="$8"
+  local head_file="$txn_dir/release-head" recorded_head current_head
+
+  [ -f "$head_file" ] || return 1
+  recorded_head="$(<"$head_file")"
+  current_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)" || return 1
+  [ "$recorded_head" = "$current_head" ] || return 1
+
+  local live_kind live_source
+  live_kind="$(manifest_get "$module" 2 "$arch" 2>/dev/null)" || return 1
+  if [ "$live_kind" = "first-party" ]; then
+    if [ "$module" = "dbdog-agent" ]; then
+      load_agent_release_baseline
+      live_source="$(agent_loaded_source_fingerprint)"
+    else
+      live_source="$(live_sha "$module")"
+    fi
+  else
+    live_source="-"
+  fi
+  [ "$live_source" = "$source_sha" ] || return 1
+
+  # manifest 仍指向旧版本，证明这次事务的提交阶段确实还没跑过。
+  local manifest_version
+  if manifest_version="$(manifest_get "$module" 5 "$arch" 2>/dev/null)"; then
+    [ "$manifest_version" != "$version" ] || return 1
+  fi
+
+  local remote_q remote_probe remote_size remote_sha
+  printf -v remote_q '%q' "$remote_path"
+  remote_probe="$(ssh "$BUILD_HOST" \
+    "test -f $remote_q && test ! -L $remote_q && stat -c '%s' -- $remote_q && sha256sum -- $remote_q" \
+    2>/dev/null)" || return 1
+  remote_size="$(sed -n '1p' <<<"$remote_probe")"
+  remote_sha="$(sed -n '2p' <<<"$remote_probe" | awk '{print $1}')"
+  [ "$remote_size" = "$size" ] || return 1
+  [ "$remote_sha" = "$sha" ] || return 1
+
+  return 0
+}
+
+publish_claim_or_upload_arch_asset() { # <module> <arch> <version> <remote_path> <asset> <size> <sha> <source_sha> <txn_dir>
+  local module="$1" arch="$2" version="$3" remote_path="$4" asset_name="$5"
+  local size="$6" sha="$7" source_sha="$8" txn_dir="$9"
+
+  resolve_build_host_for_arch "$arch"
+  local BUILD_HOST="$RESOLVED_BUILD_HOST"
+
+  inspect_release_asset "$asset_name" "$size" "$sha" \
+    || die "[$module/$arch] 无法读取产物桶资产元数据，拒绝上传"
+  case "$RELEASE_ASSET_STATE" in
+    absent)
+      upload_release_asset_from_builder "$module" "$remote_path" "$asset_name" "$size" "$sha"
+      ;;
+    identical)
+      if publish_verify_recovery_claim "$module" "$arch" "$version" "$remote_path" \
+          "$size" "$sha" "$source_sha" "$txn_dir"; then
+        log "[$module/$arch] 认领已上传的产物桶资产（恢复记录七项一致，未重新上传）：$asset_name"
+      else
+        die "[$module/$arch] 产物桶已存在同名文件但恢复校验未通过，拒绝认领（可能是无关残留，不删除现有资产）: $asset_name"
+      fi
+      ;;
+    conflict)
+      die "[$module/$arch] 产物桶已存在同名文件，拒绝覆盖: ${asset_name}（${RELEASE_ASSET_DETAIL}）"
+      ;;
+    *) die "[$module/$arch] 未知远端资产状态: $RELEASE_ASSET_STATE" ;;
+  esac
+}
+
+publish_manifest_row_matches_target() { # <module> <arch> <version> <artifact> <sha256> <source_sha> → 0/1
+  # manifest.tsv 里 (module, arch) 那一行是否已经恰好等于事务要写入的目标值。
+  # 只在这五列都能读到且完全相等时返回 0；读不到该行（尚未发布过这个架构）或任一
+  # 列不等都返回 1——这是"目标状态尚未生效"，不是错误。
+  local m="$1" a="$2" v="$3" art="$4" sha="$5" ssha="$6"
+  local cur_v cur_art cur_sha cur_ssha
+  cur_v="$(manifest_get "$m" 5 "$a" 2>/dev/null)" || return 1
+  cur_art="$(manifest_get "$m" 6 "$a" 2>/dev/null)" || return 1
+  cur_sha="$(manifest_get "$m" 7 "$a" 2>/dev/null)" || return 1
+  cur_ssha="$(manifest_get "$m" 8 "$a" 2>/dev/null)" || return 1
+  [ "$cur_v" = "$v" ] && [ "$cur_art" = "$art" ] && [ "$cur_sha" = "$sha" ] && [ "$cur_ssha" = "$ssha" ]
+}
+
+publish_resume_pending_push() { # publish_resume_pending_push <module> → 0：HEAD 已是该模块本次发布的提交、只差 push，已就地补 push+prune 并返回；1：不是这个状态，调用方走正常流程
+  # 覆盖"commit 成功、push 失败"这道中断窗口。这个状态下 release HEAD 已经因为
+  # 我们自己的 commit 前进了，publish_txn_dir 会算出一个新目录、找不到旧事务
+  # 记录，没法用 build_one_arch 的短路机制识别"已经做过"；只能反过来看：HEAD 本
+  # 身是不是一个还没推的 "publish: <module>@<version>" 提交。命中就只补
+  # push+prune，完全不碰构建/上传/manifest，不会重建矩阵也不会重复上传。
+  local m="$1" head_msg v arch head_sha origin_sha
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md || return 1
+  head_msg="$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD 2>/dev/null)" || return 1
+  case "$head_msg" in
+    "publish: ${m}@"*) v="${head_msg#"publish: ${m}@"}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$v" ] || return 1
+  while IFS= read -r arch; do
+    [ -n "$arch" ] || continue
+    [ "$(manifest_get "$m" 5 "$arch" 2>/dev/null)" = "$v" ] || return 1
+  done < <(publish_arches_for_module "$m")
+
+  # 硬判据：上面三条在"上一次发布已经完全成功"这个最常见的稳态下也会全部成立
+  # （commit 和 push 都做完之后，HEAD 的提交信息、manifest 版本自然就是这样）——
+  # 光凭它们会把稳态误判成"待推送"，直接 no-op 跳过下一次真正该发布的新版本。
+  # 必须再确认 HEAD 真的领先本地已知的 origin/main 才能当成"待推送"：push 成功后
+  # git 会把本地这个 remote-tracking ref 前移到与 HEAD 一致，push 失败/从未 push
+  # 则不会。只用本地缓存的 ref 比较，不为此发起网络访问（不 fetch）；ref 读不到
+  # 就不敢确认，一律 fail closed 走正常流程。
+  head_sha="$(git -C "$RELEASE_DIR" rev-parse HEAD)" || return 1
+  origin_sha="$(git -C "$RELEASE_DIR" rev-parse origin/main 2>/dev/null)" || return 1
+  [ "$head_sha" != "$origin_sha" ] || return 1
+
+  log "[$m] HEAD 已是本次发布提交（${head_msg}），只是尚未推送；直接补 push（不重建矩阵、不重新上传）"
+  # 显式 || die，不指望调用方永远处在 set -e 会触发的位置——if/while 条件、
+  # 命令替换等上下文里 set -e 对普通命令失效，但 die() 的 exit 不受这个影响，
+  # 任何时候 push 失败都必须可靠地在这里停下，不能滑到 prune 那一步。
+  git -C "$RELEASE_DIR" push origin main \
+    || die "[$m] push origin main 失败（本地已提交 ${head_msg}，尚未推送）；请检查网络/权限后重试，不会自动重建矩阵，也不会删除任何资产"
+  prune_modules_to_manifest 1 "$m"
+  RESUMED_PUBLISH_VERSION="$v"
+  return 0
+}
+
+publish_apply_arch_matrix_manifest_update() { # <updates.tsv: module arch version artifact sha256 source_sha>
+  local updates="$1" tmp
+  [ -s "$updates" ] || die "manifest 矩阵更新输入为空: $updates"
+  tmp="$(mktemp "$MANIFEST.matrix.XXXXXX")" || die "无法创建 manifest 临时文件"
+  if ! awk -F'\t' -v OFS='\t' '
+      FNR == NR {
+        key = $1 SUBSEP $2
+        ver[key] = $3; art[key] = $4; sha[key] = $5; src[key] = $6
+        seen[key] = 1
+        next
+      }
+      /^[[:space:]]*(#|$)/ { print; next }
+      {
+        key = $1 SUBSEP $9
+        if (key in seen) {
+          $5 = ver[key]; $6 = art[key]; $7 = sha[key]; $8 = src[key]
+          matched[key] = 1
+        }
+        print
+      }
+      END {
+        for (key in seen) {
+          if (!(key in matched)) {
+            split(key, parts, SUBSEP)
+            printf "manifest 矩阵更新目标行不存在 (module=%s, arch=%s)\n", parts[1], parts[2] > "/dev/stderr"
+            exit 1
+          }
+        }
+      }
+    ' "$updates" "$MANIFEST" >"$tmp"; then
+    rm -f -- "$tmp"
+    die "manifest 矩阵更新失败（目标 (module,arch) 行必须已存在）"
+  fi
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "manifest 矩阵更新结果未通过 manifest_all_rows 严格校验（同模块 version/source_sha 必须一致），拒绝替换 manifest"
+  fi
+  mv -- "$tmp" "$MANIFEST"
+}
+
+publish_commit_arch_matrix() { # publish_commit_arch_matrix <txn.tsv> → 校验完整矩阵、上传/恢复、一次更新全部 (module,arch) 行，regen_readme/commit/push/prune
+  local txn_tsv="$1" txn_dir module="" version=""
+  [ -f "$txn_tsv" ] && [ ! -L "$txn_tsv" ] || die "事务记录不存在或不是普通文件: $txn_tsv"
+  txn_dir="$(cd "$(dirname "$txn_tsv")" && pwd)"
+
+  local -a row_module=() row_arch=() row_version=() row_path=() row_size=() row_sha=() row_srcsha=()
+  local m a v p sz sh ss
+  while IFS=$'\t' read -r m a v p sz sh ss; do
+    [ -n "$m" ] || continue
+    if [ -z "$module" ]; then module="$m"; version="$v"; fi
+    [ "$m" = "$module" ] || die "事务记录混入多个模块，拒绝提交（${module} 与 ${m}）: $txn_tsv"
+    [ "$v" = "$version" ] || die "[$module] 事务记录内版本不一致（${version} 与 ${v}），拒绝提交: $txn_tsv"
+    row_module+=("$m"); row_arch+=("$a"); row_version+=("$v"); row_path+=("$p")
+    row_size+=("$sz"); row_sha+=("$sh"); row_srcsha+=("$ss")
+  done <"$txn_tsv"
+  [ ${#row_module[@]} -gt 0 ] || die "事务记录为空，没有可提交的架构: $txn_tsv"
+
+  local expected_arches got_arches
+  expected_arches="$(publish_arches_for_module "$module" | sort)"
+  got_arches="$(printf '%s\n' "${row_arch[@]}" | sort)"
+  [ "$got_arches" = "$expected_arches" ] || die \
+    "[$module] 事务未覆盖全部目标架构，拒绝上传（期望: $(tr '\n' ' ' <<<"$expected_arches")｜实际: $(tr '\n' ' ' <<<"$got_arches")）"
+
+  local head_file="$txn_dir/release-head" recorded_head current_head
+  [ -f "$head_file" ] || die "[$module] 事务缺少 release-head 记录: $head_file"
+  recorded_head="$(<"$head_file")"
+  current_head="$(git -C "$RELEASE_DIR" rev-parse HEAD)"
+  [ "$recorded_head" = "$current_head" ] || die \
+    "[$module] 发布仓 HEAD 已从 ${recorded_head:0:12} 漂移到 ${current_head:0:12}，拒绝在陈旧事务上提交"
 
   ensure_bucket
-  upload_release_asset_from_builder "$m" "$rpath" "$BUILT_ARTIFACT" \
-    "$REMOTE_ARTIFACT_SIZE" "$BUILT_SHA256"
 
-  local srcsha="-"
-  if [ "$kind" = "first-party" ]; then
-    if [ "$m" = "dbdog-agent" ]; then
-      srcsha="$(agent_loaded_source_fingerprint)"
-    else
-      srcsha="$(live_sha "$m")"
+  # 恢复场景之一：上一次执行已经把全部资产真实上传/认领、也已经把 manifest mv 到
+  # 本次目标状态，只是在 commit 之前中断（release HEAD 还没变，所以还能走到这
+  # 里）。这种情况下不能再跑一遍上传循环——upload_release_asset_from_builder 对
+  # 已经上传过的资产会直接 fail closed（"产物桶已存在同名文件，拒绝覆盖"），而
+  # publish_verify_recovery_claim 的恢复认领要求"manifest 仍指向旧版本"，manifest
+  # 已经是新版本时会被它拒绝，报出"可能是无关残留"这种其实指向自己刚写的状态、
+  # 容易误导人的话。所以先检测这个状态，命中就跳过上传循环和 manifest 更新，只对
+  # 每个架构的资产做一次轻量 GitHub digest 核验（不完全信任本地 manifest），再继续
+  # 走 commit/push/prune。
+  local already_applied=1 i asset_name
+  for ((i = 0; i < ${#row_module[@]}; i++)); do
+    asset_name="$(basename "${row_path[$i]}")"
+    if ! publish_manifest_row_matches_target "${row_module[$i]}" "${row_arch[$i]}" \
+        "${row_version[$i]}" "$asset_name" "${row_sha[$i]}" "${row_srcsha[$i]}"; then
+      already_applied=0
+      break
     fi
+  done
+
+  if [ "$already_applied" -eq 1 ]; then
+    log "[$module] manifest 已处于本次事务目标状态，判定为「mv 之后、commit 之前中断」的恢复；跳过重新上传与 manifest 更新"
+    for ((i = 0; i < ${#row_module[@]}; i++)); do
+      asset_name="$(basename "${row_path[$i]}")"
+      inspect_release_asset "$asset_name" "${row_size[$i]}" "${row_sha[$i]}" \
+        || die "[$module/${row_arch[$i]}] 无法读取产物桶资产元数据，拒绝确认恢复状态"
+      [ "$RELEASE_ASSET_STATE" = "identical" ] || \
+        die "[$module/${row_arch[$i]}] manifest 已指向本次目标版本，但产物桶资产状态是 ${RELEASE_ASSET_STATE}（期望 identical），拒绝在未确认远端资产完整前继续；请人工核实后再重试，不要直接删除任何资产"
+    done
+  else
+    local updates
+    updates="$txn_dir/manifest-updates.tsv"
+    : >"$updates"
+    for ((i = 0; i < ${#row_module[@]}; i++)); do
+      asset_name="$(basename "${row_path[$i]}")"
+      publish_claim_or_upload_arch_asset "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" \
+        "${row_path[$i]}" "$asset_name" "${row_size[$i]}" "${row_sha[$i]}" "${row_srcsha[$i]}" "$txn_dir"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${row_module[$i]}" "${row_arch[$i]}" "${row_version[$i]}" "$asset_name" "${row_sha[$i]}" "${row_srcsha[$i]}" \
+        >>"$updates"
+    done
+
+    # 全部目标资产已确认存在（本次真实上传或恢复认领）且 digest 正确后，才精确更新
+    # 全部 (module, arch) 行；publish_apply_arch_matrix_manifest_update 内部会再校验一遍
+    # 同模块 version/source_sha 一致。
+    publish_apply_arch_matrix_manifest_update "$updates"
   fi
-  update_manifest_row "$m" "$BUILT_VERSION" "$BUILT_ARTIFACT" "$BUILT_SHA256" "$srcsha"
+
+  regen_readme
+  if git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md; then
+    # 没有未提交变更：说明这次的 commit 已经做过了（例如上一次恰好死在 commit 成功、
+    # push 失败之间）。不能再 commit 一次——那样会产生第二个提交，破坏"一次事务一个
+    # commit"。正常情况下走不到这一分支，因为这种状态应该在更早的
+    # publish_resume_pending_push 那一关就被拦下、直接补 push 了；这里只是防御。
+    log "[$module] manifest/README 相对 HEAD 已无未提交变更，跳过重复 commit"
+  else
+    git -C "$RELEASE_DIR" add manifest.tsv README.md
+    # 显式 || die：commit 失败（比如 pre-commit hook 拒绝）必须可靠地在这里停下，
+    # 不能指望调用方总是处在 set -e 会触发的位置——if/while 条件、命令替换等上下文
+    # 里 set -e 对普通命令失效，但 die() 的 exit 不受这个影响。
+    git -C "$RELEASE_DIR" commit -m "publish: $module@$version" \
+      || die "[$module] git commit 失败（manifest/README 已经 mv 到本次目标版本但未提交）；修复问题后重新执行发布会识别出这个状态并补完提交，不会重新上传"
+  fi
+  git -C "$RELEASE_DIR" push origin main \
+    || die "[$module] push origin main 失败（本地已提交本次发布但尚未推送）；请检查网络/权限后重试，重新执行发布会识别出这个状态并只补推同一个提交，不会重建矩阵"
+  # main/manifest 成为权威后再清理；push 失败上面已经 die，绝不会滑到这里提前删除旧资产。
+  prune_modules_to_manifest 1 "$module"
+
+  rm -rf -- "$txn_dir"
+  log "[$module] 架构矩阵发布完成: ${version}（$(tr '\n' ' ' <<<"$got_arches")）"
+}
+
+# ---- manifest v2 迁移（一次性：八列旧格式 → 九列，第九列 arch）----
+publish_migrate_manifest_v2() { # publish_migrate_manifest_v2 <输出路径>；读 $MANIFEST（严格八列旧格式）
+  # 按 artifact 文件名后缀推导第九列 arch，写九列 v2 内容到 <输出路径>。只接受八列输入，
+  # 输入已经是九列或列数异常一律拒绝；未知 artifact 后缀 fail closed；未发布行
+  # （version/artifact/sha256 均为 "-"）本应由模块目标架构声明生成第九列，但当前迁移规则
+  # 未实现该场景（迁移时 manifest 里也确实没有这类行）——明确报错，不留死代码路径去猜。
+  # 注释与空行原样透传，只给数据行追加第九列，保证 git diff 只新增一列。
+  local out="$1"
+  [ -n "$out" ] || die "publish_migrate_manifest_v2 需要输出路径参数"
+  if ! awk -F'\t' -v OFS='\t' '
+      /^[[:space:]]*(#|$)/ { print; next }
+      {
+        if (NF != 8) {
+          printf "manifest 第 %d 行必须恰好八列（迁移前的 v1 旧格式；实际 %d 列）: %s\n", \
+            FNR, NF, $0 > "/dev/stderr"
+          exit 1
+        }
+        module = $1; artifact = $6
+        if (artifact == "-") {
+          printf "manifest 第 %d 行是未发布行（version/artifact/sha256=\"-\"），需要按模块 %s 的目标架构声明生成第九列，当前迁移规则未实现该场景，拒绝猜测: %s\n", \
+            FNR, module, $0 > "/dev/stderr"
+          exit 1
+        }
+        if (artifact ~ /-aarch64\.tar\.gz$/) { arch = "aarch64" }
+        else if (artifact ~ /-x86_64\.tar\.gz$/) { arch = "x86_64" }
+        else if (artifact ~ /-noarch\.tar\.gz$/) { arch = "noarch" }
+        else {
+          printf "manifest 第 %d 行 artifact 文件名没有受支持的架构后缀（只认 -aarch64/-x86_64/-noarch.tar.gz）: %s\n", \
+            FNR, artifact > "/dev/stderr"
+          exit 1
+        }
+        print $0, arch
+      }
+    ' "$MANIFEST" >"$out"; then
+    rm -f -- "$out"
+    return 1
+  fi
 }
 
 # ---- README 版本表 ----
@@ -722,9 +1229,9 @@ regen_readme() {
   {
     echo "更新于 $(date '+%Y-%m-%d %H:%M')（此表由 publish.sh 生成，权威数据在 manifest.tsv）"
     echo
-    echo "| 模块 | 类别 | 装在 | 版本 | 产物 |"
-    echo "| --- | --- | --- | --- | --- |"
-    manifest_rows | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s |\n", $1, $2, ($3=="stack" ? "全家桶机" : "DB 主机"), $5, $6 }'
+    echo "| 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |"
+    echo "| --- | --- | --- | --- | --- | --- |"
+    manifest_all_rows | awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, ($3=="stack" ? "全家桶机" : "DB 主机"), $5, $6, $9 }'
   } >"$tbl"
   awk -v tbl="$tbl" '
     /<!-- VERSION-TABLE:BEGIN -->/ { print; while ((getline l < tbl) > 0) print l; skip=1; next }
@@ -740,7 +1247,7 @@ cmd_plan() {
   printf '%-14s %-24s %-24s %s\n' "模块" "manifest 记录" "当前源码" "状态"
   printf '%s\n' "--------------------------------------------------------------------------"
   local stale=0
-  while IFS=$'\t' read -r m kind _t _s v _a _h recorded; do
+  while IFS=$'\t' read -r m kind _t _s v _a _h recorded _arch; do
     if [ "$kind" = "first-party" ]; then
       if [ -d "$SRC_ROOT/$m/.git" ]; then
         if [ "$m" = "dbdog-agent" ]; then
@@ -798,8 +1305,8 @@ assert_manifest_is_origin_main() {
 
 prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，再删非当前资产
   local execute="$1"; shift
-  local asset_rows assets protected m current expected remote_digest f asset_id
-  local modules=("$@") victims=""
+  local asset_rows assets protected m arch current expected remote_digest f asset_id
+  local modules=("$@") victims="" current_assets=""
 
   if [ ${#modules[@]} -eq 0 ]; then
     while IFS= read -r m; do modules+=("$m"); done < <(manifest_modules)
@@ -811,32 +1318,43 @@ prune_modules_to_manifest() { # <execute:0|1> [模块...]；先完整校验，�
     --jq '.assets[] | [.id, .name, (.digest // "")] | @tsv')" \
     || die "读取产物桶失败"
   assets="$(printf '%s\n' "$asset_rows" | cut -f2)"
-  protected="$(manifest_rows | cut -f6)"
+  # manifest_all_rows 是严格的九列合同，逐 (module, arch) 行输出；一个模块可能有
+  # 多个架构行，每一行的 artifact 都要保护，不能只看某一个架构。
+  protected="$(manifest_all_rows | cut -f6)"
 
-  # 删除任何文件前，先保证当前资产的模块归属、存在性和内容都正确。
+  # 删除任何文件前，先保证该模块登记的每个架构自己的当前资产都归属、存在且内容正确
+  # （不能只查 host_arch 选中的那一行——否则另一个架构的资产永远不会被校验）。
   for m in "${modules[@]}"; do
-    current="$(manifest_get "$m" 6)"
-    case "$current" in
-      "$m"-[0-9]*) ;;
-      *) die "[$m] manifest 当前资产名不属于该模块，拒绝清理: $current" ;;
-    esac
-    printf '%s\n' "$assets" | grep -Fqx -- "$current" \
-      || die "[$m] manifest 当前资产不在产物桶，拒绝清理: $current"
-    expected="$(manifest_get "$m" 7)"
-    remote_digest="$(printf '%s\n' "$asset_rows" | awk -F'\t' -v a="$current" \
-      '$2==a { sub(/^sha256:/, "", $3); print $3; exit }')"
-    [ -n "$remote_digest" ] && [ "$remote_digest" = "$expected" ] \
-      || die "[$m] 产物桶 SHA-256 与 manifest 不一致，拒绝清理: $current"
+    while IFS= read -r arch; do
+      [ -n "$arch" ] || continue
+      current="$(manifest_get "$m" 6 "$arch")"
+      # 未发布模块（register-module 登记的声明行，artifact="-"）没有任何资产可以
+      # 保护也没有任何资产可以清理；不能因为它不匹配 "<module>-[0-9]*" 就整体
+      # die——否则任何一个已登记未发布的模块存在，都会让 prune 永久报废，直到
+      # 该模块真正发布为止。
+      [ "$current" != "-" ] || continue
+      case "$current" in
+        "$m"-[0-9]*) ;;
+        *) die "[$m/$arch] manifest 当前资产名不属于该模块，拒绝清理: $current" ;;
+      esac
+      printf '%s\n' "$assets" | grep -Fqx -- "$current" \
+        || die "[$m/$arch] manifest 当前资产不在产物桶，拒绝清理: $current"
+      expected="$(manifest_get "$m" 7 "$arch")"
+      remote_digest="$(printf '%s\n' "$asset_rows" | awk -F'\t' -v a="$current" \
+        '$2==a { sub(/^sha256:/, "", $3); print $3; exit }')"
+      [ -n "$remote_digest" ] && [ "$remote_digest" = "$expected" ] \
+        || die "[$m/$arch] 产物桶 SHA-256 与 manifest 不一致，拒绝清理: $current"
+      current_assets="${current_assets}${current_assets:+$'\n'}$current"
+    done < <(publish_arches_for_module "$m")
   done
 
   for m in "${modules[@]}"; do
-    current="$(manifest_get "$m" 6)"
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       case "$f" in
         "$m"-[0-9]*)
-          [ "$f" = "$current" ] && continue
-          # 即使未来模块名前缀发生重叠，也绝不删除任一 manifest 当前引用。
+          printf '%s\n' "$current_assets" | grep -Fqx -- "$f" && continue
+          # 即使未来模块名前缀发生重叠，也绝不删除任一 manifest 当前引用（任意架构）。
           printf '%s\n' "$protected" | grep -Fqx -- "$f" && continue
           if [ -n "$victims" ] && printf '%s\n' "$victims" | grep -Fqx -- "$f"; then
             continue
@@ -884,14 +1402,38 @@ cmd_publish() {
     while IFS= read -r m; do
       [ -n "$m" ] && mods+=("$m")
     done <<<"$changed"
-    [ ${#mods[@]} -gt 0 ] || { log "没有变更的一方模块（三方件需点名发布）"; exit 0; }
+    if [ ${#mods[@]} -eq 0 ]; then
+      # 裸跑（不点名任何模块）也可能撞上"commit 成功、push 失败"的中断窗口：那次
+      # commit 已经把 manifest 的 source_sha 更新成当前源码值，changed_first_party
+      # 从此再也看不出"变更"，若这里直接 exit 0，待推送的发布提交会被永久静默
+      # 丢在本地，origin/main 悄悄落后而没有任何报错——这正是终审 Important 1
+      # 指出的场景。在判定"无变更"之前，先看 HEAD 是不是这样一个还没推的
+      # "publish: <module>@<version>" 提交，命中就直接交给
+      # publish_resume_pending_push 补推（它自己会用本地缓存的 origin/main 校验
+      # "HEAD 真的领先"，稳态下不会误命中，见 test-publish-architecture-
+      # transaction.sh CASE9/CASE12）。
+      local pending_head_msg pending_module=""
+      pending_head_msg="$(git -C "$RELEASE_DIR" log -1 --format=%s HEAD 2>/dev/null)" || pending_head_msg=""
+      case "$pending_head_msg" in
+        "publish: "*"@"*)
+          pending_module="${pending_head_msg#publish: }"
+          pending_module="${pending_module%%@*}"
+          ;;
+      esac
+      if [ -n "$pending_module" ] && publish_resume_pending_push "$pending_module"; then
+        log "发布完成: ${pending_module}@${RESUMED_PUBLISH_VERSION}"
+        exit 0
+      fi
+      log "没有变更的一方模块（三方件需点名发布）"
+      exit 0
+    fi
   fi
 
   echo "发布计划（bump=${bump}）:"
   local plan_vers=()
   for m in "${mods[@]}"; do
     local kind cur nv
-    kind="$(manifest_get "$m" 2)"; cur="$(manifest_get "$m" 5)"
+    kind="$(manifest_module_field "$m" 2)"; cur="$(manifest_module_field "$m" 5)"
     if [ "$kind" = "first-party" ]; then
       if [ "$m" = "dbdog-agent" ]; then
         load_agent_release_baseline
@@ -909,25 +1451,41 @@ cmd_publish() {
     [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { log "已取消"; exit 0; }
   fi
 
+  # 正式模块发布串行执行：每个模块自己的架构矩阵是一个完整事务
+  # （build 全部架构 → verify → upload 全部架构（含恢复）→ 一次 manifest 更新 →
+  # regen_readme → commit → push → prune）；一个模块完成/失败不影响下一个模块。
   local i=0 summary=""
   for m in "${mods[@]}"; do
-    local kind ver=""
-    kind="$(manifest_get "$m" 2)"
+    # 先看这是不是"上一次已经 commit 成功、只是 push 失败"的中断恢复：这种状态下
+    # release HEAD 已经因为那次 commit 前进了，事务目录按新 HEAD 是找不到的，必须
+    # 在触碰 build_one_arch/版本规划之前单独识别，直接补 push，不重建矩阵。
+    if publish_resume_pending_push "$m"; then
+      summary="$summary $m@$RESUMED_PUBLISH_VERSION"
+      i=$((i + 1))
+      continue
+    fi
+
+    local kind ver="" arch txn_dir="" actual_ver
+    kind="$(manifest_module_field "$m" 2)"
     if [ "$kind" = "first-party" ]; then
       if [ "$m" = "dbdog-agent" ]; then ensure_pushed dbdog-agent dbdog-agent-core; else ensure_pushed "$m"; fi
       ver="${plan_vers[$i]}"
     fi
-    build_one "$m" "$ver"
-    summary="$summary $m@$BUILT_VERSION"
+    publish_ensure_arch_builders "$m"
+    while IFS= read -r arch; do
+      [ -n "$arch" ] || continue
+      build_one_arch "$m" "$ver" "$arch"
+    done < <(publish_arches_for_module "$m")
+    txn_dir="$(publish_txn_dir "$m" "$ver")"
+    # 三方件的真实版本由配方探测，只有构建完成后才知道；从事务记录里取，
+    # 不依赖上面可能仍是空串的 $ver（publish_commit_arch_matrix 会把事务目录删掉，
+    # 所以要在调用它之前读出来）。
+    actual_ver="$(awk -F'\t' 'NR==1 { print $3; exit }' "$txn_dir/txn.tsv")"
+    publish_commit_arch_matrix "$txn_dir/txn.tsv"
+    summary="$summary $m@$actual_ver"
     i=$((i + 1))
   done
 
-  regen_readme
-  git -C "$RELEASE_DIR" add manifest.tsv README.md
-  git -C "$RELEASE_DIR" commit -m "publish:$summary"
-  git -C "$RELEASE_DIR" push origin main
-  # main/manifest 成为权威后再清理；push 失败时绝不提前删除旧资产。
-  prune_modules_to_manifest 1 "${mods[@]}"
   log "发布完成:$summary"
 }
 
@@ -942,13 +1500,228 @@ cmd_prune() {
   prune_modules_to_manifest "$yes"
 }
 
+cmd_migrate_manifest_v2() { # 一次性迁移：manifest.tsv 八列旧格式 → 九列（含 arch），再重建 README
+  local write=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --write) write=1; shift ;;
+      *) die "migrate-manifest-v2 不认识参数: $1" ;;
+    esac
+  done
+  [ "$write" -eq 1 ] || die "migrate-manifest-v2 是一次性迁移，只支持 --write（没有试运行模式）"
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.migrate.XXXXXX")" || die "无法创建迁移临时文件"
+  if ! publish_migrate_manifest_v2 "$tmp"; then
+    rm -f -- "$tmp"
+    die "manifest v2 迁移失败（源 manifest 必须严格八列，且 artifact 后缀必须是 -aarch64/-x86_64/-noarch.tar.gz 之一）"
+  fi
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "迁移结果未通过 manifest_all_rows 严格校验，拒绝替换 manifest"
+  fi
+
+  mv -- "$tmp" "$MANIFEST"
+  regen_readme
+  log "manifest 已迁移到 v2（九列，含 arch），README 版本表已重建"
+}
+
+# ---- 新模块首发登记：manifest 里完全没有该模块任何行时，唯一合法登记路径 ----
+# 原子写入未发布声明行（每个目标架构一行，version/artifact/sha256/source_sha 全部
+# 写 "-"）。发布事务（build_one_arch/publish_arches_for_module/
+# publish_apply_arch_matrix_manifest_update）不需要为"首发"另开分支：
+# publish_arches_for_module 本来就是读 manifest 里该模块出现过的架构，声明行天然
+# 提供这个矩阵；真正发布时 publish_apply_arch_matrix_manifest_update 按既有的
+# "(module,arch) 键匹配就更新" 语义，把声明行原地替换成真实行——不需要新增"插入
+# 新行"的能力，也就不需要放松那个函数对未匹配键的 fail-closed 保护。
+cmd_register_module() { # register-module <module> <first-party|third-party> <stack|dbhost> <yes|no> --arch <架构> [--arch <架构>]...
+  local m="" kind="" target="" service=""
+  local -a arches=()
+  if [ $# -ge 4 ]; then
+    m="$1"; kind="$2"; target="$3"; service="$4"; shift 4
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --arch)
+        [ $# -ge 2 ] || die "register-module: --arch 需要参数"
+        arches+=("$2"); shift 2
+        ;;
+      *) die "register-module 不认识的参数: $1" ;;
+    esac
+  done
+  [ -n "$m" ] && [ -n "$kind" ] && [ -n "$target" ] && [ -n "$service" ] \
+    || die "用法: register-module <module> <first-party|third-party> <stack|dbhost> <yes|no> --arch <架构> [--arch <架构>]..."
+  case "$m" in
+    "" | "." | ".." | */* | *$'\n'* | *$'\r'* | *$'\t'*)
+      die "register-module 模块名不是安全的单层路径名: $m"
+      ;;
+  esac
+  case "$kind" in
+    first-party | third-party) ;;
+    *) die "register-module 的 kind 只能是 first-party|third-party，收到: $kind" ;;
+  esac
+  case "$target" in
+    stack | dbhost) ;;
+    *) die "register-module 的 target 只能是 stack|dbhost，收到: $target" ;;
+  esac
+  case "$service" in
+    yes | no) ;;
+    *) die "register-module 的 service 只能是 yes|no，收到: $service" ;;
+  esac
+  [ ${#arches[@]} -gt 0 ] || die "register-module 至少需要一个 --arch"
+
+  local -a normalized=()
+  local raw na seen dup
+  for raw in "${arches[@]}"; do
+    na="$(normalize_arch "$raw")" || die "register-module 不支持的架构: $raw"
+    dup=0
+    for seen in ${normalized[@]+"${normalized[@]}"}; do
+      [ "$seen" != "$na" ] || { dup=1; break; }
+    done
+    [ "$dup" -eq 0 ] || die "register-module 重复的 --arch: $na"
+    normalized+=("$na")
+  done
+
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md \
+    || die "manifest.tsv/README.md 有未提交的改动，拒绝在脏工作区上登记新模块"
+  manifest_all_rows >/dev/null \
+    || die "现有 manifest.tsv 未通过 manifest_all_rows 严格校验，拒绝在此基础上登记新模块"
+  if manifest_all_rows | awk -F'\t' -v m="$m" '$1==m{f=1} END{exit(f?0:1)}'; then
+    die "模块 $m 已经在 manifest 里登记过，拒绝重复登记（如需变更用发布流程更新已有行，不要手改 manifest）"
+  fi
+
+  # 固定按 aarch64/x86_64/noarch 输出声明行，和 manifest_arches 的既有顺序约定一致，
+  # 不依赖调用方传 --arch 的顺序。
+  local ordered="" order_arch cand
+  for order_arch in aarch64 x86_64 noarch; do
+    for cand in "${normalized[@]}"; do
+      [ "$cand" != "$order_arch" ] || ordered="$ordered${ordered:+ }$order_arch"
+    done
+  done
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.register.XXXXXX")" || die "无法创建 manifest 临时文件"
+  if ! cp -- "$MANIFEST" "$tmp"; then
+    rm -f -- "$tmp"
+    die "无法复制 manifest 到临时文件"
+  fi
+  for na in $ordered; do
+    printf '%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$m" "$kind" "$target" "$service" "$na" >>"$tmp"
+  done
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "register-module 写入的声明行未通过 manifest_all_rows 校验，拒绝落地"
+  fi
+  mv -- "$tmp" "$MANIFEST"
+
+  regen_readme
+  git -C "$RELEASE_DIR" add manifest.tsv README.md
+  git -C "$RELEASE_DIR" commit -m "register: ${m} (${ordered// /,}) unpublished" \
+    || die "register-module git commit 失败（manifest/README 已写入声明行但未提交）；确认工作区改动后手动 git add/commit，或 git checkout -- manifest.tsv README.md 撤销后重跑"
+  publish_maybe_push_main \
+    "register-module push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main（重新执行 register-module 会因模块已登记而拒绝）"
+  log "已登记新模块 ${m}（${ordered}，未发布，version=-）"
+}
+
+cmd_register_arch() { # register-arch <module> --arch <架构> [--arch <架构>]...
+  # 给已存在模块追加未发布架构声明行；kind/target/service 从现有行复制。
+  local m=""
+  local -a arches=()
+  if [ $# -ge 1 ]; then
+    m="$1"; shift
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --arch)
+        [ $# -ge 2 ] || die "register-arch: --arch 需要参数"
+        arches+=("$2"); shift 2
+        ;;
+      *) die "register-arch 不认识的参数: $1" ;;
+    esac
+  done
+  [ -n "$m" ] || die "用法: register-arch <module> --arch <架构> [--arch <架构>]..."
+  case "$m" in
+    "" | "." | ".." | */* | *$'\n'* | *$'\r'* | *$'\t'*)
+      die "register-arch 模块名不是安全的单层路径名: $m"
+      ;;
+  esac
+  [ ${#arches[@]} -gt 0 ] || die "register-arch 至少需要一个 --arch"
+
+  local -a normalized=()
+  local raw na seen dup
+  for raw in "${arches[@]}"; do
+    na="$(normalize_arch "$raw")" || die "register-arch 不支持的架构: $raw"
+    dup=0
+    for seen in ${normalized[@]+"${normalized[@]}"}; do
+      [ "$seen" != "$na" ] || { dup=1; break; }
+    done
+    [ "$dup" -eq 0 ] || die "register-arch 重复的 --arch: $na"
+    normalized+=("$na")
+  done
+
+  git -C "$RELEASE_DIR" diff --quiet HEAD -- manifest.tsv README.md \
+    || die "manifest.tsv/README.md 有未提交的改动，拒绝在脏工作区上登记架构"
+  manifest_all_rows >/dev/null \
+    || die "现有 manifest.tsv 未通过 manifest_all_rows 严格校验，拒绝在此基础上登记架构"
+  if ! manifest_all_rows | awk -F'\t' -v m="$m" '$1==m{f=1} END{exit(f?0:1)}'; then
+    die "模块 $m 尚未在 manifest 里登记；新模块请用 register-module"
+  fi
+
+  local existing_arches kind target service
+  existing_arches="$(manifest_arches "$m")"
+  kind="$(manifest_module_field "$m" 2)"
+  target="$(manifest_module_field "$m" 3)"
+  service="$(manifest_module_field "$m" 4)"
+
+  local -a to_add=()
+  for na in "${normalized[@]}"; do
+    if printf '%s\n' "$existing_arches" | grep -Fxq -- "$na"; then
+      die "模块 $m 已经登记过架构 $na，拒绝重复登记"
+    fi
+    to_add+=("$na")
+  done
+
+  local ordered="" order_arch cand
+  for order_arch in aarch64 x86_64 noarch; do
+    for cand in "${to_add[@]}"; do
+      [ "$cand" != "$order_arch" ] || ordered="$ordered${ordered:+ }$order_arch"
+    done
+  done
+
+  local tmp
+  tmp="$(mktemp "$MANIFEST.register.XXXXXX")" || die "无法创建 manifest 临时文件"
+  if ! cp -- "$MANIFEST" "$tmp"; then
+    rm -f -- "$tmp"
+    die "无法复制 manifest 到临时文件"
+  fi
+  for na in $ordered; do
+    printf '%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$m" "$kind" "$target" "$service" "$na" >>"$tmp"
+  done
+  if ! MANIFEST="$tmp" manifest_all_rows >/dev/null; then
+    rm -f -- "$tmp"
+    die "register-arch 写入的声明行未通过 manifest_all_rows 校验，拒绝落地"
+  fi
+  mv -- "$tmp" "$MANIFEST"
+
+  regen_readme
+  git -C "$RELEASE_DIR" add manifest.tsv README.md
+  git -C "$RELEASE_DIR" commit -m "register-arch: ${m} (+${ordered// /,}) unpublished" \
+    || die "register-arch git commit 失败（manifest/README 已写入声明行但未提交）；确认工作区改动后手动 git add/commit，或 git checkout -- manifest.tsv README.md 撤销后重跑"
+  publish_maybe_push_main \
+    "register-arch push 失败（本地已提交声明行）；请检查网络/权限后手动 git push origin main"
+  log "已为模块 ${m} 登记架构 ${ordered}（未发布，version=-）"
+}
+
 main() {
   case "${1:-plan}" in
     plan) cmd_plan ;;
     publish) shift; cmd_publish "$@" ;;
     regen-readme) regen_readme ;;
     prune) shift; cmd_prune "$@" ;;
-    *) die "用法: publish.sh plan|publish|regen-readme|prune" ;;
+    migrate-manifest-v2) shift; cmd_migrate_manifest_v2 "$@" ;;
+    register-module) shift; cmd_register_module "$@" ;;
+    register-arch) shift; cmd_register_arch "$@" ;;
+    *) die "用法: publish.sh plan|publish|regen-readme|prune|migrate-manifest-v2|register-module|register-arch" ;;
   esac
 }
 

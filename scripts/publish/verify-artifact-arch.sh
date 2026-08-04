@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 发布前检查 tar 包内机器码是否与文件名架构一致。
-# 用法：verify-artifact-arch.sh <artifact.tar.gz> <aarch64|noarch> [module]
+# 用法：verify-artifact-arch.sh <artifact.tar.gz> <aarch64|x86_64|noarch> [module]
 
 set -euo pipefail
 
@@ -11,8 +11,8 @@ expected="${2:-}"
 module="${3:-}"
 [ -f "$artifact" ] || die "产物不存在: $artifact"
 case "$expected" in
-  aarch64 | noarch) ;;
-  *) die "期望架构只能是 aarch64 或 noarch" ;;
+  aarch64 | x86_64 | noarch) ;;
+  *) die "期望架构只能是 aarch64、x86_64 或 noarch" ;;
 esac
 
 for cmd in tar file find mktemp objdump; do
@@ -58,7 +58,7 @@ check_machine() { # check_machine <显示路径> <file 输出>
       # pip distlib 的 Windows launcher 是 Python 随包资源；msodbcsql 的 .rll 是
       # ODBC 本地化消息资源。Linux 不执行它们，只精确放行当前已审路径。
       [ "$module" = "dbdog-agent" ] \
-        || die "aarch64 包混入 Windows PE: $path ($info)"
+        || die "$expected 包混入 Windows PE: $path ($info)"
       case "$path" in
         embedded/lib/python3.13/site-packages/pip/_vendor/distlib/t32.exe | \
         embedded/lib/python3.13/site-packages/pip/_vendor/distlib/t64.exe | \
@@ -73,9 +73,20 @@ check_machine() { # check_machine <显示路径> <file 输出>
       esac
       ;;
   esac
-  case "$info" in
-    *ELF*ARM\ aarch64*) host_machine_count=$((host_machine_count + 1)) ;;
-    *) die "aarch64 包混入其他架构: $path ($info)" ;;
+  # x86_64 只接受 file 输出中恰好 "x86-64"（无 ARM 前缀）；aarch64 只接受 "ARM aarch64"。
+  case "$expected" in
+    aarch64)
+      case "$info" in
+        *ELF*ARM\ aarch64*) host_machine_count=$((host_machine_count + 1)) ;;
+        *) die "aarch64 包混入其他架构: $path ($info)" ;;
+      esac
+      ;;
+    x86_64)
+      case "$info" in
+        *ELF*x86-64*) host_machine_count=$((host_machine_count + 1)) ;;
+        *) die "x86_64 包混入其他架构: $path ($info)" ;;
+      esac
+      ;;
   esac
 }
 
@@ -169,8 +180,17 @@ while IFS= read -r -d '' file_path; do
         if [ "$expected" = "noarch" ]; then
           die "noarch 包含机器码静态库: $rel ($member_arch)"
         fi
-        [ "$member_arch" = "aarch64" ] \
-          || die "aarch64 包的静态库混入其他架构: $rel ($member_arch)"
+        # aarch64 静态库成员的 objdump architecture 是 "aarch64"；x86_64 是 "i386:x86-64"。
+        case "$expected" in
+          aarch64)
+            [ "$member_arch" = "aarch64" ] \
+              || die "aarch64 包的静态库混入其他架构: $rel ($member_arch)"
+            ;;
+          x86_64)
+            [ "$member_arch" = "i386:x86-64" ] \
+              || die "x86_64 包的静态库混入其他架构: $rel ($member_arch)"
+            ;;
+        esac
         host_machine_count=$((host_machine_count + 1))
       done < <(printf '%s\n' "$archive_dump" \
         | awk '/^architecture:/ { sub(/^architecture:[[:space:]]*/, ""); sub(/,.*/, ""); print }')
@@ -178,9 +198,16 @@ while IFS= read -r -d '' file_path; do
   esac
 done < <(find "$extract" -type f -print0)
 
-if [ "$expected" = "aarch64" ] && [ "$host_machine_count" -eq 0 ]; then
-  die "aarch64 包内没有发现任何 AArch64 ELF 机器码: $artifact"
-fi
+case "$expected" in
+  aarch64)
+    [ "$host_machine_count" -gt 0 ] || \
+      die "aarch64 包内没有发现任何 AArch64 ELF 机器码: $artifact"
+    ;;
+  x86_64)
+    [ "$host_machine_count" -gt 0 ] || \
+      die "x86_64 包内没有发现任何 x86-64 ELF 机器码: $artifact"
+    ;;
+esac
 
 printf '架构检查通过: %s expected=%s machine_files=%s\n' \
   "$(basename "$artifact")" "$expected" "$machine_count"

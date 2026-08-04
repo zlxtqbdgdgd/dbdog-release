@@ -54,6 +54,107 @@ if agent_installer_contract_fingerprint "$FINGERPRINT_ROOT" >/dev/null 2>&1; the
 fi
 pass "Agent 专属安装逻辑使用独立内容指纹，且对缺失/符号链接 fail closed"
 
+# 后面 GaussDB 密码复杂度断言块（"错误接受了只有两类字符的密码"）是已知基线失败，
+# 命中即 fail() -> exit 1，会挡住它之后的全部断言。下面两组架构选择契约测试与
+# GaussDB fixture 无关，故意放在那条已知失败之前，确保正常执行 `bash
+# scripts/test-agent-install-contracts.sh` 时它们真的会被跑到，而不是变成只有绕过
+# 已知失败才能触达的死代码。
+INSTALL_SCRIPT="$SCRIPTS_DIR/agent-install.sh"
+
+# ---- require_root_host 不再硬编码 AArch64-only 主机拒绝，改用 host_arch 统一解析 ----
+REQUIRE_ROOT_HOST_BODY="$(awk '/^require_root_host\(\)/ { scan=1 } /^configure_agent_health_timeout\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+# shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
+grep -Fq 'AGENT_HOST_ARCH="$(host_arch)"' <<<"$REQUIRE_ROOT_HOST_BODY" || \
+  fail "require_root_host 没有调用 host_arch 并保存 AGENT_HOST_ARCH"
+if grep -Fq '产物仅支持 aarch64' <<<"$REQUIRE_ROOT_HOST_BODY"; then
+  fail "require_root_host 仍残留硬编码的 AArch64-only 主机拒绝"
+fi
+pass "require_root_host 改用 host_arch 统一解析主机架构，不再硬编码只接受 AArch64"
+
+# ---- Step 1 TDD：manifest 出现 dbdog-agent 的 aarch64/x86_64 双行时，按 host_arch
+# 精确选择要下载的产物；未知架构在触发任何下载前 fail closed。----
+ARCH_SELECT_ROOT="$TEST_ROOT/arch-select"
+mkdir -p "$ARCH_SELECT_ROOT"
+ARCH_MANIFEST="$ARCH_SELECT_ROOT/manifest.tsv"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  dbdog-agent first-party dbhost no 9.9.9-dbdog.1 \
+  dbdog-agent-9.9.9-dbdog.1-aarch64.tar.gz \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  agent:0000000,core:0000000 aarch64 \
+  >"$ARCH_MANIFEST"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  dbdog-agent first-party dbhost no 9.9.9-dbdog.1 \
+  dbdog-agent-9.9.9-dbdog.1-x86_64.tar.gz \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  agent:0000000,core:0000000 x86_64 \
+  >>"$ARCH_MANIFEST"
+
+run_arch_select() { # <DBDOG_HOST_ARCH_OVERRIDE> <输出文件>
+  local override="$1" out="$2"
+  # 复刻 main() 里选包并下载的三行 manifest_get + 一次 download_artifact；
+  # download_artifact 被替换为记录调用参数的桩，不发真实网络请求。require_root_host
+  # 的 root/systemd 前提在这个纯函数契约测试里无法满足，不在这里调用；它单独有上面
+  # 的静态断言覆盖。
+  MANIFEST="$ARCH_MANIFEST" DBDOG_HOST_ARCH_OVERRIDE="$override" \
+    bash -c '
+      source "$1"
+      trap - EXIT
+      download_artifact() {
+        # 调用方用 package="$(download_artifact ...)" 捕获 stdout 作为本地路径；
+        # 记录日志必须走 stderr，否则会被那次命令替换悄悄吞掉，测试看不到。
+        printf "download_artifact_called artifact=%s sha256=%s\n" "$1" "$2" >&2
+        printf "%s\n" "/nonexistent/$1"
+      }
+      version="$(manifest_get dbdog-agent 5)"
+      artifact="$(manifest_get dbdog-agent 6)"
+      sha256="$(manifest_get dbdog-agent 7)"
+      package="$(download_artifact "$artifact" "$sha256")"
+      printf "SELECTED_VERSION=%s\n" "$version"
+      printf "SELECTED_ARTIFACT=%s\n" "$artifact"
+    ' bash "$INSTALL_SCRIPT" >"$out" 2>&1
+}
+
+X86_64_OUT="$ARCH_SELECT_ROOT/x86_64.out"
+run_arch_select x86_64 "$X86_64_OUT" || { cat "$X86_64_OUT" >&2; fail "x86_64 主机的合法双架构选择被拒绝"; }
+grep -Fq 'SELECTED_ARTIFACT=dbdog-agent-9.9.9-dbdog.1-x86_64.tar.gz' "$X86_64_OUT" || \
+  fail "DBDOG_HOST_ARCH_OVERRIDE=x86_64 没有选中 x86_64 产物"
+grep -Fq 'download_artifact_called artifact=dbdog-agent-9.9.9-dbdog.1-x86_64.tar.gz' "$X86_64_OUT" || \
+  fail "DBDOG_HOST_ARCH_OVERRIDE=x86_64 没有只下载 *-x86_64.tar.gz"
+if grep -Fq 'aarch64.tar.gz' "$X86_64_OUT"; then
+  fail "DBDOG_HOST_ARCH_OVERRIDE=x86_64 错误地混入了 aarch64 产物"
+fi
+
+RISCV64_OUT="$ARCH_SELECT_ROOT/riscv64.out"
+if run_arch_select riscv64 "$RISCV64_OUT"; then
+  cat "$RISCV64_OUT" >&2
+  fail "DBDOG_HOST_ARCH_OVERRIDE=riscv64 错误地被接受"
+fi
+grep -Fq 'download_artifact_called' "$RISCV64_OUT" && \
+  fail "riscv64 未支持的架构在 fail closed 前触发了下载"
+grep -Fq '不支持的主机架构: riscv64' "$RISCV64_OUT" || \
+  fail "riscv64 没有给出清晰的 fail-closed 诊断信息"
+pass "manifest 双架构行按 DBDOG_HOST_ARCH_OVERRIDE/host_arch 精确选包下载，未知架构在下载前 fail closed"
+
+# ---- DBDOG_AGENT_PREFLIGHT_ONLY：只跑 artifact 门禁，必须在 cutover/配置之前返回 ----
+MAIN_BODY="$(awk '/^main\(\)/ { scan=1 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq 'DBDOG_AGENT_PREFLIGHT_ONLY' <<<"$MAIN_BODY" || \
+  fail "main() 没有识别 DBDOG_AGENT_PREFLIGHT_ONLY"
+grep -Fq 'agent_preflight_artifact_only' <<<"$MAIN_BODY" || \
+  fail "main() 没有调用 agent_preflight_artifact_only"
+PREFLIGHT_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'agent_preflight_artifact_only' | head -1 | cut -d: -f1)"
+CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^[[:space:]]*cutover$' | head -1 | cut -d: -f1)"
+[ -n "$PREFLIGHT_LINE" ] && [ -n "$CUTOVER_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$CUTOVER_LINE" ] || \
+  fail "PREFLIGHT_ONLY 路径没有排在 cutover 之前"
+PREFLIGHT_FN="$(awk '/^agent_preflight_artifact_only\(\)/ { scan=1 } /^main\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
+grep -Fq 'validate_archive_members' <<<"$PREFLIGHT_FN" || \
+  fail "preflight 没有校验 archive 成员"
+grep -Fq 'validate_runtime_tree' <<<"$PREFLIGHT_FN" || \
+  fail "preflight 没有校验 runtime/provenance/ELF/version"
+if grep -Eq 'cutover|resolve_inputs|render_install_state|bootstrap_gaussdb|start_and_verify' <<<"$PREFLIGHT_FN"; then
+  fail "preflight 函数错误地包含了会改配置/停服务的步骤"
+fi
+pass "DBDOG_AGENT_PREFLIGHT_ONLY 只做 artifact 门禁，且排在 cutover 之前"
+
 PROC="$TEST_ROOT/proc"
 PID=4242
 DATA="$TEST_ROOT/gauss/data"
@@ -1206,6 +1307,10 @@ run_version_contract() { # <validate|prepare>
       source "$1"
       trap - EXIT
       WORK_DIR="$2"
+      # require_root_host 在真实流程里调用 host_arch 并落 AGENT_HOST_ARCH；这里
+      # 只单独测 validate_runtime_tree/prepare_runtime，绕开 root/systemd 前提，
+      # 直接按 fixture 的 provenance architecture=aarch64 设定同一个全局。
+      AGENT_HOST_ARCH=aarch64
       case "$3" in
         validate) validate_runtime_tree "$AGENT_RUNTIME_DIR" "$4" ;;
         prepare)
@@ -1271,4 +1376,4 @@ PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
 pass "staging 与 SHA-skip 精确绑定版本身份，且 Agent version 只加载候选 runtime 私有库"
 
-printf 'ALL PASS: 23 agent install contract groups\n'
+printf 'ALL PASS: 25 agent install contract groups\n'

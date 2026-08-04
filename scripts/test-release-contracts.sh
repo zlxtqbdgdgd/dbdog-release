@@ -8,6 +8,28 @@ trap 'case "$TEST_ROOT" in "${TMPDIR:-/tmp}"/dbdog-release-contracts.*) rm -rf -
 
 DBDOG_HOME="$TEST_ROOT/home"
 RELEASE_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
+
+# manifest.tsv 早已是 v2（九列，含 arch，Task 2 迁移完成）；本文件只测升级顺序
+# 等与架构无关的合同，用本地九列 fixture 覆盖真实 manifest，不依赖仓库当前状态。
+# 全部登记为 noarch，跟运行测试的机器是什么 CPU 架构无关。
+manifest_fixture="$TEST_ROOT/manifest.tsv"
+manifest_row() { # manifest_row <module> <kind> <target> <service>
+  printf '%s\t%s\t%s\t%s\t1.0.0\t%s-1.0.0-noarch.tar.gz\t%s\t-\tnoarch\n' \
+    "$1" "$2" "$3" "$4" "$1" \
+    "0000000000000000000000000000000000000000000000000000000000000000"
+}
+{
+  manifest_row dbdog-server first-party stack yes
+  manifest_row dbdog-web first-party stack yes
+  manifest_row dbdog-mcp first-party stack yes
+  manifest_row clickhouse third-party stack yes
+  manifest_row goose third-party stack no
+  manifest_row node third-party stack no
+  manifest_row postgresql third-party stack yes
+} >"$manifest_fixture"
+unset -f manifest_row
+MANIFEST="$manifest_fixture"
+
 source "$SCRIPTS_DIR/lib.sh"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }

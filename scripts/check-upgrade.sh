@@ -30,41 +30,53 @@ fi
 
 updates=0
 agent_updates=0
+selected_arch="$(host_arch)"
 printf '%-14s %-12s %-12s %s\n' "模块" "已装" "manifest" "状态"
 printf '%s\n' "--------------------------------------------------------"
-while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source_sha; do
-  if [ "$target" = "dbhost" ]; then
+while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source_sha _arch; do
+  if [ "$m" = "dbdog-agent" ]; then
     # Agent 不使用 stack 的 current 软链，但仍由同一 manifest 判定版本和产物身份。
+    # 只有 dbdog-agent 自己读 Agent runtime marker——target=dbhost 不等于
+    # "是 Agent"：其它 dbhost 模块（如 ddprof）没有 Agent 的运行时/root cutover，
+    # 借用 Agent marker 会把它们的版本号错读成 Agent 的版本号，永远显示"版本不同"。
     inst="$(agent_marker_value "$AGENT_RUNTIME_DIR/.dbdog-release-version" "$AGENT_RUNTIME_DIR")"
     inst_sha256="$(agent_marker_value "$AGENT_RUNTIME_DIR/.dbdog-artifact-sha256" "$AGENT_RUNTIME_DIR")"
   else
+    # 其它 dbhost 模块（如 ddprof）和 stack 模块共用同一套已装状态源
+    # （MODULES_DIR/<模块>/current 软链 + marker）；没有专属安装机制接入这套约定
+    # 之前，installed_version/installed_artifact_sha256 对它们天然返回 "-"
+    # （未安装），不会误报"版本不同"。
     inst="$(installed_version "$m")"
     inst_sha256="$(installed_artifact_sha256 "$m")"
   fi
   if [ "$version" = "-" ]; then
     st="未发布"
   elif [ "$inst" = "-" ]; then
-    st="未安装（install.sh 或 upgrade.sh ${m}）"
+    if [ "$target" = "dbhost" ] && [ "$m" != "dbdog-agent" ]; then
+      st="未安装/由专属流程管理"
+    else
+      st="未安装（install.sh 或 upgrade.sh ${m}）"
+    fi
   elif [ "$inst" = "?" ]; then
     st="版本 marker 损坏 ←"
     updates=$((updates + 1))
-    [ "$target" != "dbhost" ] || agent_updates=$((agent_updates + 1))
+    [ "$m" != "dbdog-agent" ] || agent_updates=$((agent_updates + 1))
   elif [ "$inst" != "$version" ]; then
     st="版本不同 ←"
     updates=$((updates + 1))
-    [ "$target" != "dbhost" ] || agent_updates=$((agent_updates + 1))
+    [ "$m" != "dbdog-agent" ] || agent_updates=$((agent_updates + 1))
   elif [ "$inst_sha256" = "-" ]; then
     st="版本一致；产物身份未知 ←"
     updates=$((updates + 1))
-    [ "$target" != "dbhost" ] || agent_updates=$((agent_updates + 1))
+    [ "$m" != "dbdog-agent" ] || agent_updates=$((agent_updates + 1))
   elif [ "$inst_sha256" = "?" ]; then
     st="产物身份 marker 损坏 ←"
     updates=$((updates + 1))
-    [ "$target" != "dbhost" ] || agent_updates=$((agent_updates + 1))
+    [ "$m" != "dbdog-agent" ] || agent_updates=$((agent_updates + 1))
   elif [ "$inst_sha256" != "$sha256" ]; then
     st="版本一致；产物 SHA 不同 ←"
     updates=$((updates + 1))
-    [ "$target" != "dbhost" ] || agent_updates=$((agent_updates + 1))
+    [ "$m" != "dbdog-agent" ] || agent_updates=$((agent_updates + 1))
   elif [ "$m" = "dbdog-agent" ]; then
     # 运行时二进制可能没有换版，但 release 安装器会继续演进。只有版本和产物身份
     # 已完全一致后才比较独立合约 marker，让正常 upgrade 重跑配置与真实采集验收。
@@ -97,7 +109,7 @@ while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source
     st="一致"
   fi
   printf '%-14s %-12s %-12s %s\n' "$m" "$inst" "$version" "$st"
-done < <(manifest_rows)
+done < <(manifest_selected_rows "" "$selected_arch")
 
 echo
 if [ "$updates" -gt 0 ]; then
