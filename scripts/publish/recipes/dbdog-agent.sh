@@ -43,10 +43,10 @@ for input_name in MODULE VERSION SHA CORE_SHA ARCH; do
 done
 readonly MODULE VERSION SHA CORE_SHA ARCH
 
-readonly PINNED_AGENT_SHA=62ad29793b02139448b76bc85fc406491a08bf58
+readonly PINNED_AGENT_SHA=c5d999c88acbd18b6003a5dd247930d3e5e9fad0
 readonly SEALED_ORIGIN_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
 readonly PINNED_OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
-readonly PINNED_INTEGRATION_CORE_SHA=612be7bea397c87df707489599c02ed623c29631
+readonly PINNED_INTEGRATION_CORE_SHA=3ae431a0a707f8b57a705848f36b637aa5bddf4f
 readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly AGENT_REPO="$CACHE_ROOT/git/dbdog-agent.git"
 readonly CORE_REPO="$CACHE_ROOT/git/dbdog-agent-core.git"
@@ -61,12 +61,12 @@ readonly MANIFEST_REL="manifests/$SEALED_ORIGIN_AGENT_SHA-$PINNED_OMNIBUS_CORE_S
 readonly MANIFEST_DIR="$CACHE_ROOT/$MANIFEST_REL"
 readonly INPUTS_MANIFEST_SHA256=e050cda2067907527b5ff4d3991320d75a2cc8b1f68e078531c1b5fae502ef79
 readonly RUBY_CACHE_MANIFEST_SHA256=29539b716e760e178b3a11ce07256e39438dbb5f1008898590ce355eda823c45
-readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v14"
+readonly OVERLAY_REL="control-overlays/$PINNED_AGENT_SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-v15"
 readonly OVERLAY_DIR="$CACHE_ROOT/$OVERLAY_REL"
 readonly RUNNER="$OVERLAY_DIR/run-agent-omnibus.sh"
 readonly RUNNER_SHA256=6da7c38074a6c16a15a491a1358e8fc8c606bea1eaac81df10352e79737c8e4a
 readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe
-readonly CONTROL_INFO_SHA256=b5dcfa966d6ebe9bcb080c392b8544693ec3c3bf5c88e49275da7c093b427b50
+readonly CONTROL_INFO_SHA256=f6e34177d193aa4aaa69977fe6bb23d6dfec77785f6bc98586300bc41de434c3
 readonly CONTROL_MANIFEST_SHA256=359151228de51ed690c00caf6d22f42f8e7f0026d512e5c39962fc23f74c4e75
 # dependency seal 是在 v10 构建依赖闭包上生成的；v14 只校正显式版本输入，
 # 不重写也不冒充旧 seal 的控制元数据。
@@ -117,9 +117,9 @@ readonly FINALIZER_WRAPPER="$CACHE_ROOT/controls/run-finalize-agent-runtime-v3.s
 readonly FINALIZER_WRAPPER_SHA256=4b5fdce057bacca6dfde0d5352255cf8760ab57458aae29024dd2f917036ad77
 readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
 readonly GAUSSDB_INTEGRATION_VERSION=1.0.1
-readonly GAUSSDB_WHEEL_REL=sources/python/gaussdb/612be7bea397c87df707489599c02ed623c29631/datadog_gaussdb-1.0.1-py3-none-any.whl
+readonly GAUSSDB_WHEEL_REL=sources/python/gaussdb/3ae431a0a707f8b57a705848f36b637aa5bddf4f/datadog_gaussdb-1.0.1-py3-none-any.whl
 readonly GAUSSDB_WHEEL="$CACHE_ROOT/$GAUSSDB_WHEEL_REL"
-readonly GAUSSDB_WHEEL_SHA256=f696515133a97de9784b86c91324f2447f11022e7da90d823d3348a645c2208f
+readonly GAUSSDB_WHEEL_SHA256=7e31861e30da49f02f509accdecdb67e4df0ea978b69034df8d5c60c123565af
 readonly BUILDER_IDENTITY=kylin-v10-tercel-native-aarch64-v7
 readonly ARCHIVE_RECIPE=gnu_tar_sorted_fixed_mtime_root_owner_gzip_n_two_pass_delete_second_before_extract
 readonly PUBLICATION_RECIPE=destination_local_copy_verify_sync_hardlink_noreplace_archive_then_sidecar_recover_archive_only
