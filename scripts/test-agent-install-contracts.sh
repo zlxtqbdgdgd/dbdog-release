@@ -249,8 +249,10 @@ case ":${AGENT_GAUSS_PID_LD_LIBRARY_PATHS[0]}:" in
   *":$GAUSSHOME/lib/libsimsearch:"*) ;;
   *) fail "没有继承目标实例 libsimsearch 动态库目录" ;;
 esac
-[ "${AGENT_GAUSS_LOG_GLOBS[*]}" = "$GAUSSLOG/gs_log/*/gaussdb-*.log" ] || \
-  fail "没有从进程 GAUSSLOG 生成日志 glob"
+# 两种落盘布局各一条：多节点按节点名分子目录，集中式直接落 gs_log/ 下。
+# 只给带子目录那条会让集中式实例一条日志都采不到（2026-08-05 x86-gaussdb-73 实证）。
+[ "${AGENT_GAUSS_LOG_GLOBS[*]}" = "$GAUSSLOG/gs_log/*/gaussdb-*.log $GAUSSLOG/gs_log/gaussdb-*.log" ] || \
+  fail "没有为两种 gs_log 落盘布局各生成一条日志 glob"
 [ "$AGENT_GAUSS_DEPLOYMENT" = centralized ] || fail "单实例拓扑推断错误"
 [ "${AGENT_GAUSS_PID_SOURCE_PIDS[*]}" = "$PID" ] || \
   fail "fenced/backend/辅助进程被错误当作 GaussDB 主实例"

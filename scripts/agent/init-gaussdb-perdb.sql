@@ -4,7 +4,10 @@
 DO $$ BEGIN CREATE SCHEMA dbdog; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 GRANT USAGE ON SCHEMA dbdog TO dbdog;
 
-CREATE OR REPLACE FUNCTION dbdog.explain_statement(l_query text, OUT explain json)
+-- 业务 SQL 通常依赖默认 public，因此 canonical explain 入口必须放在 public：GaussDB 的
+-- SECURITY DEFINER 动态 SQL 按函数所属 schema 解析未限定表名，入口若只在 dbdog schema，
+-- 解释默认 public 下的业务 SQL 会失败。函数不向 PUBLIC 开放，只授权监控用户执行。
+CREATE OR REPLACE FUNCTION public.dbdog_explain_statement(l_query text, OUT explain json)
  RETURNS SETOF json
  LANGUAGE plpgsql
  STRICT SECURITY DEFINER
@@ -21,7 +24,58 @@ BEGIN
 END;
 $function$;
 
+REVOKE ALL ON FUNCTION public.dbdog_explain_statement(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.dbdog_explain_statement(text) TO dbdog;
+
+-- 旧配置兼容入口；实现只委托给 public 中的 canonical 函数，避免保留两份 explain 逻辑。
+CREATE OR REPLACE FUNCTION dbdog.explain_statement(l_query text, OUT explain json)
+ RETURNS SETOF json
+ LANGUAGE plpgsql
+ STRICT SECURITY DEFINER
+AS $function$
+BEGIN
+  RETURN QUERY SELECT plan.explain
+  FROM public.dbdog_explain_statement(l_query) AS plan;
+END;
+$function$;
+
+REVOKE ALL ON FUNCTION dbdog.explain_statement(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION dbdog.explain_statement(text) TO dbdog;
+
+-- 列统计采集入口（SECURITY DEFINER：pg_stats 按 has_column_privilege 过滤行，dbdog 无业务表
+-- SELECT 权限会读到空集，故借函数属主身份读取）。integration 的 collect_column_statistics
+-- 默认调 datadog.column_statistics()，dbdog 命名下必须在 conf.yaml 显式配 function_name。
+CREATE OR REPLACE FUNCTION dbdog.column_statistics()
+RETURNS TABLE (
+  schemaname name,
+  tablename name,
+  attname name,
+  n_distinct real,
+  avg_width integer,
+  null_frac real,
+  inherited boolean,
+  correlation real,
+  most_common_freqs real[]
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+  SELECT schemaname,
+         tablename,
+         attname,
+         n_distinct,
+         avg_width,
+         null_frac,
+         inherited,
+         correlation,
+         most_common_freqs
+    FROM pg_catalog.pg_stats
+   WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+$function$;
+
+REVOKE ALL ON FUNCTION dbdog.column_statistics() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION dbdog.column_statistics() TO dbdog;
 
 -- GaussDB 无 pg_stat_statements；integration 的默认 view 指向本兼容视图。
 CREATE OR REPLACE VIEW dbdog.statements AS

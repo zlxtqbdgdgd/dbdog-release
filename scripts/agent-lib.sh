@@ -632,7 +632,13 @@ agent_detect_gaussdb() {
       AGENT_GAUSS_PID_SOURCE_PIDS+=("$pid")
     fi
 
-    [ -n "$env_log" ] && agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/*/gaussdb-*.log"
+    # 两种落盘布局都要覆盖：多节点部署按节点名分子目录（gs_log/dn_6002/），集中式单节点
+    # 直接落在 gs_log/ 下（2026-08-05 x86-gaussdb-73 实证）。tailer 对匹配不到的 glob 静默
+    # 跳过，多给一条无副作用；只给带子目录那条会让集中式实例一条日志都采不到。
+    if [ -n "$env_log" ]; then
+      agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/*/gaussdb-*.log"
+      agent_add_unique AGENT_GAUSS_LOG_GLOBS "$env_log/gs_log/gaussdb-*.log"
+    fi
   done
 
   [ "${#AGENT_GAUSS_PID_PORTS[@]}" -gt 0 ] || \
@@ -903,16 +909,33 @@ EOF
       - templatem
     relations:
       - relation_regex: .*
+    query_samples:
+      enabled: true
+      # canonical explain 入口在 public：GaussDB 的 SECURITY DEFINER 动态 SQL 按函数所属
+      # schema 解析未限定表名，入口只在 dbdog schema 时解释不了 public 下的业务 SQL。
+      explain_function: public.dbdog_explain_statement
     collect_schemas:
       enabled: true
       collection_interval: 30
       max_tables: 300
       max_columns: 50
+    # 上游默认调 datadog.column_statistics()；dbdog 命名下必须显式指向，否则报
+    # schema "datadog" does not exist（2026-08-05 x86-gaussdb-73 实证）。
+    collect_column_statistics:
+      enabled: true
+      collection_interval: 300
+      function_name: dbdog.column_statistics()
     collect_settings:
       enabled: true
       collection_interval: 30
     collect_database_size_metrics: true
     collect_activity_metrics: true
+    # GaussDB 对外报 PG 9.2 兼容版本但实际提供 pg_ls_waldir()；buffercache 走内核内置的
+    # pg_buffercache_pages()，不需要装扩展。
+    collect_wal_metrics: true
+    collect_bloat_metrics: true
+    collect_function_metrics: true
+    collect_buffercache_metrics: true
     data_observability:
       enabled: false
     tags:
@@ -927,6 +950,12 @@ EOF
     path: $(agent_yaml_quote "$glob")
     source: gaussdb
     service: gaussdb
+    # logs stanza 的 tags 与 instances 的 tags 是**两个作用域**，日志不继承 instance tag。
+    # 不写这块的后果：日志事件 env 为空——env 是 dd.logs 官方 7 列之一，env:<环境> 筛选会整个
+    # 漏掉本引擎（2026-08-04 box34 openGauss 实证）。
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      - dbm_source:gaussdb_logs
     log_processing_rules:
       - type: multi_line
         name: new_log_start_with_date
