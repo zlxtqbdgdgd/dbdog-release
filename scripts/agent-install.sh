@@ -661,6 +661,24 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
   done
 }
 
+# 安装器只负责「装机当时存在的库」；此后每次 CREATE DATABASE 都要由 DBA 重跑每库初始化。
+# 把批量脚本和它用的 SQL 一起落到 runtime 树下的固定路径，控制台「采集配置」页就能给出
+# 绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts DB_INIT_SCRIPT_DIR），
+# 研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
+install_dbm_init_scripts() {
+  local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent"
+  local script=init-dbdog-user-gaussdb-all-databases.sh sql=init-gaussdb-perdb.sql
+  [ -f "$source/$script" ] || die "缺少每库 DBM 初始化脚本: $source/$script"
+  [ -f "$source/$sql" ] || die "缺少 GaussDB 每库对象 SQL: $source/$sql"
+  install -d -o root -g root -m 0755 "$target" || die "无法创建每库初始化工具目录: $target"
+  # DBA 用数据库 OS 账号（非 root）执行，故给 a+rx / a+r。
+  install -o root -g root -m 0755 "$source/$script" "$target/$script" || \
+    die "无法安装每库 DBM 初始化脚本: $target/$script"
+  install -o root -g root -m 0444 "$source/$sql" "$target/$sql" || \
+    die "无法安装 GaussDB 每库对象 SQL: $target/$sql"
+  log "每库 DBM 初始化工具已就位: $target/$script（新增库后用数据库 OS 账号执行 --all）"
+}
+
 bootstrap_gaussdb_monitoring() {
   local sql="$SCRIPT_DIR/agent/init-gaussdb-perdb.sql" index count
   [ -f "$sql" ] || die "缺少 GaussDB 兼容对象 SQL: $sql"
@@ -1519,6 +1537,7 @@ main() {
   preflight_gaussdb_clients
   render_install_state
   cutover
+  install_dbm_init_scripts
   bootstrap_gaussdb_monitoring
   start_and_verify
 

@@ -26,6 +26,7 @@ printf 'shared-lib-v1\n' >"$FINGERPRINT_ROOT/lib.sh"
 printf 'install-v1\n' >"$FINGERPRINT_ROOT/agent-install.sh"
 printf 'lib-v1\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
 printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
+printf 'perdb-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-all-databases.sh"
 FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
   fail "无法计算安装器合约指纹"
 [ "${#FINGERPRINT_1}" -eq 64 ] || fail "安装器合约指纹不是 SHA-256"
@@ -1192,6 +1193,27 @@ grep -Fq 'CREATE OR REPLACE VIEW dbdog.statements' \
   "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB query metrics 兼容视图"
 grep -Fq 'CREATE OR REPLACE VIEW dbdog.activity' \
   "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB activity 兼容视图"
+
+# 每库初始化工具必须随包落到 DB 主机固定路径：控制台「采集配置」页按该绝对路径给命令，
+# 路径/文件名一变，页面上的命令就指向不存在的文件（dbdog-web DB_INIT_SCRIPT_DIR）。
+PERDB_TOOL="$SCRIPTS_DIR/agent/init-dbdog-user-gaussdb-all-databases.sh"
+[ -f "$PERDB_TOOL" ] || fail "发布包缺少每库 DBM 初始化脚本"
+[ -x "$PERDB_TOOL" ] || fail "每库 DBM 初始化脚本不可执行"
+grep -Fq 'PERDB_SQL=${GAUSSDB_PERDB_SQL:-$SCRIPT_DIR/init-gaussdb-perdb.sql}' "$PERDB_TOOL" || \
+  fail "每库初始化脚本默认没有指向随包同目录的 GaussDB 每库 SQL"
+grep -Fq "nspname = 'public' AND p.proname = 'dbdog_explain_statement'" "$PERDB_TOOL" || \
+  fail "每库初始化脚本的验收没有检查 GaussDB 的 public explain 入口"
+grep -Fq 'install_dbm_init_scripts' "$SCRIPTS_DIR/agent-install.sh" || \
+  fail "安装器没有安装每库 DBM 初始化工具"
+grep -Fq 'local target="$AGENT_RUNTIME_DIR/scripts"' "$SCRIPTS_DIR/agent-install.sh" || \
+  fail "每库初始化工具没有落到 runtime 树下的 scripts 目录"
+awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
+  | grep -Fq 'install_dbm_init_scripts' || \
+  fail "安装主流程没有调用 install_dbm_init_scripts"
+awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
+  | grep -n 'cutover\|install_dbm_init_scripts' \
+  | awk -F: 'NR==1 && $2 !~ /cutover/ { exit 1 }' || \
+  fail "每库初始化工具必须在 cutover 之后安装（整树替换会覆盖）"
 CURRENT_AGENT_ARTIFACT="$(manifest_get dbdog-agent 6)"
 CURRENT_AGENT_VERSION="$(manifest_get dbdog-agent 5)"
 if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then
