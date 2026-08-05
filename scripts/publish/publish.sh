@@ -775,8 +775,7 @@ publish_arches_for_module() { # publish_arches_for_module <module> → 该模块
 }
 
 resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RESOLVED_RECIPE
-  # 存在 recipes/<module>-<arch>.sh 时精确选择该架构专属配方（目前只有
-  # dbdog-agent 拆分出 x86_64 配方，见 recipes/dbdog-agent-x86_64.sh），否则回退
+  # 存在 recipes/<module>-<arch>.sh 时精确选择该架构专属配方，否则回退
   # 到共享的 recipes/<module>.sh。其余模块的架构差异（如 ddprof）在同一份配方
   # 内部用 ARCH 分支处理，没有拆分文件，也就没有对应的 <module>-<arch>.sh，
   # 天然落进回退分支。
@@ -873,8 +872,8 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
   if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
     # aarch64 Agent 的受封存配方、root finalizer 与 dependency seal 共同钉死这个
     # build attempt；它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的
-    # 路径/owner/mode 门禁。x86_64 Agent 配方（recipes/dbdog-agent-x86_64.sh）
-    # 没有这段历史包袱，和其它一方模块一样落在通用 BUILD_WORK/<module>/out 下。
+    # 路径/owner/mode 门禁。（曾并存过一份 x86_64 Agent 配方，按「GitHub 只出 arm」
+    # 的决定于 2026-08-05 删除；未来若有别的架构配方，同样落在通用 BUILD_WORK 下。）
     expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"

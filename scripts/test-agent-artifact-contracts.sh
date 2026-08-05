@@ -312,10 +312,9 @@ grep -Fq 'require_exact_field "$build_info" integrations_core_git_sha "$PINNED_I
   "$RECIPE" || fail "canonical artifact verifier lost the integration core provenance gate"
 pass "canonical tarball verifier rechecks integration and split-core provenance"
 
-# Task 6 taught publish.sh to select recipes/dbdog-agent-x86_64.sh precisely for
-# dbdog-agent/x86_64 and to confine the aarch64 sealed attempt path to arch=aarch64.
-# Guard both edges of that refactor: the aarch64 sealed path constant must survive
-# byte-for-byte, and it must not silently start applying to other architectures.
+# publish.sh 按 arch 选配方，并把 aarch64 的受封存 attempt 路径限定在 arch=aarch64。
+# x86_64 专属配方已于 2026-08-05 删除（GitHub 只出 arm），但这两条边界仍要守：
+# aarch64 sealed 路径常量必须逐字节存活，且不得悄悄套用到其它架构上。
 PUBLISH_SH="$SCRIPTS_DIR/publish/publish.sh"
 bash -n "$PUBLISH_SH"
 grep -Fq 'resolve_module_recipe "$m" "$arch"' "$PUBLISH_SH" ||
