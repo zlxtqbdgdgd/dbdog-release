@@ -874,7 +874,7 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
     # build attempt；它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的
     # 路径/owner/mode 门禁。（曾并存过一份 x86_64 Agent 配方，按「GitHub 只出 arm」
     # 的决定于 2026-08-05 删除；未来若有别的架构配方，同样落在通用 BUILD_WORK 下。）
-    expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"
+    expected_rpath="/home/dbdog/work/dbdog-agent-c5d999c8-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
   fi
