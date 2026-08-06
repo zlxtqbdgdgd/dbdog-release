@@ -58,7 +58,10 @@ agent_sha256_stdin() {
 agent_installer_contract_fingerprint() { # <scripts 目录>；覆盖 Agent 专属脚本及其共享 shell 运行库
   local scripts="$1" relative path digest payload=""
   for relative in lib.sh agent-install.sh agent-lib.sh agent/init-gaussdb-perdb.sql \
-    agent/init-dbdog-user-gaussdb-all-databases.sh; do
+    agent/init-dbdog-user-gaussdb-all-databases.sh \
+    agent/init-dbdog-user-pg-all-databases.sh agent/init-dbdog-user-pg-perdb.sql \
+    agent/init-dbdog-user-opengauss-all-databases.sh \
+    agent/init-dbdog-user-opengauss-perdb.sql; do
     path="$scripts/$relative"
     if [ ! -e "$path" ] && [ ! -L "$path" ]; then
       printf 'Agent 安装器合约缺少文件: %s\n' "$path" >&2

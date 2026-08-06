@@ -27,6 +27,10 @@ printf 'install-v1\n' >"$FINGERPRINT_ROOT/agent-install.sh"
 printf 'lib-v1\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
 printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
 printf 'perdb-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-all-databases.sh"
+printf 'pg-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-all-databases.sh"
+printf 'pg-sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-perdb.sql"
+printf 'og-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-opengauss-all-databases.sh"
+printf 'og-sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-opengauss-perdb.sql"
 FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
   fail "无法计算安装器合约指纹"
 [ "${#FINGERPRINT_1}" -eq 64 ] || fail "安装器合约指纹不是 SHA-256"
@@ -575,7 +579,9 @@ CUTOVER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  cutover$' | head -1 | c
 BOOTSTRAP_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'bootstrap_gaussdb_monitoring' | head -1 | cut -d: -f1)"
 VERIFY_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n '^  start_and_verify$' | head -1 | cut -d: -f1)"
 CONTRACT_MARKER_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'write_installer_contract_marker' | head -1 | cut -d: -f1)"
-SUCCESS_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'INSTALL_SUCCEEDED=1' | head -1 | cut -d: -f1)"
+# 取最后一处：DBDOG_AGENT_PREFLIGHT_ONLY 是 cutover 之前就返回的只读门禁分支，它自己那句
+# INSTALL_SUCCEEDED=1 不是安装事务的提交点，拿 head -1 会把它误当成提交点。
+SUCCESS_LINE="$(printf '%s\n' "$MAIN_BODY" | grep -n 'INSTALL_SUCCEEDED=1' | tail -1 | cut -d: -f1)"
 [ "$PREFLIGHT_LINE" -lt "$CUTOVER_LINE" ] && [ "$CUTOVER_LINE" -lt "$BOOTSTRAP_LINE" ] || \
   fail "gsql 精确预检没有发生在文件/数据库 mutation 之前"
 [ "$VERIFY_LINE" -lt "$CONTRACT_MARKER_LINE" ] && [ "$CONTRACT_MARKER_LINE" -lt "$SUCCESS_LINE" ] || \
@@ -1196,13 +1202,35 @@ grep -Fq 'CREATE OR REPLACE VIEW dbdog.activity' \
 
 # 每库初始化工具必须随包落到 DB 主机固定路径：控制台「采集配置」页按该绝对路径给命令，
 # 路径/文件名一变，页面上的命令就指向不存在的文件（dbdog-web DB_INIT_SCRIPT_DIR）。
-PERDB_TOOL="$SCRIPTS_DIR/agent/init-dbdog-user-gaussdb-all-databases.sh"
-[ -f "$PERDB_TOOL" ] || fail "发布包缺少每库 DBM 初始化脚本"
-[ -x "$PERDB_TOOL" ] || fail "每库 DBM 初始化脚本不可执行"
-grep -Fq 'PERDB_SQL=${GAUSSDB_PERDB_SQL:-$SCRIPT_DIR/init-gaussdb-perdb.sql}' "$PERDB_TOOL" || \
-  fail "每库初始化脚本默认没有指向随包同目录的 GaussDB 每库 SQL"
-grep -Fq "nspname = 'public' AND p.proname = 'dbdog_explain_statement'" "$PERDB_TOOL" || \
-  fail "每库初始化脚本的验收没有检查 GaussDB 的 public explain 入口"
+for engine_assets in \
+  'gaussdb:init-dbdog-user-gaussdb-all-databases.sh:init-gaussdb-perdb.sql:GAUSSDB' \
+  'pg:init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:PG' \
+  'opengauss:init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:OPENGAUSS'; do
+  IFS=: read -r ENGINE PERDB_TOOL_NAME PERDB_SQL_NAME ENGINE_ENV <<<"$engine_assets"
+  PERDB_TOOL="$SCRIPTS_DIR/agent/$PERDB_TOOL_NAME"
+  [ -f "$PERDB_TOOL" ] || fail "发布包缺少 $ENGINE 每库 DBM 初始化脚本"
+  [ -x "$PERDB_TOOL" ] || fail "$ENGINE 每库 DBM 初始化脚本不可执行"
+  [ -f "$SCRIPTS_DIR/agent/$PERDB_SQL_NAME" ] || fail "发布包缺少 $ENGINE 每库对象 SQL"
+  grep -Fq "PERDB_SQL=\${${ENGINE_ENV}_PERDB_SQL:-\$SCRIPT_DIR/$PERDB_SQL_NAME}" "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本默认没有指向随包同目录的每库 SQL"
+  grep -Fq "/opt/dbdog-agent/scripts/$PERDB_TOOL_NAME" "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本的 usage 没有给出落盘绝对路径"
+  grep -Fq -e '--check' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少只读验收开关"
+  grep -Fq -e '--exclude' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少跳过指定库的开关"
+  grep -Fq "$PERDB_TOOL_NAME:$PERDB_SQL_NAME" "$SCRIPTS_DIR/agent-install.sh" || \
+    fail "安装器没有把 $ENGINE 那套列进随包安装清单"
+done
+# GaussDB/openGauss 的 canonical explain 入口在 public（SECURITY DEFINER 按函数所属 schema
+# 解析未限定表名）；PostgreSQL 在 dbdog schema。验收断言必须各按各的，不许折叠。
+grep -Fq "nspname = 'public' AND p.proname = 'dbdog_explain_statement'" \
+  "$SCRIPTS_DIR/agent/init-dbdog-user-gaussdb-all-databases.sh" || \
+  fail "GaussDB 每库初始化脚本的验收没有检查 public explain 入口"
+grep -Fq "nspname = 'public' AND p.proname = 'dbdog_explain_statement'" \
+  "$SCRIPTS_DIR/agent/init-dbdog-user-opengauss-all-databases.sh" || \
+  fail "openGauss 每库初始化脚本的验收没有检查 public explain 入口"
+grep -Fq "nspname = 'dbdog' AND p.proname = 'explain_statement'" \
+  "$SCRIPTS_DIR/agent/init-dbdog-user-pg-all-databases.sh" || \
+  fail "PostgreSQL 每库初始化脚本的验收没有检查 dbdog schema 的 explain 入口"
 grep -Fq 'install_dbm_init_scripts' "$SCRIPTS_DIR/agent-install.sh" || \
   fail "安装器没有安装每库 DBM 初始化工具"
 grep -Fq 'local target="$AGENT_RUNTIME_DIR/scripts"' "$SCRIPTS_DIR/agent-install.sh" || \
@@ -1214,6 +1242,25 @@ awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
   | grep -n 'cutover\|install_dbm_init_scripts' \
   | awk -F: 'NR==1 && $2 !~ /cutover/ { exit 1 }' || \
   fail "每库初始化工具必须在 cutover 之后安装（整树替换会覆盖）"
+
+# per-db SQL 的源在 dbdog-agent（那边的 docker harness sandbox-test.sh 和 wire 契约测试直接
+# 消费），本仓存的是随包镜像。镜像与源必须逐字节一致，否则「DB 主机上跑的 DDL」会和研发仓
+# 里改的那份悄悄分家——GaussDB 那对已经这样漂过（见下面登记的例外）。
+DEPLOY_SCRIPTS="$RELEASE_DIR/../dbdog-agent/dbdog-deploy/scripts"
+if [ -d "$DEPLOY_SCRIPTS" ]; then
+  for mirrored in init-dbdog-user-pg-perdb.sql init-dbdog-user-opengauss-perdb.sql; do
+    [ -f "$DEPLOY_SCRIPTS/$mirrored" ] || fail "dbdog-agent 侧缺少每库 SQL 源: $mirrored"
+    cmp -s "$DEPLOY_SCRIPTS/$mirrored" "$SCRIPTS_DIR/agent/$mirrored" || \
+      fail "随包镜像与 dbdog-agent 源不一致: $mirrored（改了源就要同步本仓镜像）"
+  done
+  # 登记的已知例外：init-gaussdb-perdb.sql 与 dbdog-agent 的
+  # init-dbdog-user-gaussdb-perdb.sql 已漂移（本仓仍建 statements/activity 兼容视图、缺
+  # GRANT USAGE ON SCHEMA public）。合并方向取决于现网 runtime 是否已含内联 collector，
+  # 未实证前不动；本行即差异登记，收敛后一并纳入上面的逐字节校验。
+  pass "每库 SQL 随包镜像与 dbdog-agent 源逐字节一致（GaussDB 那对为已登记的待收敛差异）"
+else
+  printf 'NOTE: 未检出兄弟目录 dbdog-agent，跳过每库 SQL 镜像一致性校验\n' >&2
+fi
 CURRENT_AGENT_ARTIFACT="$(manifest_get dbdog-agent 6)"
 CURRENT_AGENT_VERSION="$(manifest_get dbdog-agent 5)"
 if [ -f "$RELEASE_DIR/scratch/$CURRENT_AGENT_ARTIFACT" ]; then

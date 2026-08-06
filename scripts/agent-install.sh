@@ -665,18 +665,31 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
 # 把批量脚本和它用的 SQL 一起落到 runtime 树下的固定路径，控制台「采集配置」页就能给出
 # 绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts DB_INIT_SCRIPT_DIR），
 # 研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
+#
+# 三引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
+# 会让 PostgreSQL/openGauss 实例的页面指向不存在的文件。多出的两套是惰性文本，无服务加载。
+AGENT_DBM_INIT_ASSETS="\
+init-dbdog-user-gaussdb-all-databases.sh:init-gaussdb-perdb.sql
+init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql
+init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql"
+
 install_dbm_init_scripts() {
-  local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent"
-  local script=init-dbdog-user-gaussdb-all-databases.sh sql=init-gaussdb-perdb.sql
-  [ -f "$source/$script" ] || die "缺少每库 DBM 初始化脚本: $source/$script"
-  [ -f "$source/$sql" ] || die "缺少 GaussDB 每库对象 SQL: $source/$sql"
+  local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent" entry script sql count=0
   install -d -o root -g root -m 0755 "$target" || die "无法创建每库初始化工具目录: $target"
-  # DBA 用数据库 OS 账号（非 root）执行，故给 a+rx / a+r。
-  install -o root -g root -m 0755 "$source/$script" "$target/$script" || \
-    die "无法安装每库 DBM 初始化脚本: $target/$script"
-  install -o root -g root -m 0444 "$source/$sql" "$target/$sql" || \
-    die "无法安装 GaussDB 每库对象 SQL: $target/$sql"
-  log "每库 DBM 初始化工具已就位: $target/$script（新增库后用数据库 OS 账号执行 --all）"
+  while IFS= read -r entry; do
+    script="${entry%%:*}"
+    sql="${entry##*:}"
+    [ -f "$source/$script" ] || die "缺少每库 DBM 初始化脚本: $source/$script"
+    [ -f "$source/$sql" ] || die "缺少每库 DBM 对象 SQL: $source/$sql"
+    # DBA 用数据库 OS 账号（非 root）执行，故给 a+rx / a+r。
+    install -o root -g root -m 0755 "$source/$script" "$target/$script" || \
+      die "无法安装每库 DBM 初始化脚本: $target/$script"
+    install -o root -g root -m 0444 "$source/$sql" "$target/$sql" || \
+      die "无法安装每库 DBM 对象 SQL: $target/$sql"
+    count=$((count + 1))
+  done <<<"$AGENT_DBM_INIT_ASSETS"
+  [ "$count" -eq 3 ] || die "每库 DBM 初始化工具数量异常: $count"
+  log "每库 DBM 初始化工具已就位: $target（新增库后用数据库 OS 账号跑对应引擎的 --all）"
 }
 
 bootstrap_gaussdb_monitoring() {
