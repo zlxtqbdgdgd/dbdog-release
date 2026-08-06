@@ -1447,4 +1447,53 @@ PREPARE_BODY="$(awk '/^prepare_runtime\(\)/ { scan=1 } /^render_install_state\(\
   fail "staging 与 SHA-skip 没有共用两次 runtime 版本校验入口"
 pass "staging 与 SHA-skip 精确绑定版本身份，且 Agent version 只加载候选 runtime 私有库"
 
+# ---- GaussDB 采集质量 GUC 的 warn 校验 ----
+# 这两条只影响采集质量、不影响能否装成，所以必须 warn 而不是 die：装不上是硬失败，采不全
+# 可以先上线再让 DBA 调。log_line_prefix 尤其隐蔽——不符时 Agent 侧一切正常，只有日志检索里
+# 悄悄没有字段，本轮就是靠实例上抓到的两种前缀混用才定位到。
+GUC_PROBE="$TEST_ROOT/guc-probe.sh"
+{
+  printf '%s\n' 'warn() { printf "WARN: %s\n" "$*" >&2; }'
+  sed -n '/^readonly AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX=/p' "$SCRIPTS_DIR/agent-install.sh"
+  sed -n '/^readonly AGENT_GAUSSDB_MIN_TRACK_ACTIVITY_QUERY_SIZE=/p' "$SCRIPTS_DIR/agent-install.sh"
+  printf '%s\n' 'FAKE_PREFIX="" FAKE_SIZE=""'
+  printf '%s\n' 'agent_show_guc_raw() { case "$2" in log_line_prefix) printf "%s" "$FAKE_PREFIX";; track_activity_query_size) printf "%s" "$FAKE_SIZE";; esac; }'
+  printf '%s\n' 'agent_show_guc() { local v; v="$(agent_show_guc_raw "$@")"; printf "%s" "${v#"${v%%[![:space:]]*}"}" | sed "s/[[:space:]]*$//"; }'
+  sed -n '/^agent_warn_gaussdb_collection_gucs()/,/^}/p' "$SCRIPTS_DIR/agent-install.sh"
+  printf '%s\n' 'FAKE_PREFIX="$1" FAKE_SIZE="$2"; agent_warn_gaussdb_collection_gucs 0'
+} >"$GUC_PROBE"
+
+guc_warns() { bash "$GUC_PROBE" "$1" "$2" 2>&1; }
+
+# 目标实例（146.56.217.73）的真实取值不得触发任何告警——误报会让真问题淹没在噪声里。
+[ -z "$(guc_warns '%m %n %u %d %h %p %S %x %a ' 16384)" ] ||
+  fail "GaussDB 真实合规取值被误报为不合规: $(guc_warns '%m %n %u %d %h %p %S %x %a ' 16384)"
+# 结尾空格是 %a 与 query_id 的分隔符，属于取值的一部分，不得被 trim 掉。
+case "$(guc_warns '%m %n %u %d %h %p %S %x %a' 16384)" in
+  *'log_line_prefix 与 dbdog 解析契约不一致'*) ;;
+  *) fail "log_line_prefix 缺少结尾空格时未告警（读取路径可能把它 trim 掉了）" ;;
+esac
+# openGauss 的前缀套到 GaussDB 上正是本轮定位到的整条失配成因。
+case "$(guc_warns '%m %u %d %h %p %S ' 16384)" in
+  *'log_line_prefix 与 dbdog 解析契约不一致'*) ;;
+  *) fail "openGauss 前缀用在 GaussDB 上时未告警" ;;
+esac
+case "$(guc_warns '%m %n %u %d %h %p %S %x %a ' 1024)" in
+  *'track_activity_query_size=1024 低于推荐值 4096'*) ;;
+  *) fail "track_activity_query_size 低于 4096 时未告警" ;;
+esac
+[ -z "$(guc_warns '%m %n %u %d %h %p %S %x %a ' 4096)" ] ||
+  fail "track_activity_query_size 恰为推荐值时不应告警"
+case "$(guc_warns '' '')" in
+  *'无法读取 log_line_prefix'*) ;;
+  *) fail "读不到 log_line_prefix 时未告警" ;;
+esac
+# 这两条永远不能升级成 die：安装器要能在 GUC 不理想时照常装完。
+grep -q 'agent_warn_gaussdb_collection_gucs "$index"' "$SCRIPTS_DIR/agent-install.sh" ||
+  fail "预检未调用 GaussDB 采集质量 GUC 校验"
+if sed -n '/^agent_warn_gaussdb_collection_gucs()/,/^}/p' "$SCRIPTS_DIR/agent-install.sh" | grep -q '\bdie\b'; then
+  fail "采集质量 GUC 校验不得 die；它只应 warn"
+fi
+pass "GaussDB 采集质量 GUC 以 warn 方式校验，且真实合规取值不误报"
+
 printf 'ALL PASS: 25 agent install contract groups\n'

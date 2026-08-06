@@ -490,7 +490,59 @@ preflight_gaussdb_clients() {
         ;;
       *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
     esac
+
+    agent_warn_gaussdb_collection_gucs "$index"
   done
+}
+
+# 只影响采集质量、不影响能否装成的 GUC 一律 warn，不 die：装不上是硬失败，采不全可以先上线
+# 再让 DBA 调。安装器保持只读，不改 postgresql.conf（与上面几条硬门禁同一口径）。
+readonly AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX='%m %n %u %d %h %p %S %x %a '
+readonly AGENT_GAUSSDB_MIN_TRACK_ACTIVITY_QUERY_SIZE=4096
+
+# agent_gsql 已带 -A -t（无对齐、纯元组），输出没有前导填充。log_line_prefix 的结尾空格是
+# %a 与 query_id 的分隔符、属于取值的一部分，所以这里只去掉行尾 CR，绝不 trim 空格——
+# 把它 trim 掉会让任何正确配置都被判成不符。命令替换只吃掉换行，空格得以保留。
+agent_show_guc_raw() { # <进程索引> <GUC 名>；读不到时输出空串而不是失败
+  local index=$1 name=$2
+  agent_gsql "$index" -c "SHOW ${name};" 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+agent_show_guc() { # <进程索引> <GUC 名>；去首尾空白，供数值类 GUC 使用
+  local value
+  value="$(agent_show_guc_raw "$@")"
+  printf '%s' "${value#"${value%%[![:space:]]*}"}" | sed 's/[[:space:]]*$//'
+}
+
+agent_warn_gaussdb_collection_gucs() { # <进程索引>
+  local index=$1 prefix size
+
+  # log_line_prefix 决定 gs_log 能否被 dbdog-server 的 GaussDB grok 切开。前缀不符时整条失配、
+  # 落 fallback：没有 attribute、没有 db.date、时间戳退化成采集时间、级别一律 info，ERROR/FATAL
+  # 在日志检索里根本看不见——而 Agent 侧看起来一切正常，很难从现象反推到这里。
+  prefix="$(agent_show_guc_raw "$index" log_line_prefix)"
+  if [ -z "$prefix" ]; then
+    warn "无法读取 log_line_prefix（实例索引 ${index}）；gs_log 能否被正确解析未经确认"
+  elif [ "$prefix" != "$AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX" ]; then
+    warn "GaussDB log_line_prefix 与 dbdog 解析契约不一致（实例索引 ${index}）：当前 '${prefix}'，期望 '${AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX}'。指标与 DBM 采集不受影响，但 gs_log 会整条解析失败：日志检索里拿不到数据库/用户/级别等字段，ERROR/FATAL 也不会被识别。请 DBA 按数据库规范修改 postgresql.conf 并重新加载；dbdog 安装器不修改它。"
+  fi
+
+  # track_activity_query_size 决定 pg_stat_activity 里 SQL 正文的截断长度，直接影响 DBM 语句
+  # 采样能看到多少内容。推荐值 4096 与 agent-core 的 GaussDB 集成同一口径。
+  size="$(agent_show_guc "$index" track_activity_query_size)"
+  case "$size" in
+    '')
+      warn "无法读取 track_activity_query_size（实例索引 ${index}）；DBM 语句采样的截断长度未经确认"
+      ;;
+    *[!0-9]*)
+      warn "track_activity_query_size 取值无法解析为字节数（实例索引 ${index}）：'${size}'"
+      ;;
+    *)
+      if [ "$size" -lt "$AGENT_GAUSSDB_MIN_TRACK_ACTIVITY_QUERY_SIZE" ]; then
+        warn "GaussDB track_activity_query_size=${size} 低于推荐值 ${AGENT_GAUSSDB_MIN_TRACK_ACTIVITY_QUERY_SIZE}（实例索引 ${index}）：超过该长度的 SQL 正文会在 pg_stat_activity 里被截断，DBM 语句采样只能看到前半截。请 DBA 按数据库规范调高并重启生效；dbdog 安装器不修改它。"
+      fi
+      ;;
+  esac
 }
 
 agent_monitor_password_works() { # 经 127.0.0.1 TCP 验证密码；0=有效，2=明确拒绝，1=基础设施失败
