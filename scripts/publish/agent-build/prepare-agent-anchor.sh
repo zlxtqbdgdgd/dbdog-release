@@ -30,6 +30,7 @@ readonly CACHE_ROOT=/home/dbdog/cache/dbdog-agent
 readonly WORK_ROOT=/home/dbdog/work
 readonly OMNIBUS_CORE_SHA=7a4247599b029f1aca10d2cb63491d535fbd502f
 readonly SEALED_ORIGIN_AGENT_SHA=4c39489b8c0b7fb7a46af88062fb9aadf2c08264
+readonly OMNIBUS_RUBY_SHA=5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749
 readonly OVERLAY_SUFFIX="$OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform"
 readonly ANCHOR_INFO_FORMAT=dbdog-agent-anchor-v1
 
@@ -148,6 +149,48 @@ install_root_readonly_dir() { # <目录>
   [[ $mode == 0:0:555 ]] || die "无法把目录设为 root:root 0555（实际 $mode）: $target"
 }
 
+# 「清单自洽 + release_agent_sha 正确」并不能证明 overlay 被完整改写过：runner 内部还有
+# 构建目录白名单与 pipeline lock 路径，它们带旧短 SHA 时清单照样自洽。手工准备的 v15 就是
+# 这么漏了三处，一直到 omnibus runner 拒绝 build dir 才暴露。所以无论是新生成还是复用现成
+# 的 overlay，都要逐字节扫一遍：runner 里出现的每个 dbdog-agent-<短SHA>- 必须是本次锚，
+# 出现的每个 40 位 hex 必须属于本代允许的身份集合。
+verify_overlay_free_of_stale_anchors() { # <overlay 目录>
+  local overlay_dir=$1 runner="$1/run-agent-omnibus.sh" token
+  # runner 合法引用两个构建目录：本次锚的 attempt，以及 sealed 69 项 handoff 的来源 attempt。
+  local sealed_short=${SEALED_ORIGIN_AGENT_SHA:0:8}
+  # 合法的 40 位提交 SHA：本次两个锚 + sealed origin + Omnibus core + 被钉住的 omnibus-ruby。
+  local -a allowed=("$to_agent_sha" "$to_core_sha" "$SEALED_ORIGIN_AGENT_SHA" \
+    "$OMNIBUS_CORE_SHA" "$OMNIBUS_RUBY_SHA")
+
+  while IFS= read -r token; do
+    [[ -z $token ]] && continue
+    [[ $token == "dbdog-agent-$to_short-" || $token == "dbdog-agent-$sealed_short-" ]] || \
+      die "overlay runner 仍指向别的构建目录锚 ${token}（应为 dbdog-agent-$to_short-）: $runner"
+  done < <(grep -oE 'dbdog-agent-[0-9a-f]{8}-' -- "$runner" | sort -u)
+
+  while IFS= read -r token; do
+    [[ -z $token ]] && continue
+    local matched=0 candidate
+    for candidate in "${allowed[@]}"; do
+      [[ $token == "$candidate" ]] && matched=1
+    done
+    ((matched == 1)) || \
+      die "overlay runner 含不属于本代身份集合的 40 位提交 SHA $token: $runner"
+  done < <(grep -oE '\b[0-9a-f]{40}\b' -- "$runner" | sort -u)
+
+  # CONTROL-INFO 的 previous_result / previous_overlay 是对上一代的历史描述，本来就该提到
+  # 旧代号，所以只查身份字段本身。
+  [[ $(awk -F= '$1 == "release_agent_sha" { sub(/^[^=]*=/, ""); print }' \
+    "$overlay_dir/CONTROL-INFO") == "$to_agent_sha" ]] || \
+    die 'CONTROL-INFO 自报的 release_agent_sha 不是新锚'
+  while IFS= read -r token; do
+    [[ -z $token ]] && continue
+    [[ $token == "dbdog-agent-$to_short-" ]] || \
+      die "CONTROL-INFO 的构建目录路径仍指向 ${token}（应为 dbdog-agent-$to_short-）"
+  done < <(grep -oE '^(go_tmpdir|selinux_policy_final_path)=.*' -- "$overlay_dir/CONTROL-INFO" |
+    grep -oE 'dbdog-agent-[0-9a-f]{8}-' | sort -u)
+}
+
 # ---- 1. control overlay ----
 # 已经就位且自洽的 overlay 直接复用（例如本代由人工按同一规则准备过），否则由上一代派生。
 if [[ -e $to_overlay_dir ]]; then
@@ -227,10 +270,8 @@ overlay_inventory=$(find "$to_overlay_dir" -xdev -mindepth 1 -maxdepth 1 -printf
   die 'control overlay 文件集合不匹配'
 (cd "$CACHE_ROOT" && sha256sum -c "$to_overlay_rel/CONTROL.sha256" >/dev/null) || \
   die 'control overlay 内容与自带清单不符'
-overlay_release_sha=$(awk -F= '$1 == "release_agent_sha" { sub(/^[^=]*=/, ""); print }' \
-  "$to_overlay_dir/CONTROL-INFO")
-[[ $overlay_release_sha == "$to_agent_sha" ]] || \
-  die "control overlay 自报的 release_agent_sha 不是新锚: $overlay_release_sha"
+verify_overlay_free_of_stale_anchors "$to_overlay_dir"
+log 'control overlay 已确认不含任何上一代锚残留'
 
 # ---- 2. anchor 目录与随锚重写的 root 控制物 ----
 mkdir -p -- "$CACHE_ROOT/anchors"
