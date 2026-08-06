@@ -899,7 +899,12 @@ EOF
     min_collection_interval: 15
     max_relations: 300
     database_identifier:
-      template: '\$resolved_hostname:\$port'
+      # 分隔符用 '-' 不用 ':'（2026-08-06）：':' 是 DD 查询语法的 key/value 分隔符，标识里带它会让
+      # 「按实例过滤」必须整体加引号——round-19 实证：裸写 database_instance:<host>:<port> 的调用
+      # 104 次、98% 报错，而 skill 教的 service:<engine> 写法 80 次仅 4% 报错。区分同机多实例效果不变。
+      # 有意偏离 DD 文档示例（上游 conf.yaml.example 为 \$env-\$resolved_hostname:\$port），军规 5 登记。
+      # **首次安装即为横线形**；老机器的冒号形由 upgrade 路径一次性迁移（见 agent_migrate_identifier_separator）。
+      template: '\$resolved_hostname-\$port'
     service: gaussdb
     host: 127.0.0.1
     port: $port

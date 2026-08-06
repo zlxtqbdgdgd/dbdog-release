@@ -1047,6 +1047,18 @@ render_install_state() {
   agent_render_datadog_yaml "$CONFIG_STAGE/datadog.yaml" "$DBDOG_SERVER_URL" \
     "$DBDOG_API_KEY" "$DBDOG_AGENT_HOSTNAME" "$RC_ROOT_JSON"
   agent_render_system_probe_yaml "$CONFIG_STAGE/system-probe.yaml"
+  # 升级路径的一次性提醒（2026-08-06）：agent_render_checks 会整份重写 conf.d，因此
+  # database_identifier 模板自动切到新的横线形（'$resolved_hostname-$port'）。但**历史数据里
+  # 的冒号标识不会自己消失**——同一实例会裂成新旧两个 database_instance，按实例分组的图会断。
+  # 清理动作在 dbdog-server 那侧（CH/PG），本机做不了，故只在这里检测并指路。
+  # 顺序铁律：先换模板 + 重启 agent，再去服务端清理；反过来会先删完、agent 又按旧模板写回来。
+  if grep -rqs 'resolved_hostname:\$port' /etc/dbdog-agent/conf.d 2>/dev/null; then
+    printf '\n[!] 本机原有 conf 使用**冒号**形 database_identifier，升级后将切为横线形。\n'
+    printf '    历史数据需在 dbdog-server 机器上一次性清理（否则同实例标识裂成两个）：\n'
+    printf '      dbdog-release/scripts/one-off/clean-colon-identifier-data.sh          # 先只统计\n'
+    printf '      dbdog-release/scripts/one-off/clean-colon-identifier-data.sh --apply  # 确认后再删\n'
+    printf '    全部环境切完后请把该一次性脚本删掉，别留成常驻工具。\n\n'
+  fi
   agent_render_checks "$CONFIG_STAGE/conf.d" "$DBDOG_GAUSSDB_MONITOR_PASSWORD" \
     "$DBDOG_GAUSSDB_USER" "$DBDOG_GAUSSDB_DBNAME" "$DBDOG_ENV"
   find "$CONFIG_STAGE" -type d -exec chmod 0700 {} +
