@@ -83,29 +83,84 @@ pass "historical v12/v1 and v13/v2 controls remain byte-identical"
 
 actual_finalizer_sha=$(file_sha256 "$FINALIZER")
 actual_wrapper_sha=$(file_sha256 "$WRAPPER")
-actual_recipe_sha=$(file_sha256 "$RECIPE")
 actual_runner_sha=$(file_sha256 "$RUNNER")
-actual_control_info_sha=$(file_sha256 "$SCRIPTS_DIR/publish/agent-build/omnibus-kylin-platform-v14/CONTROL-INFO")
-actual_control_manifest_sha=$(file_sha256 "$SCRIPTS_DIR/publish/agent-build/omnibus-kylin-platform-v14/CONTROL.sha256")
 grep -Fq "readonly FINALIZER_SHA256=$actual_finalizer_sha" "$WRAPPER" ||
   fail "v3 wrapper does not pin the actual v3 finalizer bytes"
-grep -Fq "readonly FINALIZER_SHA256=$actual_finalizer_sha" "$RECIPE" ||
-  fail "recipe does not pin the actual v3 finalizer bytes"
-grep -Fq "readonly FINALIZER_WRAPPER_SHA256=$actual_wrapper_sha" "$RECIPE" ||
-  fail "recipe does not pin the actual v3 wrapper bytes"
-grep -Fq "readonly RUNNER_SHA256=$actual_runner_sha" "$RECIPE" ||
-  fail "recipe does not pin the actual v14 runner bytes"
-grep -Fq "readonly CONTROL_INFO_SHA256=$actual_control_info_sha" "$RECIPE" ||
-  fail "recipe does not pin the actual v14 CONTROL-INFO bytes"
-grep -Fq "readonly CONTROL_MANIFEST_SHA256=$actual_control_manifest_sha" "$RECIPE" ||
-  fail "recipe does not pin the actual v14 CONTROL.sha256 bytes"
-grep -Fq "$actual_finalizer_sha  finalize-agent-runtime-v3.sh" "$CONTROL_README" ||
-  fail "control README does not record the active v3 finalizer bytes"
-grep -Fq "$actual_wrapper_sha  run-finalize-agent-runtime-v3.sh" "$CONTROL_README" ||
-  fail "control README does not record the active v3 wrapper bytes"
-grep -Fq "$actual_recipe_sha  ../recipes/dbdog-agent.sh" "$CONTROL_README" ||
-  fail "control README does not record the active v14 recipe bytes"
-pass "v14/v3 control hashes form one closed static chain"
+[ "$(file_sha256 "$SCRIPTS_DIR/publish/agent-build/omnibus-kylin-platform-v14/CONTROL-INFO")" = \
+  b5dcfa966d6ebe9bcb080c392b8544693ec3c3bf5c88e49275da7c093b427b50 ] ||
+  fail "historical v14 CONTROL-INFO bytes changed"
+[ "$(file_sha256 "$SCRIPTS_DIR/publish/agent-build/omnibus-kylin-platform-v14/CONTROL.sha256")" = \
+  359151228de51ed690c00caf6d22f42f8e7f0026d512e5c39962fc23f74c4e75 ] ||
+  fail "historical v14 CONTROL.sha256 bytes changed"
+[ "$actual_runner_sha" = 6da7c38074a6c16a15a491a1358e8fc8c606bea1eaac81df10352e79737c8e4a ] ||
+  fail "historical v14 runner bytes changed"
+pass "v14/v3 controls are frozen historical records"
+
+# ---- 锚单源化 ----
+# 每一代的 control overlay 与 finalizer/wrapper 都由 prepare-agent-anchor.sh 从上一代机械
+# 改写而来，并落到构建机上 root:root 的 anchors/<sha>/；仓库里只跟踪「生成器 + 历史各代」。
+# 因此这里不再断言配方钉住了某一代的哈希——那正是每次换锚都要人肉同步、且屡次漏改的东西
+# （8585423 / b6e9982 / 7f8e53b，以及一直没跟上的 finalizer/wrapper）。改为断言配方**不含**
+# 任何随锚变的字面量，且确实从 $SHA/$CORE_SHA 与 ANCHOR-INFO 派生。
+ANCHOR_PREPARER="$SCRIPTS_DIR/publish/agent-build/prepare-agent-anchor.sh"
+[ -f "$ANCHOR_PREPARER" ] && [ -x "$ANCHOR_PREPARER" ] ||
+  fail "missing executable prepare-agent-anchor.sh"
+bash -n "$ANCHOR_PREPARER"
+# 改写规则必须是 POSIX BRE：`\b` 只有 GNU sed 认，用它会出现「本地干跑过、构建机漏改一处」。
+if grep -E '^[[:space:]]*-e "s/' "$ANCHOR_PREPARER" | grep -Fq '\b'; then
+  fail "anchor rewrite rules rely on the GNU-only \\b word boundary"
+fi
+grep -Fq 'die "改写后仍残留旧锚 token，请人工核对' "$ANCHOR_PREPARER" ||
+  fail "anchor rewrite does not fail closed on leftover old anchor tokens"
+
+# 允许留在配方里的裸 40 位 hex 只有真正与发布锚无关的冻结身份。
+allowed_frozen_hex='4c39489b8c0b7fb7a46af88062fb9aadf2c08264|7a4247599b029f1aca10d2cb63491d535fbd502f|5b00eeae9fa553e5ae445ba91a0a0ab4c21aa749'
+stray_hex=$(grep -oE '\b[0-9a-f]{40}\b' "$RECIPE" | grep -vE "^($allowed_frozen_hex)$" || :)
+[ -z "$stray_hex" ] ||
+  fail "recipe restates anchor-bearing 40-hex literals: $(printf '%s' "$stray_hex" | tr '\n' ' ')"
+stray_short=$(grep -oE 'dbdog-agent-[0-9a-f]{8}-' "$RECIPE" || :)
+[ -z "$stray_short" ] ||
+  fail "recipe hard-codes short-SHA build paths: $(printf '%s' "$stray_short" | tr '\n' ' ')"
+
+grep -Fq 'readonly SHORT_SHA=${SHA:0:8}' "$RECIPE" ||
+  fail "recipe does not derive the short SHA from the passed-in release anchor"
+grep -Fq 'readonly BUILD_DIR="$WORK_ROOT/dbdog-agent-$SHORT_SHA-build2"' "$RECIPE" ||
+  fail "recipe does not derive BUILD_DIR from the release anchor"
+grep -Fq 'readonly OUTPUT_DIR="$BUILD_DIR/out"' "$RECIPE" ||
+  fail "recipe does not derive OUTPUT_DIR from BUILD_DIR"
+grep -Fq 'readonly PIPELINE_LOCK="$CACHE_ROOT/locks/dbdog-agent-$SHORT_SHA-aarch64-kylin10.pipeline.lock"' \
+  "$RECIPE" || fail "recipe does not derive the pipeline lock from the release anchor"
+grep -Fq 'readonly GAUSSDB_WHEEL_REL="sources/python/gaussdb/$CORE_SHA/' "$RECIPE" ||
+  fail "recipe does not derive the GaussDB wheel path from the integration core anchor"
+grep -Fq 'OVERLAY_REL="control-overlays/$SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-$OVERLAY_GENERATION"' \
+  "$RECIPE" || fail "recipe does not derive the control overlay path from the release anchor"
+pass "recipe derives every anchor-bearing path from the passed-in SHA/CORE_SHA"
+
+# ---- overlay 信任链 ----
+grep -Fq 'require_exact_field "$ANCHOR_INFO" release_agent_sha "$SHA"' "$RECIPE" ||
+  fail "recipe does not bind ANCHOR-INFO to the passed-in release anchor"
+grep -Fq 'require_exact_field "$ANCHOR_INFO" integration_core_sha "$CORE_SHA"' "$RECIPE" ||
+  fail "recipe does not bind ANCHOR-INFO to the passed-in integration core anchor"
+grep -Fq 'OVERLAY_GENERATION=$(read_exact_field "$ANCHOR_INFO" control_overlay_generation)' "$RECIPE" ||
+  fail "recipe does not read the overlay generation from ANCHOR-INFO"
+grep -Fq 'FINALIZER_SHA256=$(read_exact_field "$ANCHOR_INFO" finalizer_sha256)' "$RECIPE" ||
+  fail "recipe does not read the finalizer digest from ANCHOR-INFO"
+grep -Fq 'require_exact_field "$OVERLAY_DIR/CONTROL-INFO" release_agent_sha "$SHA"' "$RECIPE" ||
+  fail "recipe does not bind the control overlay to the passed-in release anchor"
+grep -Fq '"omnibus-kylin-platform-$OVERLAY_GENERATION"' "$RECIPE" ||
+  fail "recipe does not bind the control overlay to its own derived generation name"
+grep -Fq 'require_exact_field "$OVERLAY_DIR/CONTROL-INFO" go_tmpdir "$BUILD_DIR/tmp/go"' "$RECIPE" ||
+  fail "recipe does not bind the control overlay to this release attempt's build directory"
+# 锚无关的两行必须继续钉死，否则 overlay 自证就退化成「自己说自己对」。
+grep -Fq 'readonly PLATFORM_PATCH_SHA256=b4a5516b11029d2e225a02664b10677bb43a8dd8abd1afad587ee56ec93bccbe' \
+  "$RECIPE" || fail "recipe stopped pinning the anchor-independent platform patch"
+grep -Fq 'readonly PATCHELF_SHA256=01c84c7b8053b6b0c7f133ddbd979477bc1c9e7478e0018e1d8d96d117529faf' \
+  "$RECIPE" || fail "recipe stopped pinning the anchor-independent patchelf binary"
+grep -Fq 'CONTROL.sha256 必须精确包含固定顺序的四行清单' "$RECIPE" ||
+  fail "recipe no longer rebuilds the exact four-line control manifest"
+grep -Fq 'require_root_control '"'"'Omnibus runner'"'"' "$RUNNER" 555 "$RUNNER_SHA256"' "$RECIPE" ||
+  fail "recipe no longer enforces root ownership and mode on the Omnibus runner"
+pass "control overlay is trusted through root ownership, self-consistency, and anchor identity"
 
 if grep -Eq 'GAUSSDB_VERSION|DEFAULT_GAUSSDB_VERSION|gaussdb_version=' "$FINALIZER" "$RECIPE"; then
   fail "Agent artifact controls still overload a target GaussDB version variable"
@@ -128,44 +183,38 @@ grep -Fq 'integrations_core_git_sha=$core_sha' "$FINALIZER" ||
   fail "build provenance does not identify the integration source core"
 pass "sealed Omnibus input and post-build integration source have separate identities"
 
-grep -Fq 'omnibus-kylin-platform-v14' "$FINALIZER" || fail "finalizer is not pinned to v14"
-grep -Fq 'BUILD_DIR=/home/dbdog/work/dbdog-agent-62ad2979-build2' "$RECIPE" ||
-  fail "recipe is not pinned to the isolated v14 release attempt"
 grep -Fq 'DBDOG_PACKAGE_VERSION="$VERSION"' "$RECIPE" ||
-  fail "recipe does not pass the explicit release VERSION authority into v14"
+  fail "recipe does not pass the explicit release VERSION authority into the runner"
 grep -Fq '^7[.]81[.]0-dbdog[.][1-9][0-9]*$' "$RECIPE" ||
   fail "recipe does not bind releases to the synchronized official 7.81.0 baseline"
 if grep -Fq 'runner_mode=(--adopt-post-health-v2)' "$RECIPE" ||
    grep -Fq 'runner_mode=(--resume-v9-retry6-post-health)' "$RECIPE"; then
-  fail "v14 recipe still guesses a legacy resume mode"
+  fail "recipe still guesses a legacy resume mode"
 fi
-grep -Fq 'v14 release attempt 只接受空的 /opt/dbdog-agent' "$RECIPE" ||
-  fail "v14 recipe does not fail closed on a shared old install tree"
-pass "v14 receives the explicit official-baseline package version authority"
+grep -Fq 'release attempt 只接受空的 /opt/dbdog-agent' "$RECIPE" ||
+  fail "recipe does not fail closed on a shared old install tree"
+pass "recipe receives the explicit official-baseline package version authority"
 
-grep -Fq 'SYSTEM_PROBE_SEED_BUILD_DIR=/home/dbdog/work/dbdog-agent-4c39489b-build2' "$RECIPE" ||
-  fail "recipe lost the exact validated system-probe seed attempt"
+grep -Fq 'readonly SYSTEM_PROBE_SEED_BUILD_DIR="$WORK_ROOT/dbdog-agent-$SEALED_ORIGIN_SHORT_SHA-build2"' \
+  "$RECIPE" || fail "recipe lost the exact validated system-probe seed attempt"
 grep -Fq 'SEALED_SYSTEM_PROBE_OUTPUTS_SHA256=ae13f9dbc83fd4d219a883f029baa26073cf88b9510bde5f22bc1d84b3688f52' \
   "$RECIPE" || fail "recipe does not pin the sealed 69-output manifest"
-grep -Fq 'RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=523d7976ae926c5769252b0011f8b7e57dfa72d981d835154ec8772df5401191' \
-  "$RECIPE" || fail "recipe does not pin the release-relocated output manifest"
-grep -Fq 'RELEASE_SYSTEM_PROBE_MARKER_SHA256=809ad5d381c703641173e0e6b1d1b94ec9d4660e55cc398d4266f4129e961549' \
-  "$RECIPE" || fail "recipe does not pin the release handoff marker"
-release_agent_sha=$(recipe_readonly PINNED_AGENT_SHA)
-release_origin_sha=$(recipe_readonly SEALED_ORIGIN_AGENT_SHA)
-release_core_sha=$(recipe_readonly PINNED_OMNIBUS_CORE_SHA)
-release_assets_sha=$(recipe_readonly SEALED_SYSTEM_PROBE_ASSETS_SHA256)
-release_outputs_sha=$(recipe_readonly RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256)
-release_marker_sha=$(recipe_readonly RELEASE_SYSTEM_PROBE_MARKER_SHA256)
-calculated_release_marker_sha=$(printf '%s\n' \
-  "manifest_rel=manifests/$release_origin_sha-$release_core_sha-aarch64-kylin10-v7" \
-  "agent_sha=$release_agent_sha" \
-  "generated_outputs_origin_agent_sha=$release_origin_sha" \
-  "core_sha=$release_core_sha" \
-  "assets_manifest_sha256=$release_assets_sha" \
-  "outputs_manifest_sha256=$release_outputs_sha" | stdin_sha256)
-[[ $release_marker_sha == "$calculated_release_marker_sha" ]] ||
-  fail "release handoff marker digest is stale relative to its pinned inputs"
+# 这两个摘要是锚无关根经确定性变换得出的，必须推导而不是钉死——钉死正是 b6e9982 与
+# 7f8e53b 两个 fix 的来源。
+for derived in RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256 RELEASE_SYSTEM_PROBE_MARKER_SHA256; do
+  if grep -Eq "^readonly $derived=[0-9a-f]{64}" "$RECIPE"; then
+    fail "recipe pins $derived as a literal instead of deriving it"
+  fi
+done
+grep -Fq 'derive_release_system_probe_digests' "$RECIPE" ||
+  fail "recipe does not derive the release system-probe digests"
+grep -Fq 'RELEASE_SYSTEM_PROBE_OUTPUTS_SHA256=${digest%% *}' "$RECIPE" ||
+  fail "relocated outputs digest is not derived from the freshly written manifest"
+grep -Fq 'RELEASE_SYSTEM_PROBE_MARKER_SHA256=${digest%% *}' "$RECIPE" ||
+  fail "handoff marker digest is not derived from the freshly written marker"
+# 推导之后每次生成仍要与推导值逐位相符，否则非确定性会静默溜过去。
+grep -Fq "die 'relocated release system-probe outputs manifest 不确定'" "$RECIPE" ||
+  fail "recipe stopped rechecking the relocated manifest against the derived digest"
 grep -Fq 'generated_outputs_origin_agent_sha=$SEALED_ORIGIN_AGENT_SHA' "$RECIPE" ||
   fail "recipe does not distinguish generated-output origin from release Agent source"
 grep -Fq 'git clone --local --no-hardlinks --no-checkout --no-tags' "$RECIPE" ||
@@ -212,7 +261,7 @@ grep -Fq 'expected_version_prefix="Agent $expected - Commit: ${agent_sha:0:10} -
   "$FINALIZER" || fail "finalizer does not match the real Agent version output and pinned source commit"
 grep -Fq '"$expected_version_prefix"*'"' - Go version: go'"'*' "$FINALIZER" ||
   fail "finalizer does not require the complete compiled Agent version output shape"
-grep -Fq 'expected_agent_version_prefix="Agent $VERSION - Commit: ${PINNED_AGENT_SHA:0:10} - Serialization version: "' \
+grep -Fq 'expected_agent_version_prefix="Agent $VERSION - Commit: ${SHA:0:10} - Serialization version: "' \
   "$RECIPE" || fail "recipe does not match the real Agent version output and pinned source commit"
 grep -Fq '"$expected_agent_version_prefix"*'"' - Go version: go'"'*' "$RECIPE" ||
   fail "recipe does not require the complete compiled Agent version output shape"
@@ -232,7 +281,7 @@ grep -Fq 'expected_version_prefix="System Probe $expected - Commit: ${agent_sha:
   "$FINALIZER" || fail "finalizer does not hard-gate system-probe VERSION and Agent commit"
 grep -Fq 'write_system_probe_version_provenance "$verify_root" "$version"' "$FINALIZER" ||
   fail "archive re-verification does not execute the extracted system-probe version gate"
-grep -Fq 'require_exact_field "$system_probe_version_info" agent_git_sha "$PINNED_AGENT_SHA"' \
+grep -Fq 'require_exact_field "$system_probe_version_info" agent_git_sha "$SHA"' \
   "$RECIPE" || fail "canonical artifact verifier does not bind system-probe provenance to full Agent SHA"
 grep -Fq 'require_exact_field "$build_info" system_probe_binary_sha256 "$system_probe_binary_sha"' \
   "$RECIPE" || fail "canonical artifact verifier does not bind system-probe binary SHA-256"
@@ -308,7 +357,7 @@ grep -Fq 'require_exact_field "$gaussdb_info" integration_version "$GAUSSDB_INTE
   fail "canonical artifact verifier does not enforce GaussDB integration provenance"
 grep -Fq 'require_exact_field "$build_info" omnibus_integrations_core_git_sha "$PINNED_OMNIBUS_CORE_SHA"' \
   "$RECIPE" || fail "canonical artifact verifier lost the Omnibus core provenance gate"
-grep -Fq 'require_exact_field "$build_info" integrations_core_git_sha "$PINNED_INTEGRATION_CORE_SHA"' \
+grep -Fq 'require_exact_field "$build_info" integrations_core_git_sha "$CORE_SHA"' \
   "$RECIPE" || fail "canonical artifact verifier lost the integration core provenance gate"
 pass "canonical tarball verifier rechecks integration and split-core provenance"
 
@@ -321,9 +370,19 @@ grep -Fq 'resolve_module_recipe "$m" "$arch"' "$PUBLISH_SH" ||
   fail "build_one_arch no longer resolves the Agent recipe through the architecture-aware selector"
 grep -Fq 'if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then' "$PUBLISH_SH" ||
   fail "the aarch64 sealed attempt directory is no longer scoped precisely to arch=aarch64"
-grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-62ad2979-build2/out/$BUILT_ARTIFACT"' "$PUBLISH_SH" ||
-  fail "the aarch64 sealed attempt directory constant changed"
-pass "publish.sh keeps the aarch64 sealed attempt path exact and arch-scoped after adding x86_64 recipe selection"
+grep -Fq 'expected_rpath="/home/dbdog/work/dbdog-agent-${sha:0:8}-build2/out/$BUILT_ARTIFACT"' "$PUBLISH_SH" ||
+  fail "the aarch64 sealed attempt path is no longer derived from the release anchor"
+stray_publish_hex=$(grep -oE 'dbdog-agent-[0-9a-f]{8}-build' "$PUBLISH_SH" || :)
+[ -z "$stray_publish_hex" ] ||
+  fail "publish.sh hard-codes a short-SHA build path: $(printf '%s' "$stray_publish_hex" | tr '\n' ' ')"
+# 构建要跑几小时，随锚控制物必须在花掉这些时间之前查一遍，而不是等 finalize 才暴露。
+grep -Fq 'agent_preflight_anchor_controls "$BUILD_HOST" "$sha" "$core"' "$PUBLISH_SH" ||
+  fail "publish.sh does not preflight the anchor-bearing controls before the Agent build"
+grep -Fq 'PREFLIGHT_FAIL' "$PUBLISH_SH" ||
+  fail "anchor preflight does not report actionable remote failures"
+grep -Fq 'prepare-agent-anchor.sh' "$PUBLISH_SH" ||
+  fail "anchor preflight failure does not point at the anchor preparer"
+pass "publish.sh derives the aarch64 attempt path and preflights the anchor controls"
 
 if [ -f "$WHEEL" ]; then
   if command -v sha256sum >/dev/null 2>&1; then

@@ -788,6 +788,66 @@ resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RES
   fi
 }
 
+agent_preflight_anchor_controls() { # <build host> <agent sha> <core sha>
+  # Agent 的 omnibus 构建要跑几小时，而它依赖的一整套随锚控制物（anchor 目录、control
+  # overlay、GaussDB wheel、build attempt、pipeline lock）都得由管理员用
+  # prepare-agent-anchor.sh 事先以 root 就位。任何一项缺失或对不上锚，过去都要等到构建
+  # 中途甚至 finalize 阶段才暴露；这里在花掉那几小时之前先把它们全查一遍。
+  local host="$1" sha="$2" core="$3" detail
+  log "[dbdog-agent/aarch64] 预检构建机上的随锚控制物 ..."
+  if ! detail="$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$host" \
+      "AGENT_SHA=$sha CORE_SHA=$core bash -s" <<'REMOTE_PREFLIGHT'
+set -u
+cache=/home/dbdog/cache/dbdog-agent
+short=${AGENT_SHA:0:8}
+anchor_dir="$cache/anchors/$AGENT_SHA"
+anchor_info="$anchor_dir/ANCHOR-INFO"
+fail() { printf 'PREFLIGHT_FAIL %s\n' "$*"; exit 1; }
+field() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; n++ } END { exit(n == 1 ? 0 : 1) }' "$1"; }
+
+[ -f "$anchor_info" ] || fail "缺少 $anchor_info"
+[ "$(stat -c '%u:%g:%a' -- "$anchor_info")" = 0:0:444 ] || fail 'ANCHOR-INFO 必须是 root:root 0444'
+[ "$(field "$anchor_info" release_agent_sha)" = "$AGENT_SHA" ] || fail 'ANCHOR-INFO 的 release_agent_sha 与基线不符'
+[ "$(field "$anchor_info" integration_core_sha)" = "$CORE_SHA" ] || fail 'ANCHOR-INFO 的 integration_core_sha 与基线不符'
+
+overlay_rel="$(field "$anchor_info" control_overlay_rel)" || fail 'ANCHOR-INFO 缺少 control_overlay_rel'
+overlay_dir="$cache/$overlay_rel"
+[ -d "$overlay_dir" ] || fail "缺少 control overlay $overlay_dir"
+[ "$(stat -c '%u:%g' -- "$overlay_dir")" = 0:0 ] || fail 'control overlay 必须由 root:root 持有'
+[ "$(field "$overlay_dir/CONTROL-INFO" release_agent_sha)" = "$AGENT_SHA" ] || fail 'control overlay 自报的 release_agent_sha 与基线不符'
+(cd "$cache" && sha256sum -c "$overlay_rel/CONTROL.sha256" >/dev/null 2>&1) || fail 'control overlay 内容与自带清单不符'
+
+for control in finalize-agent-runtime.sh run-finalize-agent-runtime.sh; do
+  [ -f "$anchor_dir/$control" ] || fail "缺少随锚重写的 $control"
+  [ "$(stat -c '%u:%g:%a' -- "$anchor_dir/$control")" = 0:0:555 ] || fail "$control 必须是 root:root 0555"
+done
+expect_finalizer="$(field "$anchor_info" finalizer_sha256)"
+actual_finalizer="$(sha256sum -- "$anchor_dir/finalize-agent-runtime.sh")"
+[ "${actual_finalizer%% *}" = "$expect_finalizer" ] || fail 'finalizer 字节与 ANCHOR-INFO 记录不符'
+expect_wrapper="$(field "$anchor_info" finalizer_wrapper_sha256)"
+actual_wrapper="$(sha256sum -- "$anchor_dir/run-finalize-agent-runtime.sh")"
+[ "${actual_wrapper%% *}" = "$expect_wrapper" ] || fail 'finalizer wrapper 字节与 ANCHOR-INFO 记录不符'
+
+wheel="$cache/sources/python/gaussdb/$CORE_SHA/datadog_gaussdb-1.0.1-py3-none-any.whl"
+[ -f "$wheel" ] || fail "缺少该 core 提交的 GaussDB wheel: $wheel"
+[ "$(stat -c '%u:%g:%a' -- "$wheel")" = 0:0:444 ] || fail 'GaussDB wheel 必须是 root:root 0444'
+
+build_dir=/home/dbdog/work/dbdog-agent-$short-build2
+[ -d "$build_dir" ] || fail "缺少 build attempt $build_dir"
+[ "$(stat -c '%U:%G:%a' -- "$build_dir")" = dbdog:dbdog:775 ] || fail 'build attempt 必须是 dbdog:dbdog 0775'
+lock="$cache/locks/dbdog-agent-$short-aarch64-kylin10.pipeline.lock"
+[ -f "$lock" ] || fail "缺少 pipeline lock $lock"
+[ "$(stat -c '%U:%G:%a' -- "$lock")" = root:dbdog:644 ] || fail 'pipeline lock 必须是 root:dbdog 0644'
+
+printf 'PREFLIGHT_OK overlay=%s generation=%s\n' "${overlay_rel##*/}" "$(field "$anchor_info" control_overlay_generation)"
+REMOTE_PREFLIGHT
+    )"; then
+    printf '%s\n' "$detail" >&2
+    die "[dbdog-agent/aarch64] 构建机上的随锚控制物未就位或与基线不符。请管理员在构建机上以 root 执行 scripts/publish/agent-build/prepare-agent-anchor.sh 换锚到 ${sha:0:12} / core ${core:0:12} 后重试"
+  fi
+  log "[dbdog-agent/aarch64] 预检通过：${detail#PREFLIGHT_OK }"
+}
+
 build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> → 向事务 TSV 追加一行，不上传、不改 manifest
   local m="$1" ver="$2" arch="$3" sha="" core="" kind agent_baseline_blob=""
   local recipe txn_dir txn_tsv
@@ -847,6 +907,10 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
   resolve_build_host_for_arch "$arch"
   local BUILD_HOST="$RESOLVED_BUILD_HOST"
 
+  if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
+    agent_preflight_anchor_controls "$BUILD_HOST" "$sha" "$core"
+  fi
+
   log "[$m/$arch] 构建于 $BUILD_HOST ..."
   local out recipe_stdout
   if ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
@@ -874,7 +938,7 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
     # build attempt；它不能搬到通用 BUILD_WORK，否则就绕开 canonical artifact 的
     # 路径/owner/mode 门禁。（曾并存过一份 x86_64 Agent 配方，按「GitHub 只出 arm」
     # 的决定于 2026-08-05 删除；未来若有别的架构配方，同样落在通用 BUILD_WORK 下。）
-    expected_rpath="/home/dbdog/work/dbdog-agent-c5d999c8-build2/out/$BUILT_ARTIFACT"
+    expected_rpath="/home/dbdog/work/dbdog-agent-${sha:0:8}-build2/out/$BUILT_ARTIFACT"
   else
     expected_rpath="$BUILD_WORK/$m/out/$BUILT_ARTIFACT"
   fi

@@ -1,10 +1,61 @@
 # dbdog-agent build controls
 
-This directory tracks the exact Kylin V10 AArch64 controls. The active
-generation is v14/v3 and produces `7.81.0-dbdog.4` from the fresh attempt
-`/home/dbdog/work/dbdog-agent-62ad2979-build2`.
+This directory tracks the exact Kylin V10 AArch64 controls, plus the anchor
+preparer that derives each new generation from the previous one.
 
-## Active v14/v3 authority
+## 换锚 SOP
+
+一次换锚要改动的东西全部由 `prepare-agent-anchor.sh` 生成——**不要手工逐处改**。
+控制物（control overlay 的 runner/CONTROL-INFO、finalizer、它的 root 入口 wrapper）
+都内嵌 release source SHA、integration core SHA 与含短 SHA 的构建目录路径；历史上每次
+人肉换锚都漏过至少一处，而漏改要等几小时构建之后才暴露：
+
+| 提交 | 漏掉的东西 | 暴露时机 |
+|---|---|---|
+| `8585423` | runner 与 CONTROL.sha256 自身哈希 | 构建启动即停 |
+| `b6e9982` | relocated outputs manifest 哈希 | seed 阶段 |
+| `7f8e53b` | seed success marker 哈希 | seed 阶段 |
+| （一直没跟上） | finalizer/wrapper 的 `BUILD_DIR`/`AGENT_SHA`/`CORE_SHA` | finalize 阶段，构建已跑完 |
+| （手工建目录） | v15 overlay 目录继承了父目录的 setgid，变成 `2555` | finalize 阶段 |
+
+步骤：
+
+1. **准备 GaussDB wheel**：按新的 core 提交从干净归档独立构建（`SOURCE_DATE_EPOCH`
+   取该 commit 时间，两次独立构建必须字节一致），以 `root:root` `0444` 放到
+   `/home/dbdog/cache/dbdog-agent/sources/python/gaussdb/<core_sha>/`。
+2. **跑换锚准备器**（构建机上以 root）：
+
+   ```bash
+   ssh root@<build-host> 'bash -s -- \
+       --from-agent-sha <旧40hex> --from-core-sha <旧40hex> --from-overlay-generation vN \
+       --to-agent-sha <新40hex>   --to-core-sha <新40hex>   --to-overlay-generation vN+1 \
+       --reason <单行下划线短语>' < scripts/publish/agent-build/prepare-agent-anchor.sh
+   ```
+
+   它由上一代机械改写出新一代的 overlay 与 finalizer/wrapper，重算全部哈希，落下
+   `anchors/<新agent_sha>/ANCHOR-INFO`，并建好 pipeline lock 与 build attempt。
+   上一代一字不动。任何一处旧 token 残留都会 fail closed。
+3. **改基线**：`dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv` 的
+   `agent_release_source_commit` 与 `integrations_core_release_source_commit`。
+4. **发布**：`./scripts/publish/publish.sh publish dbdog-agent --bump patch --yes`。
+   构建前的 preflight 会先把上面这些控制物查一遍，缺任何一项都在花掉构建时间之前停下。
+
+配方本身**不含任何随锚变的字面量**——路径由传入的 `$SHA`/`$CORE_SHA` 派生，overlay 代号
+与 finalizer/wrapper 哈希从 `ANCHOR-INFO` 读取。所以换锚不需要改 `recipes/dbdog-agent.sh`。
+
+## 报错对照表
+
+| 报错 | 含义 | 处置 |
+|---|---|---|
+| `缺少本次锚的 ANCHOR-INFO` | 没跑换锚准备器，或跑的是别的锚 | 按上面 SOP 第 2 步跑 `prepare-agent-anchor.sh` |
+| `control overlay 自报的 release_agent_sha 不是新锚` | overlay 与基线对不上（拿了旧一代） | 核对 `--to-overlay-generation` 与基线是否同一锚 |
+| `CONTROL.sha256 必须精确包含固定顺序的四行清单` | overlay 内容与清单不符，或锚无关的两行（platform patch / patchelf）被改动 | 别手改 overlay，重跑准备器 |
+| `control overlay 目录必须是 root:root mode 0555` | 目录带了 setgid（父目录 `2755` 继承而来） | `chmod g-s <dir>`；注意这台 XFS 上 `chmod 0555` 不清该位 |
+| `relocated release system-probe outputs manifest 不确定` | 同一次运行内两次生成结果不一致 | 检查 `BUILD_DIR` 是否被并发改动；不要手改 seed 产物 |
+| `release fresh seed 完成标记与固定输入不一致` | seed marker 的六行常量变了（通常是锚或推导摘要变了） | 若确属换锚，删掉该 build attempt 重新 seed；否则先查为什么锚变了 |
+| `构建机上的随锚控制物未就位或与基线不符` | publish preflight 拦下 | 看它打印的 `PREFLIGHT_FAIL` 行，按上表定位 |
+
+## Historical v14/v3 authority
 
 - release Agent source:
   `62ad29793b02139448b76bc85fc406491a08bf58`
@@ -40,7 +91,7 @@ byte-identical. The generated wheel is not committed to Core; provision it as
 `root:root` mode `0444` at
 `/home/dbdog/cache/dbdog-agent/sources/python/gaussdb/612be7bea397c87df707489599c02ed623c29631/datadog_gaussdb-1.0.1-py3-none-any.whl`.
 
-Install the v14 overlay directory as `root:root` mode `0555`, its runner as
+Install each generation's overlay directory as `root:root` mode `0555`, its runner as
 `0555`, and its three data files as `0444`. Install
 `finalize-agent-runtime-v3.sh` and
 `run-finalize-agent-runtime-v3.sh` as `root:root` mode `0555` under
@@ -50,7 +101,7 @@ Install the v14 overlay directory as `root:root` mode `0555`, its runner as
 `locks/dbdog-agent-62ad2979-aarch64-kylin10.pipeline.lock` as a regular
 `root:dbdog` mode `0644` file.
 
-The active v3 destination-local publisher also pins the build host's system
+The v3 destination-local publisher also pins the build host's system
 Python before it opens `OUTPUT_DIR`: `/usr/bin/python3` must resolve exactly to
 `/usr/bin/python3.7`; that target must be a non-symlink regular file owned by
 `root:root` with mode `0755`, and its SHA-256 must be
@@ -315,7 +366,7 @@ group-readable and group-writable files, and group `rwx` plus setgid
 directories. Permission normalization is limited to `bazel/disk` and must not
 mutate the immutable dependency authorities.
 
-## Active v14/v3 SHA-256 values
+## Historical v14/v3 SHA-256 values
 
 ```text
 6da7c38074a6c16a15a491a1358e8fc8c606bea1eaac81df10352e79737c8e4a  omnibus-kylin-platform-v14/run-agent-omnibus.sh
