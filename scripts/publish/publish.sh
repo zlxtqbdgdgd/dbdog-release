@@ -535,6 +535,40 @@ verify_remote_artifact_arch() { # <远端产物> <aarch64|x86_64|noarch> <module
     || die "[$module] 构建机产物架构检查失败"
 }
 
+# expected_agent_integrations 推导「本次 Agent 产物必须带的 Python 集成」，**不钉字面量**
+# （军规 3）：判据是「我们发了 conf.d/<x>.d，且出货基线 core commit 里存在
+# <x>/datadog_checks/<x>」。核心检查（cpu/disk/memory…）由 Go 实现、没有 Python 包，
+# 天然不入集合；新增引擎只要照惯例发 conf + 建 core 目录，这里自动跟上。
+expected_agent_integrations() {
+  local conf_dir="$SRC_ROOT/dbdog-agent/dbdog-deploy/conf/conf.d" name out=""
+  [ -d "$conf_dir" ] || die "Agent conf 模板目录不存在: $conf_dir"
+  for d in "$conf_dir"/*.d; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d" .d)"
+    # 该 conf 在出货基线的 core 树里有没有对应 Python 集成？有才要求产物带上。
+    git -C "$SRC_ROOT/dbdog-agent-core" cat-file -e \
+      "$INTEGRATIONS_CORE_RELEASE_SOURCE_COMMIT:$name/datadog_checks/$name/__init__.py" 2>/dev/null \
+      || continue
+    out="${out:+$out,}$name"
+  done
+  [ -n "$out" ] || die "推导不出任何期望集成——conf 模板或 core 基线树形态异常"
+  printf '%s' "$out"
+}
+
+# verify_remote_agent_integrations 在构建机上核产物真的带了上面推导出的集成。
+# 补的是构建验收的空白：既有验收只验五个二进制入口与 ELF/rpath/补丁 marker，
+# 整个集成静默丢失不会让任何检查变红（2026-08-06 openGauss 即如此丢失，
+# 导致 round-20 该引擎零遥测、整轮作废）。
+verify_remote_agent_integrations() { # <远端产物> <module>
+  local remote_path="$1" module="$2" expected
+  expected="$(expected_agent_integrations)"
+  log "[$module] 期望集成：$expected"
+  ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+    "$BUILD_HOST" /usr/bin/bash -s -- "$remote_path" "$expected" \
+    <"$HERE/verify-agent-integrations.sh" \
+    || die "[$module] 构建机产物集成集合检查失败"
+}
+
 builder_upload_once() { # <远端产物> <asset> <release id> <size> <sha256>
   local remote_path="$1" asset_name="$2" release_id="$3" expected_size="$4" expected_sha="$5"
   local token remote_script remote_cmd
@@ -952,6 +986,9 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
   esac
   remote_artifact_metadata "$rpath"
   verify_remote_artifact_arch "$rpath" "$artifact_arch" "$m"
+  # Agent 专属：核产物真的带了我们发 conf 的那些 Python 集成（2026-08-06 openGauss
+  # 整个集成静默丢失、round-20 该引擎零遥测的直接护栏）。
+  [ "$m" = "dbdog-agent" ] && verify_remote_agent_integrations "$rpath" "$m"
   BUILT_SHA256="$REMOTE_ARTIFACT_SHA256"
 
   if [ "$m" = "dbdog-agent" ]; then
