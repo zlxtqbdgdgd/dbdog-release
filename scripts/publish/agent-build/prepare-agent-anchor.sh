@@ -281,62 +281,94 @@ install_root_readonly_dir "$CACHE_ROOT/anchors"
 anchor_staging=$(mktemp -d "$CACHE_ROOT/anchors/.anchor-staging.XXXXXX")
 trap 'if [[ -n ${anchor_staging:-} && -d $anchor_staging ]]; then rm -rf -- "$anchor_staging"; fi' EXIT
 
-rewrite_anchor_tokens "$from_finalizer" "$anchor_staging/finalize-agent-runtime.sh"
-finalizer_sha256=$(file_sha256 "$anchor_staging/finalize-agent-runtime.sh")
-
-# wrapper 里三个 overlay 哈希不是字符串改写能得到的，必须按新 overlay 重算后代入；它引用的
-# finalizer 哈希同理，要在 finalizer 定稿之后再写。
-rewrite_anchor_tokens "$from_wrapper" "$anchor_staging/run-finalize-agent-runtime.sh"
+# overlay 的三个摘要不是字符串改写能得到的，必须按新 overlay 重算后代入。finalizer 与
+# wrapper **都**钉了这三个值，只是变量名不同（finalizer 用 EXPECTED_ 前缀）；早先只代了
+# wrapper，结果 finalize 阶段死在 `omnibus.success does not match`——omnibus.success 是对的，
+# 是 finalizer 自己还拿着上一代的 runner 摘要。
 runner_sha256=$(file_sha256 "$to_overlay_dir/run-agent-omnibus.sh")
 control_info_sha256=$(file_sha256 "$to_overlay_dir/CONTROL-INFO")
 control_manifest_sha256=$(file_sha256 "$to_overlay_dir/CONTROL.sha256")
-python3 - "$anchor_staging/run-finalize-agent-runtime.sh" \
-  "$runner_sha256" "$control_info_sha256" "$control_manifest_sha256" \
-  "$finalizer_sha256" "$to_finalizer" <<'PYEOF'
+
+set_readonly_assignments() { # <文件> <name=value>...
+  local target=$1
+  shift
+  python3 - "$target" "$@" <<'PYEOF'
 import re
 import sys
 
-path, runner, control_info, control_manifest, finalizer, finalizer_path = sys.argv[1:7]
-assignments = {
-    "RUNNER_SHA256": runner,
-    "CONTROL_INFO_SHA256": control_info,
-    "CONTROL_MANIFEST_SHA256": control_manifest,
-    "FINALIZER_SHA256": finalizer,
-    "FINALIZER": finalizer_path,
-}
+path = sys.argv[1]
 with open(path, encoding="utf-8") as stream:
     text = stream.read()
-for name, value in assignments.items():
+for pair in sys.argv[2:]:
+    name, _, value = pair.partition("=")
     pattern = re.compile(r"^readonly %s=.*$" % re.escape(name), re.MULTILINE)
-    text, count = pattern.subn("readonly %s=%s" % (name, value), text)
+    text, count = pattern.subn(
+        lambda _match, value=value, name=name: "readonly %s=%s" % (name, value), text)
     if count != 1:
         raise SystemExit("expected exactly one %s assignment, found %d" % (name, count))
 with open(path, "w", encoding="utf-8") as stream:
     stream.write(text)
 PYEOF
-wrapper_sha256=$(file_sha256 "$anchor_staging/run-finalize-agent-runtime.sh")
-
-# wrapper 会自检自己的安装路径，改写后必须指向新的 anchor 目录。
-grep -qF "EXPECTED_SELF=$to_wrapper" "$anchor_staging/run-finalize-agent-runtime.sh" || {
-  python3 - "$anchor_staging/run-finalize-agent-runtime.sh" "$to_wrapper" <<'PYEOF'
-import re
-import sys
-
-path, expected_self = sys.argv[1:3]
-with open(path, encoding="utf-8") as stream:
-    text = stream.read()
-text, count = re.subn(r"^readonly EXPECTED_SELF=.*$",
-                      "readonly EXPECTED_SELF=" + expected_self, text, flags=re.MULTILINE)
-if count != 1:
-    raise SystemExit("expected exactly one EXPECTED_SELF assignment, found %d" % count)
-with open(path, "w", encoding="utf-8") as stream:
-    stream.write(text)
-PYEOF
-  wrapper_sha256=$(file_sha256 "$anchor_staging/run-finalize-agent-runtime.sh")
 }
 
+rewrite_anchor_tokens "$from_finalizer" "$anchor_staging/finalize-agent-runtime.sh"
+
+# GaussDB wheel 的摘要同样随 core 锚变——路径能靠字符串改写跟上，内容摘要不能。漏代这一处
+# 会让 finalize 死在 `pinned datadog-gaussdb wheel checksum mismatch`，同样是构建之后才暴露。
+gaussdb_wheel_rel=$(awk -F= '$1 == "readonly GAUSSDB_WHEEL_REL" { sub(/^[^=]*=/, ""); print }' \
+  "$anchor_staging/finalize-agent-runtime.sh")
+[[ $gaussdb_wheel_rel == "sources/python/gaussdb/$to_core_sha/"* ]] || \
+  die "改写后的 GaussDB wheel 路径不指向新 core 锚: $gaussdb_wheel_rel"
+gaussdb_wheel="$CACHE_ROOT/$gaussdb_wheel_rel"
+[[ -f $gaussdb_wheel && ! -L $gaussdb_wheel ]] || \
+  die "缺少该 core 提交的 GaussDB wheel（需先独立构建并以 root:root 0444 就位）: $gaussdb_wheel"
+[[ $(stat -c '%u:%g:%a' -- "$gaussdb_wheel") == 0:0:444 ]] || \
+  die "GaussDB wheel 必须是 root:root mode 0444: $gaussdb_wheel"
+gaussdb_wheel_sha256=$(file_sha256 "$gaussdb_wheel")
+
+set_readonly_assignments "$anchor_staging/finalize-agent-runtime.sh" \
+  "EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=$runner_sha256" \
+  "EXPECTED_CONTROL_INFO_SHA256=$control_info_sha256" \
+  "EXPECTED_CONTROL_MANIFEST_SHA256=$control_manifest_sha256" \
+  "GAUSSDB_WHEEL_SHA256=$gaussdb_wheel_sha256"
 bash -n "$anchor_staging/finalize-agent-runtime.sh" || die '改写后的 finalizer 语法不合法'
+finalizer_sha256=$(file_sha256 "$anchor_staging/finalize-agent-runtime.sh")
+
+# wrapper 引用 finalizer 的路径与摘要，所以必须在 finalizer 定稿之后再写。
+rewrite_anchor_tokens "$from_wrapper" "$anchor_staging/run-finalize-agent-runtime.sh"
+set_readonly_assignments "$anchor_staging/run-finalize-agent-runtime.sh" \
+  "RUNNER_SHA256=$runner_sha256" \
+  "CONTROL_INFO_SHA256=$control_info_sha256" \
+  "CONTROL_MANIFEST_SHA256=$control_manifest_sha256" \
+  "FINALIZER_SHA256=$finalizer_sha256" \
+  "FINALIZER=$to_finalizer" \
+  "EXPECTED_SELF=$to_wrapper"
 bash -n "$anchor_staging/run-finalize-agent-runtime.sh" || die '改写后的 wrapper 语法不合法'
+wrapper_sha256=$(file_sha256 "$anchor_staging/run-finalize-agent-runtime.sh")
+
+# 上一代 overlay 的三个摘要一个都不许留在新控制物里，新的三个必须都在。少代一处就会在
+# finalize 阶段——也就是几小时构建之后——才暴露。
+prev_runner_sha256=$(file_sha256 "$from_overlay_dir/run-agent-omnibus.sh")
+prev_control_info_sha256=$(file_sha256 "$from_overlay_dir/CONTROL-INFO")
+prev_control_manifest_sha256=$(file_sha256 "$from_overlay_dir/CONTROL.sha256")
+prev_wheel="$CACHE_ROOT/sources/python/gaussdb/$from_core_sha/${gaussdb_wheel_rel##*/}"
+prev_wheel_sha256=$([[ -f $prev_wheel ]] && file_sha256 "$prev_wheel" || printf 'n/a\n')
+for generated in "$anchor_staging/finalize-agent-runtime.sh" \
+  "$anchor_staging/run-finalize-agent-runtime.sh"; do
+  for stale in "$prev_runner_sha256" "$prev_control_info_sha256" \
+    "$prev_control_manifest_sha256" "$prev_wheel_sha256"; do
+    [[ $stale == n/a ]] && continue
+    if grep -qF -- "$stale" "$generated"; then
+      die "生成的控制物仍钉着上一代 overlay 摘要 $stale: $generated"
+    fi
+  done
+  for fresh in "$runner_sha256" "$control_info_sha256" "$control_manifest_sha256"; do
+    grep -qF -- "$fresh" "$generated" || \
+      die "生成的控制物没有代入本代 overlay 摘要 $fresh: $generated"
+  done
+done
+grep -qF -- "$gaussdb_wheel_sha256" "$anchor_staging/finalize-agent-runtime.sh" || \
+  die "finalizer 没有代入本代 GaussDB wheel 摘要 $gaussdb_wheel_sha256"
 
 cat >"$anchor_staging/ANCHOR-INFO" <<EOF
 anchor_info_format=$ANCHOR_INFO_FORMAT
@@ -351,6 +383,8 @@ control_info_sha256=$control_info_sha256
 control_manifest_sha256=$control_manifest_sha256
 finalizer_sha256=$finalizer_sha256
 finalizer_wrapper_sha256=$wrapper_sha256
+gaussdb_wheel_rel=$gaussdb_wheel_rel
+gaussdb_wheel_sha256=$gaussdb_wheel_sha256
 build_dir=$to_build_dir
 pipeline_lock=$to_pipeline_lock
 derived_from_agent_sha=$from_agent_sha

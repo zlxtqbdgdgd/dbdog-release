@@ -145,7 +145,8 @@ readonly GAUSSDB_INTEGRATION_NAME=datadog-gaussdb
 readonly GAUSSDB_INTEGRATION_VERSION=1.0.1
 readonly GAUSSDB_WHEEL_REL="sources/python/gaussdb/$CORE_SHA/datadog_gaussdb-$GAUSSDB_INTEGRATION_VERSION-py3-none-any.whl"
 readonly GAUSSDB_WHEEL="$CACHE_ROOT/$GAUSSDB_WHEEL_REL"
-readonly GAUSSDB_WHEEL_SHA256=7e31861e30da49f02f509accdecdb67e4df0ea978b69034df8d5c60c123565af
+# wheel 的内容摘要随 core 锚变（路径能派生，内容不能），因此同样取自 ANCHOR-INFO。
+GAUSSDB_WHEEL_SHA256=
 readonly BUILDER_IDENTITY=kylin-v10-tercel-native-aarch64-v7
 readonly ARCHIVE_RECIPE=gnu_tar_sorted_fixed_mtime_root_owner_gzip_n_two_pass_delete_second_before_extract
 readonly PUBLICATION_RECIPE=destination_local_copy_verify_sync_hardlink_noreplace_archive_then_sidecar_recover_archive_only
@@ -751,8 +752,12 @@ load_anchor_generation() {
     die "ANCHOR-INFO 的 control_overlay_generation 不是 v<N>: $OVERLAY_GENERATION"
   FINALIZER_SHA256=$(read_exact_field "$ANCHOR_INFO" finalizer_sha256)
   FINALIZER_WRAPPER_SHA256=$(read_exact_field "$ANCHOR_INFO" finalizer_wrapper_sha256)
+  GAUSSDB_WHEEL_SHA256=$(read_exact_field "$ANCHOR_INFO" gaussdb_wheel_sha256)
   require_frozen_sha256 FINALIZER_SHA256
   require_frozen_sha256 FINALIZER_WRAPPER_SHA256
+  require_frozen_sha256 GAUSSDB_WHEEL_SHA256
+  require_exact_field "$ANCHOR_INFO" gaussdb_wheel_rel "$GAUSSDB_WHEEL_REL"
+  readonly GAUSSDB_WHEEL_SHA256
 
   OVERLAY_REL="control-overlays/$SHA-$PINNED_OMNIBUS_CORE_SHA-aarch64-kylin10-v7-omnibus-kylin-platform-$OVERLAY_GENERATION"
   require_exact_field "$ANCHOR_INFO" control_overlay_rel "$OVERLAY_REL"
