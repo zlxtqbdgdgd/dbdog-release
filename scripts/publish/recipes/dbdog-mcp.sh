@@ -84,14 +84,24 @@ node --input-type=commonjs -e '
 # 只等一行启动日志是不够的：skills 是惰性加载，一个资产都没打进包时服务照样起得来、
 # Resource 照样注册，客户端拿到的却是空 catalog。所以这里以真实客户端身份完成 MCP 握手，
 # 读 dbdog://mcp/skillsets，并要求条目数与源码里的 skill.json 数量一致。
+# 服务的启动日志打的是配置值而非实际绑定端口（DBDOG_HTTP_PORT=0 时它就原样打印 0），
+# 所以不能从日志里取端口。改为先探一个空闲端口再显式传进去。
 SMOKE_LOG="$WORK/mcp-smoke.log"
-env DBDOG_HTTP_HOST=127.0.0.1 DBDOG_HTTP_PORT=0 \
+SMOKE_PORT=$(node -e 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p));});')
+case "$SMOKE_PORT" in
+  ''|*[!0-9]*) die "无法探测冒烟用的空闲端口: $SMOKE_PORT" ;;
+esac
+env DBDOG_HTTP_HOST=127.0.0.1 DBDOG_HTTP_PORT="$SMOKE_PORT" \
   node "$VERIFY_PKG/index.js" >"$SMOKE_LOG" 2>&1 &
 SMOKE_PID=$!
 SMOKE_URL=""
 for _ in {1..100}; do
-  SMOKE_URL=$(sed -n 's|.*streamable-http on \(http://[^ ]*\).*|\1|p' "$SMOKE_LOG" | head -1)
-  [ -n "$SMOKE_URL" ] && break
+  if grep -Fq '[dbdog-mcp] streamable-http' "$SMOKE_LOG"; then
+    # catalog 是按 session 过滤的：默认只选 core skillset（11 个）。这里显式要全量，
+    # 才能和源码里的 skill.json 总数逐一对齐。
+    SMOKE_URL="http://127.0.0.1:$SMOKE_PORT/mcp?skillsets=all&databases=all"
+    break
+  fi
   kill -0 "$SMOKE_PID" 2>/dev/null || break
   sleep 0.1
 done
