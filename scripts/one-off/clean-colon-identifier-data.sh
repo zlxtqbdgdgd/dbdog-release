@@ -16,6 +16,8 @@
 # 一次性代码：全部环境切完就该删掉本脚本，别留成常驻工具。
 #
 # 顺序铁律：**先换模板 + 重启 agent，再跑本脚本**。反过来会先删完、agent 又按旧模板写回来。
+# **多主机注意**：每台被采集的 DB 主机都要先切完。漏掉一台就会把那台的当前数据当历史删掉，
+# 且它立刻按旧模板写回来（2026-08-06 干跑即撞上：GaussDB 那台还没切，占 22864 行）。
 
 set -euo pipefail
 
@@ -38,10 +40,13 @@ ch() { curl -sS -u "$CH_USER:$CH_PASSWORD" "$CH_URL" --data-binary "$1"; }
 
 # 带冒号的标识列（各表列名不同：events/metric_points 用 tags，DBM 事实表用 instance）。
 # 只挑真实存在的表，避免因某表未建而整条脚本挂掉。
+# 只取**真实表**：system.columns 也会列出 View（如 dbm_activity_read），
+# 对 View 跑 ALTER … DELETE 会直接报错。用 system.tables.engine 过滤掉非 MergeTree 家族。
 tables_with_instance_col() {
-  ch "SELECT table FROM system.columns
-      WHERE database = '$CH_DB' AND name = 'instance'
-      GROUP BY table ORDER BY table FORMAT TSV"
+  ch "SELECT c.table FROM system.columns AS c
+      INNER JOIN system.tables AS t ON t.database = c.database AND t.name = c.table
+      WHERE c.database = '$CH_DB' AND c.name = 'instance' AND t.engine LIKE '%MergeTree'
+      GROUP BY c.table ORDER BY c.table FORMAT TSV"
 }
 
 printf '库: %s\n' "$CH_DB"
