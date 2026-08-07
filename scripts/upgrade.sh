@@ -571,4 +571,15 @@ if [ "$remote_config_upgrade" -eq 1 ] \
   && "$DBDOGCTL" status dbdog-server | grep -q '运行中'; then
   "$SCRIPTS_DIR/verify.sh" --remote-config
 fi
+# Agent 的「采集配置快照」是初始化健康事件带上来的，而那条事件每个 agent 进程只发一次
+# （6 小时去抖，且发送方拿不到投递结果）。server 升级期间它必然送不达：旧版本收下不落库、
+# 重启窗口里直接连不上。于是配额已消耗、6 小时内不再重发，控制台的「采集配置」就一直空着
+# ——2026-08-06 黄区实测即如此，当时误判成功能故障查了很久。重启 agent 会重置该状态，
+# 几秒内即可重报。
+for m in "${targets[@]}"; do
+  [ "$m" = dbdog-server ] || continue
+  warn "dbdog-server 已升级：请到各被采集 DB 主机上重启 agent（systemctl restart dbdog-agent）"
+  warn "  不重启的话，控制台「采集配置」最多要等 6 小时才会重新出现——那是去抖，不是故障"
+  break
+done
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"
