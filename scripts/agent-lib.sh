@@ -1005,7 +1005,15 @@ Requires=dbdog-agent-sysprobe.service
 [Service]
 Type=simple
 User=root
-Environment=DBDOG_DISABLE_DBM_HEALTH=true
+# dbm-health 是紧急停摆开关，正常部署必须是 false。它插在 submit_health_event 的第一行，
+# 打开后所有健康事件在 Python 层直接 return None——**静默、无日志、计数器为 0**，
+# 从外部完全看不出被关掉了。控制台「采集配置」那一页的数据正是初始化健康事件带上来的，
+# 开关为 true 时那页永远空白（2026-08-07 黄区实证，为此查了三轮）。
+# 历史成因：这个开关引入时 dbdog-server 还没有消费端，于是默认写死 true；server 0.1.12
+# 起已经落库 collection config 快照，但安装脚本一直没跟着翻过来。
+# 参照物：dbdog-agent/scripts/ops/dbdog-agent-runtime-cutover.sh 断言它必须是 false，
+# patch-disable-dbmhealth.sh 的注释也写明「dbdog-agent.service 显式设为 false」。
+Environment=DBDOG_DISABLE_DBM_HEALTH=false
 Environment=DBDOG_SCHEMA_RECOMMENDATION_FIELDS=true
 ExecStartPre=/usr/bin/timeout 60 /bin/bash -c 'until test -S $AGENT_RUN_DIR/sysprobe.sock; do sleep 1; done'
 ExecStart=$AGENT_RUNTIME_DIR/bin/agent/agent run -c $AGENT_CONFIG_DIR --sysprobecfgpath $AGENT_CONFIG_DIR

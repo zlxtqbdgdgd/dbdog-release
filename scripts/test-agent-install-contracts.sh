@@ -1496,4 +1496,17 @@ if sed -n '/^agent_warn_gaussdb_collection_gucs()/,/^}/p' "$SCRIPTS_DIR/agent-in
 fi
 pass "GaussDB 采集质量 GUC 以 warn 方式校验，且真实合规取值不误报"
 
-printf 'ALL PASS: 25 agent install contract groups\n'
+# dbm-health 是紧急停摆开关，插在 submit_health_event 第一行。写成 true 后所有健康事件在
+# Python 层 return None——静默、无日志、per-check 计数器为 0，外部完全看不出被关掉，
+# 控制台「采集配置」永远空白。2026-08-07 黄区为此查了三轮：agent/server/网络/配置全正常，
+# 唯独这个开关从首次安装起就是 true。dbdog-agent 的 runtime-cutover 脚本本就断言它必须是
+# false，两仓此前互相矛盾。
+unit_health_switch="$(sed -n 's/^Environment=DBDOG_DISABLE_DBM_HEALTH=//p' "$SCRIPTS_DIR/agent-lib.sh")"
+[ -n "$unit_health_switch" ] || fail "systemd 单元没有显式声明 DBDOG_DISABLE_DBM_HEALTH"
+[ "$unit_health_switch" = false ] || \
+  fail "DBDOG_DISABLE_DBM_HEALTH 必须是 false（实为 $unit_health_switch）——true 会静默关掉采集配置上报"
+[ "$(printf '%s\n' "$unit_health_switch" | wc -l)" -eq 1 ] || \
+  fail "DBDOG_DISABLE_DBM_HEALTH 只应声明一次"
+pass "systemd 单元把 dbm-health 紧急停摆开关显式置为 false"
+
+printf 'ALL PASS: 26 agent install contract groups\n'
