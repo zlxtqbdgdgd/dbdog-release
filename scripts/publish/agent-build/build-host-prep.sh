@@ -215,6 +215,12 @@ EOF
     warn "datadog_checks_base 在发布锚与封存 core 之间有差异"
     warn "产物里的 base 来自封存 core，锚上对 base 的改动**不会进这次产物**"
     warn "要出去只能推进 omnibus seal（编译域改动，不是发一次版能解决的）"
+    # 列出具体差异，否则这条警告会被训练成噪音：看得见改了什么，才判断得了要不要紧。
+    git --git-dir="$GIT_DIR_CORE" diff --name-only "$sealed" "$core_sha" \
+      -- datadog_checks_base/datadog_checks 2>/dev/null | while IFS= read -r changed; do
+      [ -n "$changed" ] || continue
+      printf '         差异: %s\n' "${changed#datadog_checks_base/datadog_checks/}"
+    done
   else
     ok "datadog_checks_base 与封存 core 一致"
   fi
