@@ -11,8 +11,8 @@ RUNNER="$SCRIPTS_DIR/publish/agent-build/omnibus-kylin-platform-v14/run-agent-om
 RECIPE="$SCRIPTS_DIR/publish/recipes/dbdog-agent.sh"
 CONTROL_README="$SCRIPTS_DIR/publish/agent-build/README.md"
 CORE_DIR="$RELEASE_DIR/../dbdog-agent-core"
-WHEEL="${DBDOG_GAUSSDB_WHEEL:-$CORE_DIR/gaussdb/dist/datadog_gaussdb-1.0.1-py3-none-any.whl}"
-EXPECTED_WHEEL_SHA=f696515133a97de9784b86c91324f2447f11022e7da90d823d3348a645c2208f
+WHEEL_BUILDER="$SCRIPTS_DIR/publish/agent-build/build-integration-wheel.sh"
+HOST_PREP="$SCRIPTS_DIR/publish/agent-build/build-host-prep.sh"
 PUBLICATION_RECIPE=destination_local_copy_verify_sync_hardlink_noreplace_archive_then_sidecar_recover_archive_only
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -247,10 +247,26 @@ pass "fresh v14 attempt is recreated from pinned Git plus an explicitly originat
 for required in --no-index --no-deps --force-reinstall --no-cache-dir; do
   grep -Fq -- "$required" "$FINALIZER" || fail "offline wheel install lacks $required"
 done
-grep -Fq 'GAUSSDB_WHEEL_SHA256=f696515133a97de9784b86c91324f2447f11022e7da90d823d3348a645c2208f' \
-  "$FINALIZER" || fail "finalizer does not pin the exact GaussDB wheel"
-grep -Fq 'GAUSSDB_WHEEL_REL=sources/python/gaussdb/612be7bea397c87df707489599c02ed623c29631/datadog_gaussdb-1.0.1-py3-none-any.whl' \
-  "$FINALIZER" || fail "active wheel cache path is not bound to the exact Core source"
+# 这里不再钉字面 SHA。仓里这份 finalizer 是**模板**：prepare-agent-anchor.sh 每次换锚
+# 都会把它机械改写成新一代装到构建机上（活的那份的哈希记在 ANCHOR-INFO 里）。把某一代的
+# wheel SHA 钉成常量，只会让它随换锚静默过期——2026-08-06 发现时它已落后三代，而且它比对的
+# 本地 wheel 路径根本不存在，整块检查静默不执行。改为断言「模板自身内部一致」。
+pinned_wheel_rel="$(sed -n 's/^readonly GAUSSDB_WHEEL_REL=//p' "$FINALIZER")"
+pinned_wheel_sha="$(sed -n 's/^readonly GAUSSDB_WHEEL_SHA256=//p' "$FINALIZER")"
+pinned_wheel_version="$(sed -n 's/^readonly EXPECTED_GAUSSDB_INTEGRATION_VERSION=//p' "$FINALIZER")"
+[ -n "$pinned_wheel_rel" ] && [ -n "$pinned_wheel_sha" ] && [ -n "$pinned_wheel_version" ] ||
+  fail "finalizer does not declare the pinned wheel path/sha/version triple"
+case "$pinned_wheel_sha" in
+  [0-9a-f]*) [ "${#pinned_wheel_sha}" -eq 64 ] || fail "pinned wheel sha is not a sha256" ;;
+  *) fail "pinned wheel sha is not lowercase hex" ;;
+esac
+pinned_wheel_core="$(printf '%s' "$pinned_wheel_rel" | sed -n 's|^sources/python/gaussdb/\([0-9a-f]\{40\}\)/.*|\1|p')"
+[ -n "$pinned_wheel_core" ] ||
+  fail "pinned wheel path is not bound to a 40-hex Core commit"
+case "$pinned_wheel_rel" in
+  *"datadog_gaussdb-$pinned_wheel_version-py3-none-any.whl") ;;
+  *) fail "pinned wheel filename disagrees with EXPECTED_GAUSSDB_INTEGRATION_VERSION" ;;
+esac
 grep -Fq 'Root-Is-Purelib' "$FINALIZER" || fail "finalizer does not verify a pure-Python wheel"
 grep -Fq 'py3-none-any' "$FINALIZER" || fail "finalizer does not verify the wheel compatibility tag"
 pass "post-Omnibus wheel replacement is offline, exact, and pure Python"
@@ -384,30 +400,40 @@ grep -Fq 'prepare-agent-anchor.sh' "$PUBLISH_SH" ||
   fail "anchor preflight failure does not point at the anchor preparer"
 pass "publish.sh derives the aarch64 attempt path and preflights the anchor controls"
 
-if [ -f "$WHEEL" ]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual_wheel_sha=$(sha256sum "$WHEEL" | awk '{ print $1 }')
+# finalizer 钉的那个 wheel SHA 必须能从它自己钉的 Core 提交**重新构建出来**。
+# 这一条把常量从「魔数」变成「可验证的推导」：构建环境不对、或 Core 那个提交的内容变了，
+# 都会在这里红掉，而不是等到发布当天在构建机上才发现。
+if [ ! -d "$CORE_DIR/.git" ]; then
+  printf 'SKIP: 本地没有 dbdog-agent-core 工作树，跳过 wheel 可复现反验\n'
+elif ! git -C "$CORE_DIR" cat-file -e "$pinned_wheel_core^{commit}" 2>/dev/null; then
+  printf 'SKIP: Core 仓里没有 %s，跳过 wheel 可复现反验（先 fetch）\n' "${pinned_wheel_core:0:12}"
+elif [ "${DBDOG_SKIP_WHEEL_REBUILD:-0}" = 1 ]; then
+  printf 'SKIP: DBDOG_SKIP_WHEEL_REBUILD=1，跳过 wheel 可复现反验\n'
+else
+  wheel_out="$(mktemp -d "${TMPDIR:-/tmp}/dbdog-wheel-contract.XXXXXX")"
+  if rebuilt="$("$WHEEL_BUILDER" --core-repo "$CORE_DIR" --core-sha "$pinned_wheel_core" \
+      --integration gaussdb --out "$wheel_out" 2>/dev/null | sed -n 's/^SHA256=//p')"; then
+    [ "$rebuilt" = "$pinned_wheel_sha" ] ||
+      fail "rebuilding gaussdb@${pinned_wheel_core:0:12} yields $rebuilt, finalizer pins $pinned_wheel_sha"
+    pass "finalizer 钉的 wheel SHA 可由其钉的 Core 提交复现"
   else
-    actual_wheel_sha=$(shasum -a 256 "$WHEEL" | awk '{ print $1 }')
+    printf 'SKIP: wheel 构建工具链不可用（首次需要网络装 build/hatchling）\n'
   fi
-  [ "$actual_wheel_sha" = "$EXPECTED_WHEEL_SHA" ] ||
-    fail "local GaussDB wheel SHA-256 differs from the pinned authority"
-  python3 - "$WHEEL" <<'PYEOF'
-from email.parser import BytesParser
-import sys
-import zipfile
-
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
-    wheel_name = next(name for name in archive.namelist() if name.endswith(".dist-info/WHEEL"))
-    metadata = BytesParser().parsebytes(archive.read(metadata_name))
-    wheel = BytesParser().parsebytes(archive.read(wheel_name))
-assert metadata["Name"] == "datadog-gaussdb"
-assert metadata["Version"] == "1.0.1"
-assert wheel["Root-Is-Purelib"] == "true"
-assert wheel.get_all("Tag") == ["py3-none-any"]
-PYEOF
-  pass "local wheel bytes match the pinned 1.0.1 pure-Python artifact"
+  rm -rf -- "$wheel_out"
 fi
+
+# 换构建机 / 换开发机不该重踩：让这套工具与它在发布链里的接线成为契约。
+[ -x "$WHEEL_BUILDER" ] || fail "缺少可复现 wheel 构建器 build-integration-wheel.sh"
+[ -x "$HOST_PREP" ] || fail "缺少构建机前置自检 build-host-prep.sh"
+grep -Fq 'SOURCE_DATE_EPOCH' "$WHEEL_BUILDER" || fail "wheel 构建器没有钉住 SOURCE_DATE_EPOCH"
+grep -Fq -- '--self-check' "$WHEEL_BUILDER" || fail "wheel 构建器缺少按已知锚反验工具链的能力"
+for subcommand in check fetch-mirrors install-wheels; do
+  grep -Fq "$subcommand)" "$HOST_PREP" || fail "构建机前置自检缺少子命令 $subcommand"
+done
+grep -Fq 'omnibus_core_sha' "$HOST_PREP" ||
+  fail "前置自检没有基于封存 core 判断「锚上的改动能否进产物」"
+grep -Fq 'agent_preflight_build_host' "$PUBLISH_SH" ||
+  fail "publish.sh 没有在构建前一次性核对构建机前置条件"
+pass "wheel 构建与构建机前置自检已固化并接入发布链"
 
 printf 'ALL PASS: Agent artifact version/provenance contracts\n'

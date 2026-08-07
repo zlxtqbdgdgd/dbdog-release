@@ -40,6 +40,10 @@ GitHub 资产来绕过脚本。
 - 源仓出货提交必须已经进入各自 `origin/main`；发布器会 fail closed。
 - Agent 正式配方已经跑通。版本和 Agent/Core 源码锚只认
   `dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv`，不要用 `publish.conf` 覆盖。
+- 发 Agent 前先读 `scripts/publish/agent-build/README.md` 的换锚 SOP。**产物里的 Python 包
+  来自被 seal 钉死的 core，不是发布锚**——只有锚定 wheel 能把锚上的改动带进产物。
+  `build-host-prep.sh check` 会算清这件事并一次报全前置条件（publish 预检已自动调用）；
+  它报的「封存 core 里没有」是硬阻断，「内容不同」意味着这次改动不会出去。
 - Agent、Web、MCP 等正式发布不要并发执行；它们会修改同一份 manifest 和 `main`。
 - 清理先运行 `./scripts/publish/publish.sh prune`，确认目标后再加 `--yes`。
 - 网络错误发生在上传或 push 之后时，不要盲目重跑：先核对 GitHub 同名资产、远端 `main` 和

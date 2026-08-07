@@ -822,6 +822,25 @@ resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RES
   fi
 }
 
+# agent_preflight_build_host 在严格的控制物校验之前，先把构建机的前置条件**一次报全**。
+# 下面那个 anchor-controls 预检遇到第一处不满足就 die，一次只暴露一个问题；2026-08-06
+# 那次发布因此来回五轮（mirror 没同步 → 安装根被占 → 缺集成 wheel → …）。这里先跑
+# build-host-prep.sh：顺带把两个 bare mirror fetch 到位，然后列出全部缺项与修复命令，
+# 并报告「哪些包在封存 core 与发布锚之间有差异」——那类差异不会阻断构建，但意味着
+# 锚上的改动这次根本不会进产物（openGauss 因此丢过两次，base 层改动因此白改过一次）。
+agent_preflight_build_host() { # <build host> <agent sha> <core sha>
+  local host="$1" sha="$2" core="$3" prep="$HERE/agent-build/build-host-prep.sh"
+  [ -f "$prep" ] || die "缺少构建机前置脚本: $prep"
+  log "[dbdog-agent/aarch64] 同步构建机 git mirror ..."
+  ssh -o BatchMode=yes -o ConnectTimeout=20 "$host" 'bash -s -- fetch-mirrors' <"$prep" >/dev/null \
+    || die "[dbdog-agent/aarch64] 构建机 git mirror 同步失败"
+  log "[dbdog-agent/aarch64] 核对构建机前置条件 ..."
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=20 "$host" \
+      "bash -s -- check $sha $core" <"$prep"; then
+    die "[dbdog-agent/aarch64] 构建机前置条件未满足；按上面每项的「修复」逐条处理后重试"
+  fi
+}
+
 agent_preflight_anchor_controls() { # <build host> <agent sha> <core sha>
   # Agent 的 omnibus 构建要跑几小时，而它依赖的一整套随锚控制物（anchor 目录、control
   # overlay、GaussDB wheel、build attempt、pipeline lock）都得由管理员用
@@ -942,6 +961,7 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
   local BUILD_HOST="$RESOLVED_BUILD_HOST"
 
   if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
+    agent_preflight_build_host "$BUILD_HOST" "$sha" "$core"
     agent_preflight_anchor_controls "$BUILD_HOST" "$sha" "$core"
   fi
 

@@ -20,9 +20,18 @@ preparer that derives each new generation from the previous one.
 
 步骤：
 
-1. **准备 GaussDB wheel**：按新的 core 提交从干净归档独立构建（`SOURCE_DATE_EPOCH`
-   取该 commit 时间，两次独立构建必须字节一致），以 `root:root` `0444` 放到
-   `/home/dbdog/cache/dbdog-agent/sources/python/gaussdb/<core_sha>/`。
+1. **准备锚定 wheel**：开发机上按新的 core 提交构建，再以 `root:root` `0444` 放到
+   `/home/dbdog/cache/dbdog-agent/sources/python/<引擎>/<core_sha>/`。
+
+   ```bash
+   ./scripts/publish/agent-build/build-integration-wheel.sh \
+       --core-sha <新core_sha> --integration gaussdb --out ./dist \
+       --self-check <上一个core_sha>=<ANCHOR-INFO 里的 gaussdb_wheel_sha256>
+   ```
+
+   `--self-check` 先按上一个锚重建并比对，确认这台开发机能复现历史 wheel 之后，
+   新 wheel 才可信。**GaussDB 之外还有谁需要 wheel，由 `build-host-prep.sh check` 判定**
+   （见「产物里的 Python 代码来自哪」）——openGauss 就属于必须补 wheel 的那一类。
 2. **跑换锚准备器**（构建机上以 root）：
 
    ```bash
@@ -37,11 +46,99 @@ preparer that derives each new generation from the previous one.
    上一代一字不动。任何一处旧 token 残留都会 fail closed。
 3. **改基线**：`dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv` 的
    `agent_release_source_commit` 与 `integrations_core_release_source_commit`。
-4. **发布**：`./scripts/publish/publish.sh publish dbdog-agent --bump patch --yes`。
-   构建前的 preflight 会先把上面这些控制物查一遍，缺任何一项都在花掉构建时间之前停下。
+4. **腾出安装根**：`/opt/dbdog-agent` 必须为空且无进程占用。这台机器上的
+   `dbdog-agent.service` 就跑在这个运行时上，所以要先停服务、把上一代 runtime 整体
+   `mv` 进它自己的历史 build 目录（约定名 `finalized-runtime-<上一版本>`），发布后再起回来。
+   **只移不删**——依赖 cache 与历史产物都在那底下。
+
+5. **发布**：`./scripts/publish/publish.sh publish dbdog-agent --bump patch --yes`。
+   构建前的 preflight 会先跑 `build-host-prep.sh check` 一次报全前置条件，再逐项校验
+   控制物，缺任何一项都在花掉构建时间之前停下。
+
+6. **装非 GaussDB 的锚定 wheel**（omnibus 跑完、finalizer 之前，构建机 root）：
+
+   ```bash
+   ssh root@<build-host> 'bash -s -- install-wheels <agent_sha> <core_sha>' \
+     < scripts/publish/agent-build/build-host-prep.sh
+   ```
+
+   只装「封存 core 里没有」那一类；GaussDB 由 finalizer 自己装，不重复。
+
+7. **finalize**（构建机 root，交互执行，不要给它配 NOPASSWD）：
+   `anchors/<agent_sha>/run-finalize-agent-runtime.sh <版本>`，完成后重跑第 5 步的 publish，
+   配方会验证并复用已出的 canonical 产物。
 
 配方本身**不含任何随锚变的字面量**——路径由传入的 `$SHA`/`$CORE_SHA` 派生，overlay 代号
 与 finalizer/wrapper 哈希从 `ANCHOR-INFO` 读取。所以换锚不需要改 `recipes/dbdog-agent.sh`。
+
+## 先记住这一条：产物里的 Python 代码来自哪
+
+**omnibus 只从被 seal 钉死的 core 装 Python 包**（`ANCHOR-INFO` 的 `omnibus_core_sha`），
+发布锚的 core 代码只有通过**锚定 wheel**才进得了产物。
+
+所以"改了 dbdog-agent-core 就会随下次发布出去"是**错的**。按引擎分三种情况：
+
+| 情况 | 结果 | 处置 |
+|---|---|---|
+| 封存 core 里**没有**这个引擎（如 openGauss） | 产物整个缺掉它，而我们又发了它的 conf → 采集静默归零 | **必须**出锚定 wheel，否则发布被 `verify-agent-integrations.sh` 拦下 |
+| 封存里有、与发布锚**内容不同**（如 postgres、`datadog_checks_base`） | 产物装的是**封存版**，锚上的改动这次不会出去 | 要出去只能推进 omnibus seal（编译域大改），或给它加锚定 wheel |
+| 封存里有、与发布锚一致 | 正常 | 无 |
+
+`build-host-prep.sh check` 会把这三类算清楚并直接报出来。openGauss 因为第一种情况丢过两次
+（第一次让 round-20 该引擎零遥测、整轮作废）；`datadog_checks_base` 的改动因为第二种情况
+白改过一次（2026-08-06）——两次都不是构建报错，是**静默**的。
+
+## 每次发布必过的前置条件
+
+在构建机上跑一条就够，缺什么它连修复命令一起给：
+
+```bash
+ssh <build-host> 'bash -s -- check <agent_sha> <core_sha>' < scripts/publish/agent-build/build-host-prep.sh
+```
+
+`publish.sh` 在构建前会自动跑它（并顺带 fetch 两个 mirror），所以正常路径不用手动执行。
+它覆盖的五类，每一类都真实拦过一次发布：
+
+1. **随锚控制物**：`anchors/<sha>/ANCHOR-INFO` 存在、core 锚与基线一致
+2. **git mirror**：两个 bare mirror 有本次的 agent/core 提交。它们**不会自动 fetch**，
+   且属主是 `dbdog`——用 root fetch 会在里面留下 root 属主的对象
+3. **安装根 `/opt/dbdog-agent`**：必须是空的 `dbdog:dbdog 0755`，且**没有进程在用**。
+   这台机器上的 `dbdog-agent.service` 正是从这里跑的，不停它，finalizer 会在
+   `clean_runtime_tree` 与 `verify_runtime_exclusions` 之间被它重写 `run/registry.json`
+4. **锚定 wheel**：见上一节
+5. **共享基座漂移**：只报告，不阻断
+
+## 新构建机接管
+
+构建机上有一批**不在 git 里、也不可能从 git 重建**的状态。换机时必须整体迁移，
+否则就是从头再踩一遍：
+
+| 路径 | 是什么 | 能否重建 |
+|---|---|---|
+| `cache/seals/<origin>-<omnibus_core>-…/` | omnibus 依赖封存（含 git bundle、bazel/distdir 缓存） | 否——这是"离线可复现"的根 |
+| `cache/anchors/<agent_sha>/` | 该代的 ANCHOR-INFO 与被改写的 finalizer/wrapper | 可由上一代经 `prepare-agent-anchor.sh` 派生，但需要上一代在场 |
+| `cache/control-overlays/…-vN/` | 每代 control overlay | 同上（历史代不可变，别手改） |
+| `cache/git/dbdog-agent{,-core}.git` | bare mirror | 可重新 clone，但要保持 `dbdog` 属主与 `+refs/*:refs/*` |
+| `cache/sources/python/<引擎>/<core_sha>/*.whl` | 锚定 wheel | **可以**，用 `build-integration-wheel.sh` 按 core 提交重建 |
+| `work/dbdog-agent-<short>-build*/` | 各代 build attempt 与归档的 runtime | 历史记录，别删（`out/` 里是已发布产物的副本） |
+
+**wheel 是唯一能干净重建的一类**，做法固化在 `build-integration-wheel.sh`：干净归档 +
+`SOURCE_DATE_EPOCH` 取 commit 时间 + 两次独立构建字节一致。接手新开发机时先用
+`--self-check <已知core_sha>=<已知sha256>` 按 `ANCHOR-INFO` 里记着的值反验一次——
+复现不出历史 wheel 就说明这台机器的工具链不对，别急着出新包。
+
+## 发布域 vs 编译域
+
+出问题时先分清归属，能省掉大半排查：
+
+| | 编译域（本目录 + 构建机） | 发布域（`publish.sh` + manifest + 产物桶） |
+|---|---|---|
+| 决定什么 | 产物里**有什么代码**：封存 core、锚定 wheel、control overlay、finalizer | 产物**去哪、叫什么版本**：版本号、manifest、桶内资产、验收 |
+| 权威 | `ANCHOR-INFO` + seal | `manifest.tsv` |
+| 典型症状 | 集成缺失/装了旧版、构建中途失败、finalize 门禁不过 | 版本号错、桶里有孤儿资产、验收失败、上传中断 |
+| 改动代价 | 大：动 control 物要换代（overlay vN→vN+1）并重跑构建 | 小：改脚本即可，不必重新构建 |
+
+一个判别法：**问题换台构建机会不会消失**？会 → 编译域；不会 → 发布域。
 
 ## 报错对照表
 
