@@ -385,6 +385,9 @@ oauth_main() {
   check "web 后端与 PUBLIC_* URL 已配置" probe_web_urls
   check "MCP 后端/OAuth/public URL 已配置" probe_mcp_urls
   check "Web OAuth 表结构已迁移" probe_web_oauth_schema
+  # discovery 探测建立在 MCP 在监听之上；先单独判一次存活，服务没起来时报的是
+  # 「MCP 没在跑」而不是「OAuth 端点不可用」，省掉一轮翻日志。
+  check "dbdog-mcp /healthz（仅存活）" probe_mcp
   check "MCP OAuth discovery 与 401 challenge 可用" probe_oauth_discovery
   finish_checks "OAuth 自动认证链验收通过"
 }

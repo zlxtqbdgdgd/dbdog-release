@@ -414,6 +414,29 @@ upgrade_one() {
   log "$m: $inst → ${version}（artifact ${sha256:0:12}）完成"
 }
 
+# 升级的目的是让点名的模块跑上新版本，所以升级计划内的服务在收尾时必须是运行态。
+# upgrade_one 只把「切包前确实在跑」的服务原样拉回：崩溃后残留的、以及产物身份已经
+# 匹配而走了跳过分支的模块，都会被静默留在停止态，而随后的验收是无条件执行的，于是
+# 出现「包已切好」和「端点不可用」同时成立（bugs/upgrade-mcp-0.1.9-oauth-verify-failure.md）。
+# 这里在验收之前统一收口，并把失败落到「哪个服务没起来」而不是「去翻日志」。
+start_target_services() {
+  local m s svcs pending=""
+  for m in "$@"; do
+    svcs="$(module_services "$m")"
+    for s in $svcs; do
+      if "$DBDOGCTL" status "$s" | grep -q 运行中; then continue; fi
+      case " $pending " in *" $s "*) continue ;; esac
+      pending="$pending $s"
+    done
+  done
+  [ -n "$pending" ] || return 0
+  log "升级计划内未在运行的服务，按计划拉起:$pending"
+  # pending 由仓内固定服务名组成，需要有意拆词传给 dbdogctl。
+  # shellcheck disable=SC2086
+  "$DBDOGCTL" start $pending \
+    || die "升级后这些服务未能启动:${pending}；查看 $LOGS_DIR/ 下对应服务日志"
+}
+
 # Agent 位于 DB 主机且拥有独立的 root/config/systemd 事务。统一入口在参数校验后
 # 直接 exec 同一份首装/升级实现，避免先创建 stack 布局，也避免维护第二套 cutover。
 for requested in "$@"; do
@@ -540,6 +563,7 @@ fi
 if [ "$mcp_was_running" -eq 1 ]; then
   "$DBDOGCTL" restart dbdog-mcp
 fi
+start_target_services "${targets[@]}"
 if [ "$oauth_upgrade" -eq 1 ]; then
   "$SCRIPTS_DIR/verify.sh" --oauth
 fi

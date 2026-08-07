@@ -292,6 +292,9 @@ retry_http() {
     *:8090/.well-known/oauth-protected-resource)
       printf '%s\n' '{"resource":"http://dbdog.internal:8090/mcp","authorization_servers":["http://dbdog.internal:3000"],"bearer_methods_supported":["header"]}'
       ;;
+    *:8090/healthz)
+      printf '%s\n' 'ok'
+      ;;
     *) return 1 ;;
   esac
 }
@@ -302,6 +305,18 @@ curl() {
 oauth_main >/dev/null || fail "OAuth 专项升级验收未通过完整执行"
 pass "OAuth 专项验收覆盖表结构、发现元数据与 401 challenge"
 
+# 升级前崩掉/停掉的模块曾被静默留在停止态，再由无条件执行的验收报成端点故障
+# （bugs/upgrade-mcp-0.1.9-oauth-verify-failure.md）。收尾拉起必须发生在验收之前。
+start_line="$(grep -n 'start_target_services "\${targets\[@\]}"' "$SCRIPTS_DIR/upgrade.sh" | cut -d: -f1)"
+oauth_verify_line="$(grep -n '"\$SCRIPTS_DIR/verify.sh" --oauth' "$SCRIPTS_DIR/upgrade.sh" | cut -d: -f1)"
+[ -n "$start_line" ] || fail "升级收尾没有统一确保计划内模块的服务在运行"
+[ -n "$oauth_verify_line" ] || fail "升级收尾没有安排 OAuth 验收"
+[ "$start_line" -lt "$oauth_verify_line" ] \
+  || fail "计划内服务的收尾拉起晚于 OAuth 验收，停止态仍会被报成端点故障"
+grep -Fq 'check "dbdog-mcp /healthz（仅存活）" probe_mcp' "$SCRIPTS_DIR/verify.sh" \
+  || fail "OAuth 专项验收没有先判 MCP 存活，服务没起来时会误报成端点故障"
+pass "升级在验收前拉起计划内模块的服务，验收失败先归因到服务存活"
+
 mkdir -p "$DATA_DIR"
 install -m 0600 /dev/null "$DATA_DIR/remote-config.seed"
 remote_config_main >/dev/null || fail "Remote Config 专项升级验收未通过完整执行"
@@ -310,4 +325,4 @@ rc_auth_header="$(cat "$TEST_ROOT/rc-auth-header-path")"
 [ ! -e "$rc_auth_header" ] || fail "Remote Config 验收遗留了含内部凭证的临时文件"
 pass "Remote Config 验收覆盖内部认证、seed 权限与 TUF root 结构"
 
-printf 'ALL PASS: 14 release contract tests\n'
+printf 'ALL PASS: 15 release contract tests\n'
