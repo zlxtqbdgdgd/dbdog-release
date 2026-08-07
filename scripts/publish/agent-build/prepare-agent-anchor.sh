@@ -326,6 +326,48 @@ gaussdb_wheel="$CACHE_ROOT/$gaussdb_wheel_rel"
   die "GaussDB wheel 必须是 root:root mode 0444: $gaussdb_wheel"
 gaussdb_wheel_sha256=$(file_sha256 "$gaussdb_wheel")
 
+# --- 锚定 wheel 清单：把「谁必须有 wheel」在换锚这一步就定死 -------------------
+#
+# 产物里的 Python 包只来自被 seal 钉死的 core（$OMNIBUS_CORE_SHA）。封存 core 里根本
+# 没有的引擎（openGauss 就是），不补锚定 wheel 就会整个缺出产物，而 conf 又已经发了，
+# 采集静默归零——它因此丢过两次。以前这件事全靠人记，现在在这里 fail closed：
+# 换锚是最早能发现它的时刻，比构建几十分钟后才报废划算得多。
+#
+# gaussdb 由 finalizer 自己装（上面那段）；其余记进 PINNED-WHEELS，由
+# build-host-prep.sh install-wheels 在 finalize 之前装，语义与 finalizer 完全一致。
+pinned_wheels_file="$anchor_staging/PINNED-WHEELS"
+: >"$pinned_wheels_file"
+printf 'gaussdb\t%s\t%s\n' "$gaussdb_wheel_rel" "$gaussdb_wheel_sha256" >>"$pinned_wheels_file"
+
+agent_git="$CACHE_ROOT/git/dbdog-agent.git"
+core_git="$CACHE_ROOT/git/dbdog-agent-core.git"
+tree_at() { # <gitdir> <sha> <路径> —— 不存在回显空串；--verify 不能少
+  git --git-dir="$1" rev-parse --verify --quiet "$2:$3" 2>/dev/null || true
+}
+for conf_entry in $(git --git-dir="$agent_git" ls-tree --name-only \
+  "$to_agent_sha:dbdog-deploy/conf/conf.d" 2>/dev/null); do
+  engine=${conf_entry%/}
+  engine=${engine%.d}
+  case $engine in '' | *[!a-z0-9_]*) continue ;; esac
+  [[ $engine == gaussdb ]] && continue
+  released_tree=$(tree_at "$core_git" "$to_core_sha" "$engine/datadog_checks/$engine")
+  [[ -n $released_tree ]] || continue
+  sealed_tree=$(tree_at "$core_git" "$OMNIBUS_CORE_SHA" "$engine/datadog_checks/$engine")
+  [[ -n $sealed_tree ]] && continue   # 封存里有，产物至少不会缺掉它（可能是旧版，另行报告）
+  extra_wheel=$(find "$CACHE_ROOT/sources/python/$engine/$to_core_sha" -maxdepth 1 \
+    -name "datadog_$engine-*-py3-none-any.whl" -type f 2>/dev/null | head -1 || true)
+  [[ -n $extra_wheel ]] || die \
+    "$engine 不在封存 core 里，必须为本次 core 锚提供锚定 wheel，否则产物会整个缺掉它。
+   先在开发机上跑 build-integration-wheel.sh --integration $engine --core-sha $to_core_sha，
+   再以 root:root 0444 放到 $CACHE_ROOT/sources/python/$engine/$to_core_sha/"
+  [[ $(stat -c '%u:%g:%a' -- "$extra_wheel") == 0:0:444 ]] || \
+    die "$engine 的锚定 wheel 必须是 root:root mode 0444: $extra_wheel"
+  printf '%s\t%s\t%s\n' "$engine" "${extra_wheel#"$CACHE_ROOT/"}" "$(file_sha256 "$extra_wheel")" \
+    >>"$pinned_wheels_file"
+  log "锚定 wheel 入册: $engine <- ${extra_wheel##*/}"
+done
+pinned_wheels_sha256=$(file_sha256 "$pinned_wheels_file")
+
 set_readonly_assignments "$anchor_staging/finalize-agent-runtime.sh" \
   "EXPECTED_CONTROL_OVERLAY_RUNNER_SHA256=$runner_sha256" \
   "EXPECTED_CONTROL_INFO_SHA256=$control_info_sha256" \
@@ -385,6 +427,7 @@ finalizer_sha256=$finalizer_sha256
 finalizer_wrapper_sha256=$wrapper_sha256
 gaussdb_wheel_rel=$gaussdb_wheel_rel
 gaussdb_wheel_sha256=$gaussdb_wheel_sha256
+pinned_wheels_sha256=$pinned_wheels_sha256
 build_dir=$to_build_dir
 pipeline_lock=$to_pipeline_lock
 derived_from_agent_sha=$from_agent_sha
@@ -395,6 +438,7 @@ EOF
 install_root_readonly "$anchor_staging/finalize-agent-runtime.sh" 0555
 install_root_readonly "$anchor_staging/run-finalize-agent-runtime.sh" 0555
 install_root_readonly "$anchor_staging/ANCHOR-INFO" 0444
+install_root_readonly "$anchor_staging/PINNED-WHEELS" 0444
 install_root_readonly_dir "$anchor_staging"
 mv -T -- "$anchor_staging" "$to_anchor_dir"
 anchor_staging=

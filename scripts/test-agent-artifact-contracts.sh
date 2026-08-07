@@ -436,4 +436,24 @@ grep -Fq 'agent_preflight_build_host' "$PUBLISH_SH" ||
   fail "publish.sh 没有在构建前一次性核对构建机前置条件"
 pass "wheel 构建与构建机前置自检已固化并接入发布链"
 
+# 锚定 wheel 清单：把「谁不补 wheel 就会整个缺出产物」在换锚这一步定死。
+# openGauss 正是这一类，它因此丢过两次（第一次让 round-20 该引擎零遥测整轮作废）。
+ANCHOR_PREP="$SCRIPTS_DIR/publish/agent-build/prepare-agent-anchor.sh"
+grep -Fq 'PINNED-WHEELS' "$ANCHOR_PREP" ||
+  fail "换锚准备器没有生成锚定 wheel 清单"
+grep -Fq 'pinned_wheels_sha256=$pinned_wheels_sha256' "$ANCHOR_PREP" ||
+  fail "ANCHOR-INFO 没有记录锚定 wheel 清单的摘要"
+grep -Fq 'install_root_readonly "$anchor_staging/PINNED-WHEELS" 0444' "$ANCHOR_PREP" ||
+  fail "锚定 wheel 清单没有按 root:root 0444 落盘"
+grep -Fq '不在封存 core 里，必须为本次 core 锚提供锚定 wheel' "$ANCHOR_PREP" ||
+  fail "换锚时对「封存 core 里没有的引擎」没有 fail closed"
+grep -Fq 'pinned_wheels_sha256' "$PUBLISH_SH" ||
+  fail "publish 预检没有按 ANCHOR-INFO 校验锚定 wheel 清单"
+if grep -Fq 'datadog_gaussdb-1.0.1-py3-none-any.whl' "$PUBLISH_SH"; then
+  fail "publish 预检又把 GaussDB wheel 版本写死了（应从 ANCHOR-INFO 的 gaussdb_wheel_rel 取）"
+fi
+grep -Fq '锚册是权威' "$HOST_PREP" ||
+  fail "build-host-prep 没有以锚定 wheel 清单为权威"
+pass "锚定 wheel 清单在换锚时定死，预检与安装都以它为权威"
+
 printf 'ALL PASS: Agent artifact version/provenance contracts\n'

@@ -14,14 +14,18 @@
 # 子命令：
 #   check <agent_sha> <core_sha>          只读；报全部前置条件与漂移，缺项给修复命令
 #   fetch-mirrors                         以属主 dbdog 身份 fetch 两个 bare mirror
-#   install-wheels <agent_sha> <core_sha> root；装上 check 判定需要的锚定 wheel
+#   install-wheels <agent_sha> <core_sha> root；照锚册 PINNED-WHEELS 安装锚定 wheel
+#
+# 锚定 wheel 的权威是换锚时落下的 anchors/<sha>/PINNED-WHEELS（摘要记在 ANCHOR-INFO）。
+# 旧版准备器建的锚没有它，那类退回按封存 core 现场推导，并会明确提示是旧锚。
 set -euo pipefail
 
 umask 0022
 export LC_ALL=C
 
-CACHE_ROOT=/home/dbdog/cache/dbdog-agent
-INSTALL_DIR=/opt/dbdog-agent
+# 两个根路径可被环境变量覆盖——只为让合成夹具能在不碰真实 cache 的前提下跑这套判定。
+CACHE_ROOT="${DBDOG_AGENT_CACHE_ROOT:-/home/dbdog/cache/dbdog-agent}"
+INSTALL_DIR="${DBDOG_AGENT_INSTALL_DIR:-/opt/dbdog-agent}"
 GIT_DIR_AGENT="$CACHE_ROOT/git/dbdog-agent.git"
 GIT_DIR_CORE="$CACHE_ROOT/git/dbdog-agent-core.git"
 EMBEDDED_PYTHON="$INSTALL_DIR/embedded/bin/python3"
@@ -77,6 +81,12 @@ classify_engines() { # <agent_sha> <core_sha> <sealed_sha> -> 每行 "missing|dr
   done
 }
 
+# 换锚时定死的锚定 wheel 清单（每行 "<引擎>\t<相对路径>\t<sha256>"）。
+# 这次改动之前建的锚没有这个文件——那类走下面的推导兜底，并明确提示它是旧锚。
+pinned_wheels_file() { # <agent_sha>
+  printf '%s\n' "$CACHE_ROOT/anchors/$1/PINNED-WHEELS"
+}
+
 wheel_path_for() { # <引擎> <core_sha> —— 回显 wheel 路径；没有就回显空串（绝不失败）
   local dir="$CACHE_ROOT/sources/python/$1/$2"
   [ -d "$dir" ] || return 0
@@ -86,7 +96,8 @@ wheel_path_for() { # <引擎> <core_sha> —— 回显 wheel 路径；没有就�
 
 cmd_check() {
   local agent_sha="$1" core_sha="$2" sealed info_core covered engine wheel
-  local base_released base_sealed drifted kind
+  local base_released base_sealed drifted kind manifest expect_digest actual_digest
+  local pw_engine pw_rel pw_sha
 
   section "锚控制物"
   if anchor_value "$agent_sha" anchor_info_format >/dev/null 2>&1; then
@@ -145,6 +156,28 @@ cmd_check() {
   section "锚定 wheel（决定发布锚的代码能否进产物）"
   covered="$(anchor_value "$agent_sha" gaussdb_wheel_rel | sed -n 's|^sources/python/\([^/]*\)/.*|\1|p')"
   if [ -n "$covered" ]; then printf '         finalizer 自带覆盖: %s\n' "$covered"; fi
+  manifest="$(pinned_wheels_file "$agent_sha")"
+  if [ -f "$manifest" ]; then
+    expect_digest="$(anchor_value "$agent_sha" pinned_wheels_sha256 || true)"
+    actual_digest="$(sha256sum "$manifest" | awk '{ print $1 }')"
+    if [ -n "$expect_digest" ] && [ "$expect_digest" != "$actual_digest" ]; then
+      bad "PINNED-WHEELS 内容与 ANCHOR-INFO 记录不符（清单被改过）"
+    fi
+    while IFS="$(printf '\t')" read -r pw_engine pw_rel pw_sha; do
+      [ -n "$pw_engine" ] || continue
+      if [ ! -f "$CACHE_ROOT/$pw_rel" ]; then
+        bad "$pw_engine：锚册登记的 wheel 不在了（$pw_rel）"
+      elif [ "$(sha256sum "$CACHE_ROOT/$pw_rel" | awk '{ print $1 }')" != "$pw_sha" ]; then
+        bad "$pw_engine：wheel 内容与锚册记录的 sha256 不符"
+      elif [ "$(stat -c '%U:%G %a' "$CACHE_ROOT/$pw_rel")" != "root:root 444" ]; then
+        bad "$pw_engine：wheel 属主模式应为 root:root 0444"
+      else
+        ok "$pw_engine：锚册登记的 wheel 就位且内容吻合"
+      fi
+    done <"$manifest"
+  else
+    warn "这一代锚没有 PINNED-WHEELS（换锚时的旧版准备器所建），改用推导兜底"
+  fi
   drifted=""
   while read -r kind engine; do
     [ -n "$engine" ] || continue
@@ -194,6 +227,18 @@ EOF
   printf '全部前置条件满足，可以发布\n'
 }
 
+# 与 finalizer 装 gaussdb 完全同一套语义：净化环境、离线、不牵连依赖、不写字节码。
+install_one_wheel() { # <引擎> <wheel 绝对路径>
+  [ "$(stat -c '%U:%G %a' "$2")" = "root:root 444" ] \
+    || die "$1 的 wheel 必须是 root:root 0444: $2"
+  env -i HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin:/bin \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 \
+    "$EMBEDDED_PYTHON" -I -B -m pip install \
+    --no-index --no-deps --force-reinstall --no-cache-dir "$2" >/dev/null \
+    || die "$1 离线 wheel 安装失败"
+  printf 'installed %s from %s\n' "$1" "$2"
+}
+
 cmd_fetch_mirrors() {
   local d
   for d in "$GIT_DIR_AGENT" "$GIT_DIR_CORE"; do
@@ -209,27 +254,34 @@ cmd_fetch_mirrors() {
 }
 
 cmd_install_wheels() {
-  local agent_sha="$1" core_sha="$2" sealed covered engine wheel kind
+  local agent_sha="$1" core_sha="$2" sealed covered engine wheel kind manifest rel sha
   [ "$(id -u)" -eq 0 ] || die "install-wheels 必须以 root 执行"
   [ -x "$EMBEDDED_PYTHON" ] || die "运行时里没有 embedded Python（先跑 omnibus 构建）"
   sealed="$(anchor_value "$agent_sha" omnibus_core_sha)" || die "读不到 ANCHOR-INFO"
   covered="$(anchor_value "$agent_sha" gaussdb_wheel_rel | sed -n 's|^sources/python/\([^/]*\)/.*|\1|p')"
 
+  manifest="$(pinned_wheels_file "$agent_sha")"
+  if [ -f "$manifest" ]; then
+    # 锚册是权威：换锚时已按封存 core 判定并 fail closed，这里照单安装即可。
+    while IFS="$(printf '\t')" read -r engine rel sha; do
+      [ -n "$engine" ] || continue
+      if [ "$engine" = "$covered" ]; then continue; fi  # finalizer 自己装
+      wheel="$CACHE_ROOT/$rel"
+      [ -f "$wheel" ] || die "锚册登记的 wheel 不在了: $rel"
+      [ "$(sha256sum "$wheel" | awk '{ print $1 }')" = "$sha" ] \
+        || die "$engine 的 wheel 内容与锚册记录不符"
+      install_one_wheel "$engine" "$wheel"
+    done <"$manifest"
+    return 0
+  fi
+  printf '注意: 这一代锚没有 PINNED-WHEELS（旧版准备器所建），改用推导兜底\n' >&2
   classify_engines "$agent_sha" "$core_sha" "$sealed" | while read -r kind engine; do
     # 只补「封存 core 里没有」的；drift 那类装的是封存版，不在这里越权替换。
     if [ "$kind" != missing ]; then continue; fi
     if [ "$engine" = "$covered" ]; then continue; fi   # 这个由 finalizer 自己装
     wheel="$(wheel_path_for "$engine" "$core_sha")"
     [ -n "$wheel" ] || die "$engine 的锚定 wheel 未就位（先跑 check）"
-    [ "$(stat -c '%U:%G %a' "$wheel")" = "root:root 444" ] \
-      || die "$engine 的 wheel 必须是 root:root 0444"
-    # 与 finalizer 装 gaussdb 完全同一套语义：净化环境、离线、不牵连依赖、不写字节码。
-    env -i HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin:/bin \
-      PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 \
-      "$EMBEDDED_PYTHON" -I -B -m pip install \
-      --no-index --no-deps --force-reinstall --no-cache-dir "$wheel" >/dev/null \
-      || die "$engine 离线 wheel 安装失败"
-    printf 'installed %s from %s\n' "$engine" "$wheel"
+    install_one_wheel "$engine" "$wheel"
   done
 }
 

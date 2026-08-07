@@ -881,9 +881,33 @@ expect_wrapper="$(field "$anchor_info" finalizer_wrapper_sha256)"
 actual_wrapper="$(sha256sum -- "$anchor_dir/run-finalize-agent-runtime.sh")"
 [ "${actual_wrapper%% *}" = "$expect_wrapper" ] || fail 'finalizer wrapper 字节与 ANCHOR-INFO 记录不符'
 
-wheel="$cache/sources/python/gaussdb/$CORE_SHA/datadog_gaussdb-1.0.1-py3-none-any.whl"
-[ -f "$wheel" ] || fail "缺少该 core 提交的 GaussDB wheel: $wheel"
+# wheel 路径与摘要都从 ANCHOR-INFO 取，不在这里复写版本号——写死过 1.0.1，集成版本一 bump
+# 这条检查就会指向不存在的文件。
+wheel_rel="$(field "$anchor_info" gaussdb_wheel_rel)" || fail 'ANCHOR-INFO 缺少 gaussdb_wheel_rel'
+wheel="$cache/$wheel_rel"
+[ -f "$wheel" ] || fail "缺少 ANCHOR-INFO 登记的 GaussDB wheel: $wheel"
 [ "$(stat -c '%u:%g:%a' -- "$wheel")" = 0:0:444 ] || fail 'GaussDB wheel 必须是 root:root 0444'
+[ "$(sha256sum -- "$wheel" | awk '{ print $1 }')" = "$(field "$anchor_info" gaussdb_wheel_sha256)" ] ||
+  fail 'GaussDB wheel 内容与 ANCHOR-INFO 记录不符'
+
+# 锚定 wheel 清单：换锚时按封存 core 判定「谁不补 wheel 就会整个缺出产物」并定死。
+# 这一代锚由旧版准备器所建时没有该文件，退回只校 GaussDB（openGauss 那类仍由
+# build-host-prep.sh check 与产物集成集合检查兜住）。
+pinned="$anchor_dir/PINNED-WHEELS"
+if [ -f "$pinned" ]; then
+  [ "$(stat -c '%u:%g:%a' -- "$pinned")" = 0:0:444 ] || fail 'PINNED-WHEELS 必须是 root:root 0444'
+  expect_pinned="$(field "$anchor_info" pinned_wheels_sha256)" || fail 'ANCHOR-INFO 缺少 pinned_wheels_sha256'
+  [ "$(sha256sum -- "$pinned" | awk '{ print $1 }')" = "$expect_pinned" ] ||
+    fail 'PINNED-WHEELS 与 ANCHOR-INFO 记录不符'
+  while IFS="$(printf '\t')" read -r pw_engine pw_rel pw_sha; do
+    [ -n "$pw_engine" ] || continue
+    pw="$cache/$pw_rel"
+    [ -f "$pw" ] || fail "锚册登记的 $pw_engine wheel 不在了: $pw_rel"
+    [ "$(stat -c '%u:%g:%a' -- "$pw")" = 0:0:444 ] || fail "$pw_engine wheel 必须是 root:root 0444"
+    [ "$(sha256sum -- "$pw" | awk '{ print $1 }')" = "$pw_sha" ] ||
+      fail "$pw_engine wheel 内容与锚册记录不符"
+  done <"$pinned"
+fi
 
 build_dir=/home/dbdog/work/dbdog-agent-$short-build2
 [ -d "$build_dir" ] || fail "缺少 build attempt $build_dir"

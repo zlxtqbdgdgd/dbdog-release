@@ -30,8 +30,9 @@ preparer that derives each new generation from the previous one.
    ```
 
    `--self-check` 先按上一个锚重建并比对，确认这台开发机能复现历史 wheel 之后，
-   新 wheel 才可信。**GaussDB 之外还有谁需要 wheel，由 `build-host-prep.sh check` 判定**
-   （见「产物里的 Python 代码来自哪」）——openGauss 就属于必须补 wheel 的那一类。
+   新 wheel 才可信。**GaussDB 之外还有谁需要 wheel，由换锚准备器在第 2 步判定并 fail closed**
+   ——凡「conf 已发、发布锚 core 里有、封存 core 里没有」的引擎（openGauss 就是），
+   缺 wheel 会让换锚直接失败，不会拖到构建之后才暴露。
 2. **跑换锚准备器**（构建机上以 root）：
 
    ```bash
@@ -44,6 +45,11 @@ preparer that derives each new generation from the previous one.
    它由上一代机械改写出新一代的 overlay 与 finalizer/wrapper，重算全部哈希，落下
    `anchors/<新agent_sha>/ANCHOR-INFO`，并建好 pipeline lock 与 build attempt。
    上一代一字不动。任何一处旧 token 残留都会 fail closed。
+
+   同时落下 `anchors/<新agent_sha>/PINNED-WHEELS`（`root:root 0444`，每行
+   `<引擎>\t<相对路径>\t<sha256>`），摘要记进 ANCHOR-INFO 的 `pinned_wheels_sha256`。
+   **这份清单是此后的权威**：publish 预检逐个校验它登记的 wheel 是否在位、内容是否吻合，
+   `install-wheels` 照单安装。清单里少了谁，在这一步就报错，而不是等产物出来才发现缺集成。
 3. **改基线**：`dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv` 的
    `agent_release_source_commit` 与 `integrations_core_release_source_commit`。
 4. **腾出安装根**：`/opt/dbdog-agent` 必须为空且无进程占用。这台机器上的
@@ -62,7 +68,8 @@ preparer that derives each new generation from the previous one.
      < scripts/publish/agent-build/build-host-prep.sh
    ```
 
-   只装「封存 core 里没有」那一类；GaussDB 由 finalizer 自己装，不重复。
+   照 `PINNED-WHEELS` 安装（GaussDB 那条由 finalizer 自己装，这里跳过）。
+   忘了这一步不会静默：产物集成集合检查会在发布时红掉。
 
 7. **finalize**（构建机 root，交互执行，不要给它配 NOPASSWD）：
    `anchors/<agent_sha>/run-finalize-agent-runtime.sh <版本>`，完成后重跑第 5 步的 publish，
