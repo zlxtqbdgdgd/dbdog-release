@@ -152,12 +152,24 @@ with zipfile.ZipFile(wheel_path) as archive:
         raise SystemExit("wheel must contain one METADATA and one WHEEL record")
     metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
     wheel_metadata = BytesParser().parsebytes(archive.read(wheel_names[0]))
-    if metadata.get("Name") != f"datadog-{integration}":
-        raise SystemExit(f"wheel name mismatch: {metadata.get('Name')!r}")
+    # 引擎目录（postgres）的包名是 datadog-<目录>；datadog_ 开头的共享包目录
+    # （datadog_checks_base）的包名就是目录名的连字符形。两类都要能走 wheel 通路。
+    expected_name = (
+        integration.replace("_", "-")
+        if integration.startswith("datadog_")
+        else f"datadog-{integration}"
+    )
+    if metadata.get("Name") != expected_name:
+        raise SystemExit(f"wheel name mismatch: {metadata.get('Name')!r} != {expected_name!r}")
     if wheel_metadata.get("Root-Is-Purelib") != "true":
         raise SystemExit("wheel does not declare Root-Is-Purelib: true")
-    if wheel_metadata.get_all("Tag", []) != ["py3-none-any"]:
-        raise SystemExit("wheel does not have the exact py3-none-any tag")
+    # 引擎 wheel 是 py3-none-any；datadog_checks_base 上游保留 py2 兼容 tag，
+    # 构建产出 py2.py3-none-any。两种都是纯 Python 单 wheel，其余一律拒绝。
+    if wheel_metadata.get_all("Tag", []) not in (
+        ["py3-none-any"],
+        ["py2-none-any", "py3-none-any"],
+    ):
+        raise SystemExit("wheel does not have a pure py3-none-any (or py2.py3) tag set")
 PYEOF
 version="$("$VENV_DIR/bin/python" - "$w1" <<'PYEOF'
 from email.parser import BytesParser
@@ -169,7 +181,13 @@ PYEOF
 )"
 
 # 版本必须与该 core 提交声明的一致——finalizer 会用 __about__.py 复核。
-declared="$(git -C "$CORE_REPO" show "$core_sha:$integration/datadog_checks/$integration/__about__.py" \
+# 引擎目录的包路径是 <目录>/datadog_checks/<目录>；datadog_checks_base 的包路径是
+# datadog_checks_base/datadog_checks/base（目录名去掉 datadog_checks_ 前缀）。
+about_pkg=$integration
+case "$integration" in
+  datadog_checks_*) about_pkg=${integration#datadog_checks_} ;;
+esac
+declared="$(git -C "$CORE_REPO" show "$core_sha:$integration/datadog_checks/$about_pkg/__about__.py" \
   | sed -n 's/^__version__[[:space:]]*=[[:space:]]*["'"'"']\(.*\)["'"'"']$/\1/p')"
 [ "$declared" = "$version" ] \
   || die "wheel 版本 ${version} 与该 core 提交声明的 ${declared} 不一致"

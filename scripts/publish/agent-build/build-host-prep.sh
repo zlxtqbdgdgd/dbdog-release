@@ -97,7 +97,7 @@ wheel_path_for() { # <引擎> <core_sha> —— 回显 wheel 路径；没有就�
 
 cmd_check() {
   local agent_sha="$1" core_sha="$2" sealed info_core covered engine wheel
-  local base_released base_sealed reason kind manifest expect_digest actual_digest
+  local base_released base_sealed base_rel base_pin_sha reason kind manifest expect_digest actual_digest
   local pw_engine pw_rel pw_sha
 
   section "锚控制物"
@@ -205,19 +205,26 @@ cmd_check() {
 $(classify_engines "$agent_sha" "$core_sha" "$sealed")
 EOF
 
-  section "共享基座漂移（阻断：改动静默出不去等于白改）"
+  section "共享基座漂移（漂移必须由锚定 wheel 覆盖，否则改动静默出不去）"
   base_released="$(tree_id "$GIT_DIR_CORE" "$core_sha" datadog_checks_base/datadog_checks/base)"
   base_sealed="$(tree_id "$GIT_DIR_CORE" "$sealed" datadog_checks_base/datadog_checks/base)"
   if [ -n "$base_released" ] && [ "$base_released" != "$base_sealed" ]; then
-    bad "datadog_checks_base 在发布锚与封存 core 之间有差异——产物装封存版，改动出不去"
-    fix "要么撤销对 base 的改动，要么把 base 接入锚定 wheel 通路"
-    fix "（build-integration-wheel.sh 目前按 <引擎>/datadog_checks/<引擎> 布局取源，base 需先扩展它）"
-    # 列出具体差异：看得见改了什么，才判断得了走哪条路。
-    git --git-dir="$GIT_DIR_CORE" diff --name-only "$sealed" "$core_sha" \
-      -- datadog_checks_base/datadog_checks 2>/dev/null | while IFS= read -r changed; do
-      [ -n "$changed" ] || continue
-      printf '         差异: %s\n' "${changed#datadog_checks_base/datadog_checks/}"
-    done
+    base_rel="$(awk -F'\t' '$1 == "datadog_checks_base" { print $2; exit }' "$manifest" 2>/dev/null || true)"
+    base_pin_sha="$(awk -F'\t' '$1 == "datadog_checks_base" { print $3; exit }' "$manifest" 2>/dev/null || true)"
+    if [ -n "$base_rel" ] && [ -f "$CACHE_ROOT/$base_rel" ] \
+      && [ "$(sha256sum "$CACHE_ROOT/$base_rel" | awk '{ print $1 }')" = "$base_pin_sha" ]; then
+      ok "datadog_checks_base 有漂移，已由锚册登记的 wheel 覆盖（install-wheels 会装）"
+    else
+      bad "datadog_checks_base 在发布锚与封存 core 之间有差异，且锚册未覆盖——改动出不去"
+      fix "开发机 build-integration-wheel.sh --integration datadog_checks_base --core-sha $core_sha --out ./dist"
+      fix "送到 $CACHE_ROOT/sources/python/datadog_checks_base/$core_sha/（root:root 0444），重跑换锚准备器"
+      # 列出具体差异：看得见改了什么，才判断得了走哪条路。
+      git --git-dir="$GIT_DIR_CORE" diff --name-only "$sealed" "$core_sha" \
+        -- datadog_checks_base/datadog_checks 2>/dev/null | while IFS= read -r changed; do
+        [ -n "$changed" ] || continue
+        printf '         差异: %s\n' "${changed#datadog_checks_base/datadog_checks/}"
+      done
+    fi
   else
     ok "datadog_checks_base 与封存 core 一致"
   fi

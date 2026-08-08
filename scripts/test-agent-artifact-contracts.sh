@@ -454,8 +454,8 @@ grep -Fq '不在封存 core 里，缺锚定 wheel 时产物会整个缺掉它' "
   fail "换锚时对「封存 core 里没有的引擎」没有 fail closed"
 grep -Fq '在封存 core 里是旧版（tree 与发布锚不同）' "$ANCHOR_PREP" ||
   fail "换锚时对「封存 core 里是旧版的引擎」没有 fail closed（改动会静默出不去）"
-grep -Fq 'uncovered_drift' "$ANCHOR_PREP" ||
-  fail "换锚时没有对锚册覆盖不到的 Python 集成（如 base）做通用漂移兜底"
+grep -Fq '锚定 wheel 入册(共享基座漂移)' "$ANCHOR_PREP" ||
+  fail "换锚时没有对锚册覆盖不到的 Python 集成（如 base）做通用漂移兜底（漂移即要求入册）"
 grep -Fq 'pinned_wheels_sha256' "$PUBLISH_SH" ||
   fail "publish 预检没有按 ANCHOR-INFO 校验锚定 wheel 清单"
 if grep -Fq 'datadog_gaussdb-1.0.1-py3-none-any.whl' "$PUBLISH_SH"; then

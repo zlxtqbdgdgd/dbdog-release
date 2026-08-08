@@ -381,23 +381,33 @@ done
 # --- 通用漂移兜底：锚册覆盖不到的 Python 集成不许静默漂移 ----------------------
 #
 # 上面的循环只枚举「有 conf.d 条目」的引擎。datadog_checks_base 这类共享基座没有 conf，
-# 但产物同样装的是封存版——它若在发布锚上被改过而无出路，改动就是白改（还以为发出去了）。
-# 这里按 git diff 机械检出封存与发布锚之间所有漂移的顶层 Python 集成目录，凡不在锚册
-# 覆盖内的一律 fail closed：要么撤销那笔改动，要么先把该集成接入锚定 wheel 通路。
-uncovered_drift=""
+# 但产物同样装的是封存版——它若在发布锚上被改过而无出路，改动就是白改（还以为发出去了；
+# dbdog.6 的 base 层 health.py 修复正是这么丢的）。这里按 git diff 机械检出封存与发布锚
+# 之间所有漂移的顶层 Python 集成目录，凡不在锚册覆盖内的同样要求锚定 wheel 并入册，
+# 缺 wheel 即 fail closed。包名规则：引擎目录（postgres）的 wheel 是 datadog_<目录>-*，
+# datadog_ 开头的共享包目录（datadog_checks_base）的 wheel 就是 <目录>-*。
 while IFS= read -r drift_dir; do
   [[ -n $drift_dir ]] || continue
   # 只关心 Python 集成目录（其下有 datadog_checks/）
   [[ -n $(tree_at "$core_git" "$to_core_sha" "$drift_dir/datadog_checks") ]] || continue
   cut -f1 "$pinned_wheels_file" | grep -qx -- "$drift_dir" && continue
-  uncovered_drift="$uncovered_drift $drift_dir"
+  case $drift_dir in
+    datadog_*) drift_wheel_prefix=$drift_dir ;;
+    *)         drift_wheel_prefix=datadog_$drift_dir ;;
+  esac
+  drift_wheel=$(find "$CACHE_ROOT/sources/python/$drift_dir/$to_core_sha" -maxdepth 1 \
+    -name "${drift_wheel_prefix}-*-py*-none-any.whl" -type f 2>/dev/null | head -1 || true)
+  [[ -n $drift_wheel ]] || die \
+    "$drift_dir 在封存 core 与发布锚之间有漂移，锚上的改动会静默出不去。
+   先在开发机上跑 build-integration-wheel.sh --integration $drift_dir --core-sha $to_core_sha，
+   再以 root:root 0444 放到 $CACHE_ROOT/sources/python/$drift_dir/$to_core_sha/"
+  [[ $(stat -c '%u:%g:%a' -- "$drift_wheel") == 0:0:444 ]] || \
+    die "$drift_dir 的锚定 wheel 必须是 root:root mode 0444: $drift_wheel"
+  printf '%s\t%s\t%s\n' "$drift_dir" "${drift_wheel#"$CACHE_ROOT/"}" "$(file_sha256 "$drift_wheel")" \
+    >>"$pinned_wheels_file"
+  log "锚定 wheel 入册(共享基座漂移): $drift_dir <- ${drift_wheel##*/}"
 done < <(git --git-dir="$core_git" diff --name-only "$OMNIBUS_CORE_SHA" "$to_core_sha" \
   2>/dev/null | cut -d/ -f1 | sort -u)
-[[ -z $uncovered_drift ]] || die \
-  "以下 Python 集成在封存 core 与发布锚之间有漂移，但锚册没有覆盖它:${uncovered_drift}。
-   产物会装封存旧版，锚上的改动静默出不去。要么撤销该改动，要么先把它接入锚定 wheel
-   通路（build-integration-wheel.sh 目前按 <引擎>/datadog_checks/<引擎> 布局取源，
-   datadog_checks_base 这类共享基座需要先扩展该脚本再入册）。"
 
 pinned_wheels_sha256=$(file_sha256 "$pinned_wheels_file")
 
