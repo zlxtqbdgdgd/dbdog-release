@@ -1010,11 +1010,6 @@ User=root
 # 理由消失；而它的失效是完全静默的（Python 层 return None，无日志、计数器为 0），
 # 2026-08-07 黄区为此查了三轮。
 # 定则：停发某类数据是产品决策，必须显式上升，不能由安装脚本默默决定。
-#
-# 下面这行 SCHEMA 开关是过渡遗留：≤7.81.0-dbdog.6 的产物里 schemas.py 是构建期补丁版，
-# 靠它开推荐字段；自 .7 起字段烧进源码、无人再读它。manifest 升到 ≥.7 后必须删掉这行
-# ——契约测试盯着 manifest 版本强制这一点，忘删会直接红。
-Environment=DBDOG_SCHEMA_RECOMMENDATION_FIELDS=true
 ExecStartPre=/usr/bin/timeout 60 /bin/bash -c 'until test -S $AGENT_RUN_DIR/sysprobe.sock; do sleep 1; done'
 ExecStart=$AGENT_RUNTIME_DIR/bin/agent/agent run -c $AGENT_CONFIG_DIR --sysprobecfgpath $AGENT_CONFIG_DIR
 Restart=always
