@@ -719,10 +719,18 @@ verify_python_sources() {
   local health=$1
   local schemas=$2
 
-  grep -Fq 'DBDOG_DISABLE_DBM_HEALTH' "$health" ||
-    die "dbm-health patch marker is absent"
-  grep -Fq 'SCHEMA_RECOMMENDATION_FIELDS_ENV' "$schemas" ||
-    die "PostgreSQL schema recommendation patch marker is absent"
+  # dbm-health 停摆补丁已废除：产物里不得再带这个门控。原先此处断言它「必须存在」，
+  # 现在反过来断言它「必须消失」——留着等于把一个静默丢数据的开关继续打进产物。
+  if grep -Fq 'DISABLE_DBM_HEALTH' "$health"; then
+    die "dbm-health kill switch is still patched into health.py; it has been retired"
+  fi
+  # schema 推荐字段已烧进 postgres 集成源码（经锚定 wheel 进产物）：字段必须在，
+  # 补丁时代的 env 门控标记必须不在——出现即说明装进来的还是打过补丁的旧版。
+  grep -Fq 'AS is_primary_key' "$schemas" ||
+    die "postgres schema recommendation fields are absent (anchored wheel not installed?)"
+  if grep -Fq 'SCHEMA_RECOMMENDATION_FIELDS_ENV' "$schemas"; then
+    die "postgres schemas.py still carries the retired patch-era env gate"
+  fi
   "$embedded_python" -I -B - "$health" "$schemas" <<'PYEOF'
 import ast
 import sys
@@ -1375,12 +1383,17 @@ verify_archive() {
   cmp -s -- "$verify_root/provenance/glibc-requirements.tsv" "$glibc_report" ||
     die "extracted GLIBC report differs from packaged report"
   verify_no_path_leaks "$verify_root"
-  grep -Fq 'DBDOG_DISABLE_DBM_HEALTH' \
-    "$verify_root/embedded/lib/python3.13/site-packages/datadog_checks/base/utils/db/health.py" ||
-    die "extracted dbm-health patch marker is absent"
-  grep -Fq 'SCHEMA_RECOMMENDATION_FIELDS_ENV' \
+  if grep -Fq 'DISABLE_DBM_HEALTH' \
+    "$verify_root/embedded/lib/python3.13/site-packages/datadog_checks/base/utils/db/health.py"; then
+    die "extracted runtime still carries the retired dbm-health kill switch"
+  fi
+  grep -Fq 'AS is_primary_key' \
     "$verify_root/embedded/lib/python3.13/site-packages/datadog_checks/postgres/schemas.py" ||
-    die "extracted PostgreSQL patch marker is absent"
+    die "extracted postgres schema recommendation fields are absent"
+  if grep -Fq 'SCHEMA_RECOMMENDATION_FIELDS_ENV' \
+    "$verify_root/embedded/lib/python3.13/site-packages/datadog_checks/postgres/schemas.py"; then
+    die "extracted runtime still carries the retired schema patch gate"
+  fi
 }
 
 require_root_private_dir() {
@@ -1992,17 +2005,14 @@ adp_inputs_manifest_sha256=$(verify_adp_input_handoff)
 git_in "$core_repo" cat-file -e "$core_sha^{commit}" ||
   die "post-Omnibus integration CORE_SHA is absent from CORE_REPO"
 
-patch_disable_rel=dbdog-deploy/scripts/patch-disable-dbmhealth.sh
-patch_schema_rel=dbdog-deploy/scripts/patch-postgres-schema-recommendation-fields.sh
-patch_disable="$agent_source_dir/$patch_disable_rel"
-patch_schema="$agent_source_dir/$patch_schema_rel"
-for patch_rel in "$patch_disable_rel" "$patch_schema_rel"; do
-  git_in "$agent_source_dir" ls-files --error-unmatch "$patch_rel" >/dev/null ||
-    die "patch script is not tracked at AGENT_SHA: $patch_rel"
-  git_in "$agent_source_dir" diff --quiet "$agent_sha" -- "$patch_rel" ||
-    die "patch script differs from exact AGENT_SHA source: $patch_rel"
+# 构建期补丁已全部废除（2026-08-07 定则：fork 对集成的改动一律进源码、经锚定 wheel
+# 出包）。这里反向把关：补丁脚本必须真的从源仓消失，而不是「不再调用但还躺在那里」。
+for retired_patch in \
+  dbdog-deploy/scripts/patch-disable-dbmhealth.sh \
+  dbdog-deploy/scripts/patch-postgres-schema-recommendation-fields.sh; do
+  [[ ! -e $agent_source_dir/$retired_patch ]] ||
+    die "retired build-time patch script still exists in the agent source tree: $retired_patch"
 done
-[[ -f $patch_disable && -f $patch_schema ]] || die "source patch scripts are missing"
 
 source_date_epoch=${SOURCE_DATE_EPOCH:-}
 if [[ -z $source_date_epoch ]]; then
@@ -2152,24 +2162,8 @@ install -o root -g root -m 0400 "$success_marker" "$success_marker_snapshot"
 verify_omnibus_success_marker "$success_marker_snapshot"
 success_marker=$success_marker_snapshot
 
-log "running private-runtime patches from exact agent source $agent_sha"
-env -i \
-  HOME=/root \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  PATH="$install_dir/embedded/bin:/usr/bin:/bin" \
-  PY="$python_site" \
-  /usr/bin/bash "$patch_disable"
-env -i \
-  HOME=/root \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  PATH="$install_dir/embedded/bin:/usr/bin:/bin" \
-  PY="$python_site" \
-  TARGET="$schemas_py" \
-  DBDOG_AGENT_BIN="$install_dir/bin/agent/agent" \
-  PATCH_ONLY=true \
-  /usr/bin/bash "$patch_schema"
+# 构建期不再打任何补丁：Python 侧改动全部来自锚定 wheel（install-wheels 已在
+# finalize 之前照锚册安装）。这里只验证装进来的源码形状。
 verify_python_sources "$health_py" "$schemas_py"
 install_pinned_gaussdb_integration "$install_dir"
 
@@ -2226,8 +2220,6 @@ gauss_import_version=$(awk -F= '$1 == "integration_version" { print $2; found++ 
   die "GaussDB integration provenance lacks one integration_version"
 
 finalizer_sha256=$(sha256sum -- "$(readlink -e -- "$0")" | awk '{ print $1 }')
-patch_disable_sha256=$(sha256sum -- "$patch_disable" | awk '{ print $1 }')
-patch_schema_sha256=$(sha256sum -- "$patch_schema" | awk '{ print $1 }')
 omnibus_success_sha256=$(sha256sum -- "$success_marker" | awk '{ print $1 }')
 agent_binary_sha256=$(awk -F= '$1 == "binary_sha256" { print $2 }' "$agent_version_report")
 agent_version_output_sha256=$(awk -F= '$1 == "version_output_sha256" { print $2 }' "$agent_version_report")
@@ -2275,8 +2267,6 @@ source_date_epoch=$source_date_epoch
 builder_image_digest=${builder_image_digest:-none}
 builder_identity=${builder_identity:-none}
 finalizer_sha256=$finalizer_sha256
-patch_disable_dbmhealth_sha256=$patch_disable_sha256
-patch_postgres_schema_sha256=$patch_schema_sha256
 omnibus_success_sha256=$omnibus_success_sha256
 glibc_maximum=$MAX_GLIBC_VERSION
 runtime_manifest_scope=all_regular_files_except_./provenance/runtime.sha256

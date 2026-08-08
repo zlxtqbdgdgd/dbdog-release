@@ -1496,17 +1496,33 @@ if sed -n '/^agent_warn_gaussdb_collection_gucs()/,/^}/p' "$SCRIPTS_DIR/agent-in
 fi
 pass "GaussDB 采集质量 GUC 以 warn 方式校验，且真实合规取值不误报"
 
-# dbm-health 是紧急停摆开关，插在 submit_health_event 第一行。写成 true 后所有健康事件在
-# Python 层 return None——静默、无日志、per-check 计数器为 0，外部完全看不出被关掉，
-# 控制台「采集配置」永远空白。2026-08-07 黄区为此查了三轮：agent/server/网络/配置全正常，
-# 唯独这个开关从首次安装起就是 true。dbdog-agent 的 runtime-cutover 脚本本就断言它必须是
-# false，两仓此前互相矛盾。
-unit_health_switch="$(sed -n 's/^Environment=DBDOG_DISABLE_DBM_HEALTH=//p' "$SCRIPTS_DIR/agent-lib.sh")"
-[ -n "$unit_health_switch" ] || fail "systemd 单元没有显式声明 DBDOG_DISABLE_DBM_HEALTH"
-[ "$unit_health_switch" = false ] || \
-  fail "DBDOG_DISABLE_DBM_HEALTH 必须是 false（实为 $unit_health_switch）——true 会静默关掉采集配置上报"
-[ "$(printf '%s\n' "$unit_health_switch" | wc -l)" -eq 1 ] || \
-  fail "DBDOG_DISABLE_DBM_HEALTH 只应声明一次"
-pass "systemd 单元把 dbm-health 紧急停摆开关显式置为 false"
+# DBDOG_DISABLE_DBM_HEALTH 已彻底废除，单元里不得再出现——连 =false 也不行。
+# 它是「server 没有 dbmhealth 端点」年代的停采补丁，server 0.1.12 起已落库采集配置快照，
+# 存在理由消失；而它的失效完全静默（Python 层 return None，无日志、计数器为 0），
+# 2026-08-07 黄区为此查了三轮。留着 =false 等于把这个静默陷阱继续摆在那里等人写反。
+# 定则：停发某类数据是产品决策，必须显式上升，不能由安装脚本默默决定。
+# 注意用 if 而非 `grep && fail`：本文件 set -e，grep 未命中时返回 1 会直接终止整个测试。
+if grep -q 'DISABLE_DBM_HEALTH' "$SCRIPTS_DIR/agent-lib.sh"; then
+  fail "agent-lib.sh 仍出现 DISABLE_DBM_HEALTH——该开关已废除，不应以任何取值复活"
+fi
+pass "dbm-health 停摆开关已从 systemd 单元彻底移除"
+
+# SCHEMA 推荐字段的 env 开关是过渡遗留：≤dbdog.6 的补丁版产物靠它，≥.7 源码版无人读。
+# 用 manifest 版本钉住删除时机——manifest 一升到 .7+，这行 env 不删测试就红，
+# 免得又出一个「没人知道要跟着翻」的两仓脱节（dbm-health 开关就是那么烂掉的）。
+manifest_agent_ver="$(awk -F'\t' '$1 == "dbdog-agent" { print $5 }' "$RELEASE_DIR/manifest.tsv")"
+schema_env_count="$(grep -c '^Environment=DBDOG_SCHEMA_RECOMMENDATION_FIELDS=' "$SCRIPTS_DIR/agent-lib.sh" || true)"
+case "$manifest_agent_ver" in
+  7.81.0-dbdog.[1-6])
+    [ "$schema_env_count" -eq 1 ] || \
+      fail "manifest 还在 $manifest_agent_ver（补丁版产物），SCHEMA env 行必须保留恰好一次（实为 $schema_env_count）"
+    pass "SCHEMA env 过渡行与补丁版产物 $manifest_agent_ver 匹配"
+    ;;
+  *)
+    [ "$schema_env_count" -eq 0 ] || \
+      fail "manifest 已是 $manifest_agent_ver（源码版产物），agent-lib.sh 的 SCHEMA env 过渡行必须删除"
+    pass "SCHEMA env 过渡行已随源码版产物移除"
+    ;;
+esac
 
 printf 'ALL PASS: 26 agent install contract groups\n'

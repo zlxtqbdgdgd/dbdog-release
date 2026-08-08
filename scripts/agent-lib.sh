@@ -1005,15 +1005,15 @@ Requires=dbdog-agent-sysprobe.service
 [Service]
 Type=simple
 User=root
-# dbm-health 是紧急停摆开关，正常部署必须是 false。它插在 submit_health_event 的第一行，
-# 打开后所有健康事件在 Python 层直接 return None——**静默、无日志、计数器为 0**，
-# 从外部完全看不出被关掉了。控制台「采集配置」那一页的数据正是初始化健康事件带上来的，
-# 开关为 true 时那页永远空白（2026-08-07 黄区实证，为此查了三轮）。
-# 历史成因：这个开关引入时 dbdog-server 还没有消费端，于是默认写死 true；server 0.1.12
-# 起已经落库 collection config 快照，但安装脚本一直没跟着翻过来。
-# 参照物：dbdog-agent/scripts/ops/dbdog-agent-runtime-cutover.sh 断言它必须是 false，
-# patch-disable-dbmhealth.sh 的注释也写明「dbdog-agent.service 显式设为 false」。
-Environment=DBDOG_DISABLE_DBM_HEALTH=false
+# 这里刻意不声明 dbm-health 停摆开关（契约测试禁止它以任何取值复活，故此处不写其字面名）。
+# 它曾是「server 没有 dbmhealth 端点」年代的停采补丁，server 0.1.12 起已落库采集配置快照，
+# 理由消失；而它的失效是完全静默的（Python 层 return None，无日志、计数器为 0），
+# 2026-08-07 黄区为此查了三轮。
+# 定则：停发某类数据是产品决策，必须显式上升，不能由安装脚本默默决定。
+#
+# 下面这行 SCHEMA 开关是过渡遗留：≤7.81.0-dbdog.6 的产物里 schemas.py 是构建期补丁版，
+# 靠它开推荐字段；自 .7 起字段烧进源码、无人再读它。manifest 升到 ≥.7 后必须删掉这行
+# ——契约测试盯着 manifest 版本强制这一点，忘删会直接红。
 Environment=DBDOG_SCHEMA_RECOMMENDATION_FIELDS=true
 ExecStartPre=/usr/bin/timeout 60 /bin/bash -c 'until test -S $AGENT_RUN_DIR/sysprobe.sock; do sleep 1; done'
 ExecStart=$AGENT_RUNTIME_DIR/bin/agent/agent run -c $AGENT_CONFIG_DIR --sysprobecfgpath $AGENT_CONFIG_DIR

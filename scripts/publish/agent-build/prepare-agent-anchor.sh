@@ -328,13 +328,19 @@ gaussdb_wheel_sha256=$(file_sha256 "$gaussdb_wheel")
 
 # --- 锚定 wheel 清单：把「谁必须有 wheel」在换锚这一步就定死 -------------------
 #
-# 产物里的 Python 包只来自被 seal 钉死的 core（$OMNIBUS_CORE_SHA）。封存 core 里根本
-# 没有的引擎（openGauss 就是），不补锚定 wheel 就会整个缺出产物，而 conf 又已经发了，
-# 采集静默归零——它因此丢过两次。以前这件事全靠人记，现在在这里 fail closed：
-# 换锚是最早能发现它的时刻，比构建几十分钟后才报废划算得多。
+# 产物里的 Python 包默认来自被 seal 钉死的 core（$OMNIBUS_CORE_SHA）。两类引擎必须有
+# 锚定 wheel，否则 fail closed（换锚是最早能发现的时刻，比构建几十分钟后才报废划算）：
+#
+#   missing —— 封存 core 里根本没有（openGauss 曾是）：缺 wheel 会整个缺出产物，
+#              而 conf 又已经发了，采集静默归零——它因此丢过两次。
+#   drift   —— 封存 core 里有、但与发布锚 tree 不同（postgres 曾是）：缺 wheel 时产物
+#              装的是封存旧版，锚上的改动**静默出不去**。2026-08-07 定则：fork 对集成的
+#              改动一律进源码、经锚定 wheel 出去，不再打构建期补丁——所以漂移即必须有
+#              wheel，判据是机械的 tree SHA 比对，不靠人记「我改过哪些」。
 #
 # gaussdb 由 finalizer 自己装（上面那段）；其余记进 PINNED-WHEELS，由
-# build-host-prep.sh install-wheels 在 finalize 之前装，语义与 finalizer 完全一致。
+# build-host-prep.sh install-wheels 在 finalize 之前装（pip --force-reinstall，
+# 覆盖封存版），语义与 finalizer 完全一致。
 pinned_wheels_file="$anchor_staging/PINNED-WHEELS"
 : >"$pinned_wheels_file"
 printf 'gaussdb\t%s\t%s\n' "$gaussdb_wheel_rel" "$gaussdb_wheel_sha256" >>"$pinned_wheels_file"
@@ -353,11 +359,17 @@ for conf_entry in $(git --git-dir="$agent_git" ls-tree --name-only \
   released_tree=$(tree_at "$core_git" "$to_core_sha" "$engine/datadog_checks/$engine")
   [[ -n $released_tree ]] || continue
   sealed_tree=$(tree_at "$core_git" "$OMNIBUS_CORE_SHA" "$engine/datadog_checks/$engine")
-  [[ -n $sealed_tree ]] && continue   # 封存里有，产物至少不会缺掉它（可能是旧版，另行报告）
+  # 封存与发布锚 tree 一致才可跳过；不同（missing 或 drift）都必须有锚定 wheel。
+  [[ $released_tree == "$sealed_tree" ]] && continue
+  if [[ -n $sealed_tree ]]; then
+    wheel_reason="$engine 在封存 core 里是旧版（tree 与发布锚不同），缺锚定 wheel 时锚上的改动会静默出不去"
+  else
+    wheel_reason="$engine 不在封存 core 里，缺锚定 wheel 时产物会整个缺掉它"
+  fi
   extra_wheel=$(find "$CACHE_ROOT/sources/python/$engine/$to_core_sha" -maxdepth 1 \
     -name "datadog_$engine-*-py3-none-any.whl" -type f 2>/dev/null | head -1 || true)
   [[ -n $extra_wheel ]] || die \
-    "$engine 不在封存 core 里，必须为本次 core 锚提供锚定 wheel，否则产物会整个缺掉它。
+    "$wheel_reason。
    先在开发机上跑 build-integration-wheel.sh --integration $engine --core-sha $to_core_sha，
    再以 root:root 0444 放到 $CACHE_ROOT/sources/python/$engine/$to_core_sha/"
   [[ $(stat -c '%u:%g:%a' -- "$extra_wheel") == 0:0:444 ]] || \
@@ -366,6 +378,27 @@ for conf_entry in $(git --git-dir="$agent_git" ls-tree --name-only \
     >>"$pinned_wheels_file"
   log "锚定 wheel 入册: $engine <- ${extra_wheel##*/}"
 done
+# --- 通用漂移兜底：锚册覆盖不到的 Python 集成不许静默漂移 ----------------------
+#
+# 上面的循环只枚举「有 conf.d 条目」的引擎。datadog_checks_base 这类共享基座没有 conf，
+# 但产物同样装的是封存版——它若在发布锚上被改过而无出路，改动就是白改（还以为发出去了）。
+# 这里按 git diff 机械检出封存与发布锚之间所有漂移的顶层 Python 集成目录，凡不在锚册
+# 覆盖内的一律 fail closed：要么撤销那笔改动，要么先把该集成接入锚定 wheel 通路。
+uncovered_drift=""
+while IFS= read -r drift_dir; do
+  [[ -n $drift_dir ]] || continue
+  # 只关心 Python 集成目录（其下有 datadog_checks/）
+  [[ -n $(tree_at "$core_git" "$to_core_sha" "$drift_dir/datadog_checks") ]] || continue
+  cut -f1 "$pinned_wheels_file" | grep -qx -- "$drift_dir" && continue
+  uncovered_drift="$uncovered_drift $drift_dir"
+done < <(git --git-dir="$core_git" diff --name-only "$OMNIBUS_CORE_SHA" "$to_core_sha" \
+  2>/dev/null | cut -d/ -f1 | sort -u)
+[[ -z $uncovered_drift ]] || die \
+  "以下 Python 集成在封存 core 与发布锚之间有漂移，但锚册没有覆盖它:${uncovered_drift}。
+   产物会装封存旧版，锚上的改动静默出不去。要么撤销该改动，要么先把它接入锚定 wheel
+   通路（build-integration-wheel.sh 目前按 <引擎>/datadog_checks/<引擎> 布局取源，
+   datadog_checks_base 这类共享基座需要先扩展该脚本再入册）。"
+
 pinned_wheels_sha256=$(file_sha256 "$pinned_wheels_file")
 
 set_readonly_assignments "$anchor_staging/finalize-agent-runtime.sh" \

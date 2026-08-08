@@ -331,7 +331,8 @@ grep -Fq 'destination_required_blocks=$((archive_bound + reserve))' "$FINALIZER"
   fail "finalizer does not reserve one archive copy on a separate OUTPUT_DIR filesystem"
 preflight_line=$(grep -nF 'preflight_bulk_workspace "$install_dir" "$bulk_build_scratch" "$output_dir"' \
   "$FINALIZER" | awk -F: 'NR == 1 { print $1 }' || :)
-mutation_line=$(grep -nF 'log "running private-runtime patches from exact agent source $agent_sha"' \
+# 构建期补丁已废除；finalize 对 runtime 的第一次变更如今是钉死的 GaussDB wheel 安装。
+mutation_line=$(grep -nF 'install_pinned_gaussdb_integration "$install_dir"' \
   "$FINALIZER" | awk -F: 'NR == 1 { print $1 }' || :)
 [[ $preflight_line =~ ^[0-9]+$ && $mutation_line =~ ^[0-9]+$ && $preflight_line -lt $mutation_line ]] ||
   fail "split-filesystem capacity gates do not precede the first runtime mutation"
@@ -436,8 +437,10 @@ grep -Fq 'agent_preflight_build_host' "$PUBLISH_SH" ||
   fail "publish.sh 没有在构建前一次性核对构建机前置条件"
 pass "wheel 构建与构建机前置自检已固化并接入发布链"
 
-# 锚定 wheel 清单：把「谁不补 wheel 就会整个缺出产物」在换锚这一步定死。
-# openGauss 正是这一类，它因此丢过两次（第一次让 round-20 该引擎零遥测整轮作废）。
+# 锚定 wheel 清单：把「谁必须有 wheel」在换锚这一步定死。两类都 fail closed：
+# missing（封存里没有——openGauss 因此丢过两次，round-20 该引擎零遥测整轮作废）、
+# drift（封存是旧版——postgres 曾因此把 schema 推荐字段困在构建期补丁里）。
+# 判据是机械的 tree SHA 比对，不靠人记「我改过哪些」。
 ANCHOR_PREP="$SCRIPTS_DIR/publish/agent-build/prepare-agent-anchor.sh"
 grep -Fq 'PINNED-WHEELS' "$ANCHOR_PREP" ||
   fail "换锚准备器没有生成锚定 wheel 清单"
@@ -445,8 +448,14 @@ grep -Fq 'pinned_wheels_sha256=$pinned_wheels_sha256' "$ANCHOR_PREP" ||
   fail "ANCHOR-INFO 没有记录锚定 wheel 清单的摘要"
 grep -Fq 'install_root_readonly "$anchor_staging/PINNED-WHEELS" 0444' "$ANCHOR_PREP" ||
   fail "锚定 wheel 清单没有按 root:root 0444 落盘"
-grep -Fq '不在封存 core 里，必须为本次 core 锚提供锚定 wheel' "$ANCHOR_PREP" ||
+grep -Fq '[[ $released_tree == "$sealed_tree" ]] && continue' "$ANCHOR_PREP" ||
+  fail "换锚判据不是 tree SHA 比对——只有一致才可跳过，missing/drift 都必须有 wheel"
+grep -Fq '不在封存 core 里，缺锚定 wheel 时产物会整个缺掉它' "$ANCHOR_PREP" ||
   fail "换锚时对「封存 core 里没有的引擎」没有 fail closed"
+grep -Fq '在封存 core 里是旧版（tree 与发布锚不同）' "$ANCHOR_PREP" ||
+  fail "换锚时对「封存 core 里是旧版的引擎」没有 fail closed（改动会静默出不去）"
+grep -Fq 'uncovered_drift' "$ANCHOR_PREP" ||
+  fail "换锚时没有对锚册覆盖不到的 Python 集成（如 base）做通用漂移兜底"
 grep -Fq 'pinned_wheels_sha256' "$PUBLISH_SH" ||
   fail "publish 预检没有按 ANCHOR-INFO 校验锚定 wheel 清单"
 if grep -Fq 'datadog_gaussdb-1.0.1-py3-none-any.whl' "$PUBLISH_SH"; then

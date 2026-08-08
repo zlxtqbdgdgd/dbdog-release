@@ -62,8 +62,9 @@ tree_id() {
 #   missing —— 封存 core 里根本没有这个引擎。产物会整个缺掉它，而我们又发了它的
 #              conf，采集静默归零。**硬阻断**，必须有锚定 wheel。（openGauss 就是这样
 #              丢过两次，第一次让 round-20 整轮作废。）
-#   drift   —— 封存里有、但与发布锚内容不同。产物能跑，装的是封存版；锚上对它的
-#              改动这次不会出去。**只报告**，因为绝大多数只是上游漂移，不是我们改的。
+#   drift   —— 封存里有、但与发布锚内容不同。不补锚定 wheel 时产物装的是封存旧版，
+#              锚上的改动**静默出不去**（postgres 曾因此把 schema 推荐字段困在构建期
+#              补丁里）。2026-08-07 起与 missing 同等对待：必须有锚定 wheel，fail closed。
 classify_engines() { # <agent_sha> <core_sha> <sealed_sha> -> 每行 "missing|drift <引擎>"
   local agent_sha="$1" core_sha="$2" sealed="$3" entry name released sealed_tree
   git --git-dir="$GIT_DIR_AGENT" ls-tree --name-only \
@@ -96,7 +97,7 @@ wheel_path_for() { # <引擎> <core_sha> —— 回显 wheel 路径；没有就�
 
 cmd_check() {
   local agent_sha="$1" core_sha="$2" sealed info_core covered engine wheel
-  local base_released base_sealed drifted kind manifest expect_digest actual_digest
+  local base_released base_sealed reason kind manifest expect_digest actual_digest
   local pw_engine pw_rel pw_sha
 
   section "锚控制物"
@@ -178,44 +179,40 @@ cmd_check() {
   else
     warn "这一代锚没有 PINNED-WHEELS（换锚时的旧版准备器所建），改用推导兜底"
   fi
-  drifted=""
+  # missing 与 drift 同等对待：都必须有锚定 wheel，否则改动/集成静默出不去 —— 硬阻断
   while read -r kind engine; do
     [ -n "$engine" ] || continue
-    if [ "$kind" = drift ]; then
-      if [ "$engine" = "$covered" ]; then
-        ok "$engine：finalizer 用锚定 wheel 覆盖，锚上的改动会进产物"
-      else
-        drifted="$drifted $engine"
-      fi
+    if [ "$engine" = "$covered" ]; then
+      ok "$engine：finalizer 用锚定 wheel 覆盖，锚上的改动会进产物"
       continue
     fi
-    # missing：封存 core 里没有，产物会整个缺掉它 —— 硬阻断
+    case "$kind" in
+      missing) reason="封存 core 里没有它，缺 wheel 产物会整个缺掉这个集成" ;;
+      drift)   reason="封存 core 里是旧版，缺 wheel 锚上的改动会静默出不去" ;;
+      *)       continue ;;
+    esac
     wheel="$(wheel_path_for "$engine" "$core_sha")"
     if [ -z "$wheel" ]; then
-      bad "$engine：封存 core 里没有它，且无锚定 wheel —— 产物会整个缺掉这个集成"
+      bad "$engine：$reason —— 无锚定 wheel"
       fix "开发机 build-integration-wheel.sh --integration $engine --core-sha $core_sha --out ./dist"
       fix "送到 $CACHE_ROOT/sources/python/$engine/$core_sha/（root:root 0444），再 install-wheels"
     elif [ "$(stat -c '%U:%G %a' "$wheel")" != "root:root 444" ]; then
       bad "$engine：wheel 属主模式应为 root:root 0444，实为 $(stat -c '%U:%G %a' "$wheel")"
     else
-      ok "$engine：封存 core 里没有，已由锚定 wheel 补上（install-wheels 会装）"
+      ok "$engine（$kind）：锚定 wheel 就位（install-wheels 会覆盖装）"
     fi
   done <<EOF
 $(classify_engines "$agent_sha" "$core_sha" "$sealed")
 EOF
-  if [ -n "$drifted" ]; then
-    warn "以下引擎封存 core 里有、但与发布锚内容不同，产物装的是**封存版**:${drifted}"
-    warn "它们在发布锚上的改动这次不会出去；要出去得推进 omnibus seal 或给它加锚定 wheel"
-  fi
 
-  section "共享基座漂移（不阻断发布，但决定改动是否白改）"
+  section "共享基座漂移（阻断：改动静默出不去等于白改）"
   base_released="$(tree_id "$GIT_DIR_CORE" "$core_sha" datadog_checks_base/datadog_checks/base)"
   base_sealed="$(tree_id "$GIT_DIR_CORE" "$sealed" datadog_checks_base/datadog_checks/base)"
   if [ -n "$base_released" ] && [ "$base_released" != "$base_sealed" ]; then
-    warn "datadog_checks_base 在发布锚与封存 core 之间有差异"
-    warn "产物里的 base 来自封存 core，锚上对 base 的改动**不会进这次产物**"
-    warn "要出去只能推进 omnibus seal（编译域改动，不是发一次版能解决的）"
-    # 列出具体差异，否则这条警告会被训练成噪音：看得见改了什么，才判断得了要不要紧。
+    bad "datadog_checks_base 在发布锚与封存 core 之间有差异——产物装封存版，改动出不去"
+    fix "要么撤销对 base 的改动，要么把 base 接入锚定 wheel 通路"
+    fix "（build-integration-wheel.sh 目前按 <引擎>/datadog_checks/<引擎> 布局取源，base 需先扩展它）"
+    # 列出具体差异：看得见改了什么，才判断得了走哪条路。
     git --git-dir="$GIT_DIR_CORE" diff --name-only "$sealed" "$core_sha" \
       -- datadog_checks_base/datadog_checks 2>/dev/null | while IFS= read -r changed; do
       [ -n "$changed" ] || continue
