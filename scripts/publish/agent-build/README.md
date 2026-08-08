@@ -47,6 +47,14 @@ preparer that derives each new generation from the previous one.
    `anchors/<新agent_sha>/ANCHOR-INFO`，并建好 pipeline lock 与 build attempt。
    上一代一字不动。任何一处旧 token 残留都会 fail closed。
 
+   **⚠️ 机械改写只换 token，不换逻辑**：仓里 `finalize-agent-runtime-v3.sh` / wrapper 的
+   **逻辑改动**不会经由「从上一代派生」进入新锚——2026-08-08 v17 首版就因此带着已退役的
+   补丁逻辑出了锚（当场发现并重播种）。凡模板改过，换锚必须显式从模板播种：先把仓里的
+   新模板对（root:root 0555）更新到构建机 `controls/`，再给准备器加
+   `--from-finalizer <controls/finalize-agent-runtime-v3.sh> --from-wrapper <controls/run-...-v3.sh>`，
+   且 `--from-*-sha/--from-overlay-generation` 要填**模板内嵌**的 token
+   （当前模板：agent 62ad2979 / core 612be7be / v14），不是上一个锚的。
+
    同时落下 `anchors/<新agent_sha>/PINNED-WHEELS`（`root:root 0444`，每行
    `<引擎>\t<相对路径>\t<sha256>`），摘要记进 ANCHOR-INFO 的 `pinned_wheels_sha256`。
    **这份清单是此后的权威**：publish 预检逐个校验它登记的 wheel 是否在位、内容是否吻合，
