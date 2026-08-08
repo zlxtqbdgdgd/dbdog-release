@@ -31,8 +31,9 @@ preparer that derives each new generation from the previous one.
 
    `--self-check` 先按上一个锚重建并比对，确认这台开发机能复现历史 wheel 之后，
    新 wheel 才可信。**GaussDB 之外还有谁需要 wheel，由换锚准备器在第 2 步判定并 fail closed**
-   ——凡「conf 已发、发布锚 core 里有、封存 core 里没有」的引擎（openGauss 就是），
-   缺 wheel 会让换锚直接失败，不会拖到构建之后才暴露。
+   ——封存 core 与发布锚 tree 不一致的每一个 Python 集成（missing 或 drift，
+   含 `datadog_checks_base` 这类无 conf 的共享基座），缺 wheel 都会让换锚直接失败，
+   不会拖到构建之后才暴露。
 2. **跑换锚准备器**（构建机上以 root）：
 
    ```bash
@@ -87,13 +88,17 @@ preparer that derives each new generation from the previous one.
 
 | 情况 | 结果 | 处置 |
 |---|---|---|
-| 封存 core 里**没有**这个引擎（如 openGauss） | 产物整个缺掉它，而我们又发了它的 conf → 采集静默归零 | **必须**出锚定 wheel，否则发布被 `verify-agent-integrations.sh` 拦下 |
-| 封存里有、与发布锚**内容不同**（如 postgres、`datadog_checks_base`） | 产物装的是**封存版**，锚上的改动这次不会出去 | 要出去只能推进 omnibus seal（编译域大改），或给它加锚定 wheel |
+| 封存 core 里**没有**这个引擎（missing，如 openGauss 曾是） | 产物整个缺掉它，而我们又发了它的 conf → 采集静默归零 | **必须**出锚定 wheel，换锚与预检都 fail closed |
+| 封存里有、与发布锚**内容不同**（drift，如 postgres、`datadog_checks_base` 曾是） | 不补 wheel 时产物装**封存旧版**，锚上的改动静默出不去 | **同样必须**出锚定 wheel——2026-08-07 起换锚按 tree SHA 比对，drift 与 missing 同等 fail closed |
 | 封存里有、与发布锚一致 | 正常 | 无 |
 
-`build-host-prep.sh check` 会把这三类算清楚并直接报出来。openGauss 因为第一种情况丢过两次
-（第一次让 round-20 该引擎零遥测、整轮作废）；`datadog_checks_base` 的改动因为第二种情况
-白改过一次（2026-08-06）——两次都不是构建报错，是**静默**的。
+判据是机械的（tree SHA 比对 + git diff 全量漂移兜底，含 base 这类无 conf 的共享基座），
+不靠人记「我改过哪些」；`build-host-prep.sh check` 与换锚准备器都会算清并 fail closed。
+历史教训：openGauss 因 missing 丢过两次（第一次让 round-20 该引擎零遥测、整轮作废）；
+`datadog_checks_base` 因 drift 白改过一次（2026-08-06 的 health event 序列化兜底，
+直到 2026-08-08 v17 锚才真正出货）——三次都不是构建报错，是**静默**的，这正是判据必须
+机械化的原因。共享基座的 wheel 同样由 `build-integration-wheel.sh` 构建
+（`--integration datadog_checks_base`，包名/包路径规则脚本内建）。
 
 ## 每次发布必过的前置条件
 
