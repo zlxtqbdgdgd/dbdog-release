@@ -121,8 +121,16 @@ rewrite_anchor_tokens() { # <源文件> <目标文件>
     -e "s/\\(omnibus-kylin-platform-\\)$from_generation\$/\\1$to_generation/g" \
     -e "s/\\(omnibus-kylin-platform-\\)$from_generation\\([^0-9]\\)/\\1$to_generation\\2/g" \
     -- "$source" >"$destination" || die "改写失败: $source"
-  if grep -qF -e "$from_agent_sha" -e "dbdog-agent-$from_short-" -e "$from_core_sha" \
-      -- "$destination"; then
+  # 残留断言只对**真正换了值**的 token 成立：agent 与 core 两个锚可以各自独立移动
+  # （manifest 的 source_sha 就写成 `agent:<sha>,core:<sha>`，二者任一变更即视为变更）。
+  # 只动 agent 时 core 的 `s///` 是空替换，此时那个 SHA 留在文件里是正确结果而非漏改；
+  # 无条件断言它必须消失会让「只换 agent 锚」这条路永远 fail closed。
+  local -a stale_tokens=()
+  [[ $from_agent_sha == "$to_agent_sha" ]] || stale_tokens+=(-e "$from_agent_sha")
+  [[ $from_short == "$to_short" ]] || stale_tokens+=(-e "dbdog-agent-$from_short-")
+  [[ $from_core_sha == "$to_core_sha" ]] || stale_tokens+=(-e "$from_core_sha")
+  if [[ ${#stale_tokens[@]} -gt 0 ]] && \
+    grep -qF "${stale_tokens[@]}" -- "$destination"; then
     die "改写后仍残留旧锚 token，请人工核对: $destination"
   fi
   if grep -q "omnibus-kylin-platform-${from_generation}\$" -- "$destination" ||
@@ -436,8 +444,15 @@ wrapper_sha256=$(file_sha256 "$anchor_staging/run-finalize-agent-runtime.sh")
 prev_runner_sha256=$(file_sha256 "$from_overlay_dir/run-agent-omnibus.sh")
 prev_control_info_sha256=$(file_sha256 "$from_overlay_dir/CONTROL-INFO")
 prev_control_manifest_sha256=$(file_sha256 "$from_overlay_dir/CONTROL.sha256")
-prev_wheel="$CACHE_ROOT/sources/python/gaussdb/$from_core_sha/${gaussdb_wheel_rel##*/}"
-prev_wheel_sha256=$([[ -f $prev_wheel ]] && file_sha256 "$prev_wheel" || printf 'n/a\n')
+# wheel 的摘要只在 core 锚移动时才有「上一代」可言。core 不变的换锚（只动 agent）沿用
+# 同一枚 wheel，此时 prev_wheel 就是本代 wheel：把它当 stale 断言「必须消失」，会和下面
+# 「finalizer 必须代入本代 wheel 摘要」的断言直接互斥，无论如何都过不去。
+if [[ $from_core_sha == "$to_core_sha" ]]; then
+  prev_wheel_sha256=n/a
+else
+  prev_wheel="$CACHE_ROOT/sources/python/gaussdb/$from_core_sha/${gaussdb_wheel_rel##*/}"
+  prev_wheel_sha256=$([[ -f $prev_wheel ]] && file_sha256 "$prev_wheel" || printf 'n/a\n')
+fi
 for generated in "$anchor_staging/finalize-agent-runtime.sh" \
   "$anchor_staging/run-finalize-agent-runtime.sh"; do
   for stale in "$prev_runner_sha256" "$prev_control_info_sha256" \
