@@ -98,7 +98,9 @@ fast_agent_local() {
   log "[agent] dda 构建 Go agent（源 $short，--build-exclude=systemd）"
   # 工具链 PATH 与 omnibus overlay runner 同源（dda-venv/ruby/python312/go/tools/node/cargo）。
   local build_path="/home/dbdog/tools/dda-venv/bin:/home/dbdog/tools/ruby27/bin:/home/dbdog/tools/python312/bin:/home/dbdog/tools/go/bin:/home/dbdog/tools/bin:/home/dbdog/tools/node/bin:/home/dbdog/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-  as_stack_user bash -c "cd '$agent_repo' && unset LD_LIBRARY_PATH && export PATH='$build_path' && exec dda inv -- agent.build --build-exclude=systemd" \
+  # 不建 rtloader：链接面直接取 embedded 运行时（lib + include 都在），与运行期同源；
+  # arm 的 tools/python312 是静态非 PIC，本地建 rtloader 必然 -fPIC 失败，也没必要建。
+  as_stack_user bash -c "cd '$agent_repo' && unset LD_LIBRARY_PATH && export PATH='$build_path' && exec dda inv -- agent.build --build-exclude=systemd --exclude-rtloader --rtloader-root=$AGENT_RUNTIME/embedded" \
     || die "agent Go 构建失败（构建机应有 /home/dbdog/tools/dda-venv；见 omnibus 构建日志里的 DDA 行）"
   [ -f "$agent_repo/bin/agent/agent" ] || die "构建产物缺失: $agent_repo/bin/agent/agent"
 
