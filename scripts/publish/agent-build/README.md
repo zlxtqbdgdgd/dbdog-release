@@ -61,10 +61,14 @@ preparer that derives each new generation from the previous one.
    `install-wheels` 照单安装。清单里少了谁，在这一步就报错，而不是等产物出来才发现缺集成。
 3. **改基线**：`dbdog-agent/dbdog-deploy/RELEASE-BASELINE.tsv` 的
    `agent_release_source_commit` 与 `integrations_core_release_source_commit`。
-4. **腾出安装根**：`/opt/dbdog-agent` 必须为空且无进程占用。这台机器上的
-   `dbdog-agent.service` 就跑在这个运行时上，所以要先停服务、把上一代 runtime 整体
-   `mv` 进它自己的历史 build 目录（约定名 `finalized-runtime-<上一版本>`），发布后再起回来。
-   **只移不删**——依赖 cache 与历史产物都在那底下。
+4. **构建安装根**（2026-08-09 起，构建期不再停宿主 agent）：构建/最终化在**私有挂载
+   命名空间**内进行——publish.sh 以 root 把 `/var/lib/dbdog-agent-install-roots/<agent_sha>`
+   bind 到 `/opt/dbdog-agent` 之上再降回 dbdog 跑配方。配方看到的仍是 canonical 前缀
+   （前缀烤进 rpath 与 embedded python，产物不可重定位），宿主同路径上自己的
+   `dbdog-agent.service` 全程照跑。bind 源由换锚准备器创建（publish 构建时也会自动
+   补建）；它必须在 `/var/lib` 同文件系统上——配方按同一设备核算 root 盘预算。
+   发布完成后 bind 源里留着的就是该代最终化运行时，等价于旧约定的
+   `finalized-runtime-<版本>` 归档；空间紧张时整体 `mv` 进该代 build 目录，**只移不删**。
 
 5. **发布**：`./scripts/publish/publish.sh publish dbdog-agent --bump patch --yes`。
    构建前的 preflight 会先跑 `build-host-prep.sh check` 一次报全前置条件，再逐项校验
@@ -77,12 +81,34 @@ preparer that derives each new generation from the previous one.
      < scripts/publish/agent-build/build-host-prep.sh
    ```
 
-   照 `PINNED-WHEELS` 安装（GaussDB 那条由 finalizer 自己装，这里跳过）。
+   照 `PINNED-WHEELS` 安装（GaussDB 那条由 finalizer 自己装，这里跳过）。pip 自动在
+   bind 了构建安装根的命名空间里执行，不会碰宿主上正在跑的运行时。
    忘了这一步不会静默：产物集成集合检查会在发布时红掉。
 
-7. **finalize**（构建机 root，交互执行，不要给它配 NOPASSWD）：
-   `anchors/<agent_sha>/run-finalize-agent-runtime.sh <版本>`，完成后重跑第 5 步的 publish，
-   配方会验证并复用已出的 canonical 产物。
+7. **finalize**（构建机 root，交互执行，不要给它配 NOPASSWD）。finalize 同样必须在
+   bind 了构建安装根的命名空间里进行：
+
+   ```bash
+   unshare --mount --propagation private /usr/bin/bash -c \
+     'mount --bind /var/lib/dbdog-agent-install-roots/<agent_sha> /opt/dbdog-agent \
+        && exec /home/dbdog/cache/dbdog-agent/anchors/<agent_sha>/run-finalize-agent-runtime.sh <版本>'
+   ```
+
+   完成后重跑第 5 步的 publish，配方会验证并复用已出的 canonical 产物。
+
+8. **构建机本机装回**（发布收尾；也是内网升级流程的第一次实战预演）：不要再手工把
+   运行时 `mv` 回 `/opt/dbdog-agent`——把产物播种进本机 cache 后走与内网完全相同的
+   升级路径（`download_artifact` 缓存命中即跳过下载，其余校验/解包/cutover/配置/验收
+   一步不少）：
+
+   ```bash
+   ssh root@<build-host> 'bash -s -- local-upgrade <agent_sha>' \
+     < scripts/publish/agent-build/build-host-prep.sh
+   ```
+
+   它核对 manifest 与产物一致后播种 `/root/dbdog/cache`，然后执行
+   `repo/dbdog-release/scripts/upgrade.sh dbdog-agent`。升级流程的问题在这里暴露，
+   而不是等到内网。
 
 配方本身**不含任何随锚变的字面量**——路径由传入的 `$SHA`/`$CORE_SHA` 派生，overlay 代号
 与 finalizer/wrapper 哈希从 `ANCHOR-INFO` 读取。所以换锚不需要改 `recipes/dbdog-agent.sh`。
@@ -122,9 +148,10 @@ ssh <build-host> 'bash -s -- check <agent_sha> <core_sha>' < scripts/publish/age
 1. **随锚控制物**：`anchors/<sha>/ANCHOR-INFO` 存在、core 锚与基线一致
 2. **git mirror**：两个 bare mirror 有本次的 agent/core 提交。它们**不会自动 fetch**，
    且属主是 `dbdog`——用 root fetch 会在里面留下 root 属主的对象
-3. **安装根 `/opt/dbdog-agent`**：必须是空的 `dbdog:dbdog 0755`，且**没有进程在用**。
-   这台机器上的 `dbdog-agent.service` 正是从这里跑的，不停它，finalizer 会在
-   `clean_runtime_tree` 与 `verify_runtime_exclusions` 之间被它重写 `run/registry.json`
+3. **构建安装根（命名空间 bind 源）**：`/var/lib/dbdog-agent-install-roots/<agent_sha>`
+   必须是空的 `dbdog:dbdog 0755`（canonical 产物已出时例外——复跑 publish 走验证复用，
+   不再碰安装根）。宿主 `/opt/dbdog-agent` 与在跑的 `dbdog-agent.service` 不参与判定：
+   构建/finalize 都在自己的挂载命名空间里，看不见也碰不到宿主运行时
 4. **锚定 wheel**：见上一节
 5. **共享基座漂移**：只报告，不阻断
 

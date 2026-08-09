@@ -15,6 +15,9 @@
 #   check <agent_sha> <core_sha>          只读；报全部前置条件与漂移，缺项给修复命令
 #   fetch-mirrors                         以属主 dbdog 身份 fetch 两个 bare mirror
 #   install-wheels <agent_sha> <core_sha> root；照锚册 PINNED-WHEELS 安装锚定 wheel
+#   local-upgrade <agent_sha>             root；发布收尾：把该锚 canonical 产物播种进本机
+#                                         cache 后走与内网完全相同的 upgrade.sh 升级路径
+#                                         （缓存命中即免下载，其余校验/cutover/验收一步不少）
 #
 # 锚定 wheel 的权威是换锚时落下的 anchors/<sha>/PINNED-WHEELS（摘要记在 ANCHOR-INFO）。
 # 旧版准备器建的锚没有它，那类退回按封存 core 现场推导，并会明确提示是旧锚。
@@ -23,9 +26,15 @@ set -euo pipefail
 umask 0022
 export LC_ALL=C
 
-# 两个根路径可被环境变量覆盖——只为让合成夹具能在不碰真实 cache 的前提下跑这套判定。
+# 根路径可被环境变量覆盖——只为让合成夹具能在不碰真实 cache 的前提下跑这套判定。
 CACHE_ROOT="${DBDOG_AGENT_CACHE_ROOT:-/home/dbdog/cache/dbdog-agent}"
 INSTALL_DIR="${DBDOG_AGENT_INSTALL_DIR:-/opt/dbdog-agent}"
+# 构建不再直接占用宿主 $INSTALL_DIR：构建/最终化在私有挂载命名空间内进行，把
+# $INSTALL_ROOTS/<agent_sha> bind 到 $INSTALL_DIR 之上——配方看到的仍是 canonical
+# 前缀（前缀烤进 rpath 与 embedded python，产物不可重定位），宿主同路径上自己的
+# dbdog-agent 服务全程照跑，构建期不停服。bind 源必须与 /var/lib 同文件系统
+# （配方按同一设备核算 root 盘预算），因此固定在 /var/lib 下。
+INSTALL_ROOTS="${DBDOG_AGENT_INSTALL_ROOTS:-/var/lib/dbdog-agent-install-roots}"
 GIT_DIR_AGENT="$CACHE_ROOT/git/dbdog-agent.git"
 GIT_DIR_CORE="$CACHE_ROOT/git/dbdog-agent-core.git"
 EMBEDDED_PYTHON="$INSTALL_DIR/embedded/bin/python3"
@@ -99,6 +108,7 @@ cmd_check() {
   local agent_sha="$1" core_sha="$2" sealed info_core covered engine wheel
   local base_released base_sealed base_rel base_pin_sha reason kind manifest expect_digest actual_digest
   local pw_engine pw_rel pw_sha
+  local local_build_dir install_src
 
   section "锚控制物"
   if anchor_value "$agent_sha" anchor_info_format >/dev/null 2>&1; then
@@ -133,25 +143,27 @@ cmd_check() {
     fix "build-host-prep.sh fetch-mirrors"
   fi
 
-  section "安装根 $INSTALL_DIR"
-  if [ ! -d "$INSTALL_DIR" ] || [ -L "$INSTALL_DIR" ]; then
-    bad "不是实际目录"
-    fix "install -d -o dbdog -g dbdog -m 0755 $INSTALL_DIR"
-  elif [ "$(stat -c '%U:%G %a' "$INSTALL_DIR")" != "dbdog:dbdog 755" ]; then
-    bad "属主/模式应为 dbdog:dbdog 0755，实为 $(stat -c '%U:%G %a' "$INSTALL_DIR")"
-    fix "chown dbdog:dbdog $INSTALL_DIR && chmod 0755 $INSTALL_DIR"
-  elif [ -n "$(find "$INSTALL_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
-    bad "非空——release attempt 只接受空的安装根"
-    fix "systemctl stop dbdog-agent（它占着这个运行时）"
-    fix "mv $INSTALL_DIR <上一代build目录>/finalized-runtime-<上一版本> 并重建空目录"
+  section "构建安装根（命名空间 bind 源；宿主 $INSTALL_DIR 与在跑服务不受构建影响）"
+  local_build_dir="$(anchor_value "$agent_sha" build_dir || true)"
+  install_src="$INSTALL_ROOTS/$agent_sha"
+  if [ -n "$local_build_dir" ] && [ -e "$local_build_dir/omnibus.success" ] && \
+     find "$local_build_dir/out" -maxdepth 1 -name 'dbdog-agent-*.tar.gz' -print -quit 2>/dev/null | grep -q .; then
+    # 配方在 canonical 产物已出时走「验证并复用」路径，根本不碰安装根；
+    # 此时 bind 源里留着的正是刚最终化的运行时，要求它为空反而会拦住复跑 publish。
+    ok "本锚已有 canonical 产物（publish 验证复用，不要求空 bind 源）"
+  elif [ ! -e "$install_src" ] && [ ! -L "$install_src" ]; then
+    ok "bind 源尚未创建（publish 构建时自动以 dbdog:dbdog 0755 创建）: $install_src"
+  elif [ ! -d "$install_src" ] || [ -L "$install_src" ]; then
+    bad "bind 源不是实际目录: $install_src"
+    fix "移走后重跑（publish 会重建），或 install -d -o dbdog -g dbdog -m 0755 $install_src"
+  elif [ "$(stat -c '%U:%G %a' "$install_src")" != "dbdog:dbdog 755" ]; then
+    bad "bind 源属主/模式应为 dbdog:dbdog 0755，实为 $(stat -c '%U:%G %a' "$install_src")"
+    fix "chown dbdog:dbdog $install_src && chmod 0755 $install_src"
+  elif [ -n "$(find "$install_src" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    bad "bind 源非空——release attempt 只接受空的安装根（上次构建残留？）"
+    fix "mv $install_src <该代build目录>/finalized-runtime-<版本> 归档（只移不删）并重建空目录"
   else
-    ok "存在、属主模式正确、为空"
-  fi
-  if pgrep -f "$INSTALL_DIR/bin/agent/agent run" >/dev/null 2>&1; then
-    bad "有进程正在使用该运行时（会在 finalizer 清理后重写 run/，导致打包失败）"
-    fix "systemctl stop dbdog-agent"
-  else
-    ok "没有进程占用该运行时"
+    ok "bind 源存在、属主模式正确、为空"
   fi
 
   section "锚定 wheel（决定发布锚的代码能否进产物）"
@@ -238,15 +250,59 @@ EOF
 }
 
 # 与 finalizer 装 gaussdb 完全同一套语义：净化环境、离线、不牵连依赖、不写字节码。
+# pip 在 bind 了构建安装根的私有命名空间里执行：一来绝不会碰宿主 $INSTALL_DIR 里
+# 正在跑的运行时，二来 embedded python 自见的前缀就是 canonical 路径，装出来的
+# 脚本 shebang / RECORD 与旧流程逐字节同形。RUNTIME_SRC 由 cmd_install_wheels 设置。
 install_one_wheel() { # <引擎> <wheel 绝对路径>
   [ "$(stat -c '%U:%G %a' "$2")" = "root:root 444" ] \
     || die "$1 的 wheel 必须是 root:root 0444: $2"
   env -i HOME=/nonexistent LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin:/bin \
     PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 \
-    "$EMBEDDED_PYTHON" -I -B -m pip install \
-    --no-index --no-deps --force-reinstall --no-cache-dir "$2" >/dev/null \
+    unshare --mount --propagation private /usr/bin/bash -c \
+    'mount --bind "$1" "$2" && exec "$3" -I -B -m pip install \
+       --no-index --no-deps --force-reinstall --no-cache-dir "$4"' \
+    _ "$RUNTIME_SRC" "$INSTALL_DIR" "$EMBEDDED_PYTHON" "$2" >/dev/null \
     || die "$1 离线 wheel 安装失败"
   printf 'installed %s from %s\n' "$1" "$2"
+}
+
+# 发布收尾的本机装回：不再手工把运行时 mv 回宿主 /opt/dbdog-agent（那是纯拷二进制，
+# 升级流程的问题只会等到内网才暴露）。这里把 canonical 产物播种进本机 cache，然后
+# 执行与内网 DB 主机完全相同的 upgrade.sh 路径——download_artifact 缓存命中即跳过
+# 下载，manifest 校验、解包验收、root cutover、配置与真实采集验收一步不少。
+cmd_local_upgrade() { # <agent_sha>
+  local agent_sha="$1" build_dir artifact art_name repo manifest cache
+  local m_version m_artifact m_sha file_sha
+  [ "$(id -u)" -eq 0 ] || die "local-upgrade 必须以 root 执行"
+  build_dir="$(anchor_value "$agent_sha" build_dir)" || die "读不到 ANCHOR-INFO"
+  [ -n "$build_dir" ] || die "ANCHOR-INFO 缺 build_dir"
+  artifact="$(find "$build_dir/out" -maxdepth 1 -name 'dbdog-agent-*.tar.gz' -print -quit 2>/dev/null)"
+  [ -n "$artifact" ] || die "该锚还没有 canonical 产物（先完成 publish/finalize）: $build_dir/out"
+  art_name="$(basename "$artifact")"
+
+  repo="${DBDOG_RELEASE_REPO:-/home/dbdog/repo/dbdog-release}"
+  [ -d "$repo/.git" ] || die "构建机上没有 dbdog-release 检出: $repo"
+  # manifest 是升级权威：先把检出对齐远端 main，再核对产物与 manifest 一字不差。
+  # 检出属主是 dbdog，root 直接 fetch 会往 .git 里留 root 属主对象（同 mirror 的坑）。
+  su -s /bin/bash dbdog -c "git -C '$repo' fetch -q origin main && git -C '$repo' merge -q --ff-only origin/main" \
+    || die "无法把 $repo fast-forward 到 origin/main"
+  manifest="$repo/manifest.tsv"
+  [ -f "$manifest" ] || die "缺 manifest: $manifest"
+  m_version="$(awk -F'\t' '$1=="dbdog-agent"{print $5; exit}' "$manifest")"
+  m_artifact="$(awk -F'\t' '$1=="dbdog-agent"{print $6; exit}' "$manifest")"
+  m_sha="$(awk -F'\t' '$1=="dbdog-agent"{print $7; exit}' "$manifest")"
+  [ -n "$m_version" ] && [ "$m_version" != - ] || die "manifest 里 dbdog-agent 尚未发布"
+  [ "$art_name" = "$m_artifact" ] || \
+    die "构建产物 $art_name 与 manifest 记录 $m_artifact 不一致——先完成发布再本机装回"
+  file_sha="$(sha256sum "$artifact" | awk '{print $1}')"
+  [ "$file_sha" = "$m_sha" ] || \
+    die "构建产物 SHA-256 与 manifest 不一致（产物=$file_sha manifest=$m_sha）"
+
+  cache="${DBDOG_HOME:-$HOME/dbdog}/cache"
+  install -d -m 0755 "$cache"
+  install -m 0644 "$artifact" "$cache/$art_name"
+  printf 'seeded %s (%s) -> %s\n' "$art_name" "$m_version" "$cache/$art_name"
+  exec "$repo/scripts/upgrade.sh" dbdog-agent
 }
 
 cmd_fetch_mirrors() {
@@ -266,7 +322,9 @@ cmd_fetch_mirrors() {
 cmd_install_wheels() {
   local agent_sha="$1" core_sha="$2" sealed covered engine wheel kind manifest rel sha
   [ "$(id -u)" -eq 0 ] || die "install-wheels 必须以 root 执行"
-  [ -x "$EMBEDDED_PYTHON" ] || die "运行时里没有 embedded Python（先跑 omnibus 构建）"
+  RUNTIME_SRC="$INSTALL_ROOTS/$agent_sha"
+  [ -x "$RUNTIME_SRC/embedded/bin/python3" ] || \
+    die "构建安装根里没有 embedded Python（先跑 omnibus 构建；命名空间构建的运行时应在 $RUNTIME_SRC）"
   sealed="$(anchor_value "$agent_sha" omnibus_core_sha)" || die "读不到 ANCHOR-INFO"
   covered="$(anchor_value "$agent_sha" gaussdb_wheel_rel | sed -n 's|^sources/python/\([^/]*\)/.*|\1|p')"
 
@@ -308,7 +366,11 @@ case "${1:-}" in
     [ "$#" -eq 3 ] || die "用法: build-host-prep.sh install-wheels <agent_sha> <core_sha>"
     cmd_install_wheels "$2" "$3"
     ;;
+  local-upgrade)
+    [ "$#" -eq 2 ] || die "用法: build-host-prep.sh local-upgrade <agent_sha>"
+    cmd_local_upgrade "$2"
+    ;;
   *)
-    die "用法: build-host-prep.sh check|fetch-mirrors|install-wheels [参数...]"
+    die "用法: build-host-prep.sh check|fetch-mirrors|install-wheels|local-upgrade [参数...]"
     ;;
 esac

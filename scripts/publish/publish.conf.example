@@ -6,6 +6,11 @@
 BUILD_HOST_AARCH64="dbdog-build"     # 标准维护机，在 ~/.ssh/config 中定义
 BUILD_HOST_X86_64="z1@CHANGE-ME"     # 独立的原生 x86_64 builder；未配置真实机器前留占位值
 
+# Agent 构建以 root 建私有挂载命名空间（把构建安装根 bind 到 /opt/dbdog-agent 上，
+# 构建期不停宿主 agent）。默认从 aarch64 builder 的 ssh 配置解析 root@<hostname>；
+# root 通路另有别名/跳板时在这里显式指定。
+#BUILD_HOST_ROOT="root@dbdog-build"
+
 # 兼容回退：只在未设置 BUILD_HOST_<ARCH> 时才会退回这个旧的单一 BUILD_HOST——且仅当
 # 发布前在它上面执行 `uname -m` 并经 normalize_arch 精确等于请求架构才会被接受；
 # 不一致时该架构整体拒绝构建（不会静默换机器，也不会用 QEMU 模拟）。

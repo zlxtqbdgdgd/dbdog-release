@@ -765,6 +765,17 @@ resolve_build_host_for_arch() { # resolve_build_host_for_arch <aarch64|x86_64|no
   RESOLVED_BUILD_HOST="$BUILD_HOST"
 }
 
+build_host_root_login() { # <build host 别名> → stdout root 登录串
+  # Agent 构建要以 root 建私有挂载命名空间（bind 构建安装根到 canonical 前缀上），
+  # 别名通常按普通用户配置，这里解析出同一台机器的 root 通路；也可用 BUILD_HOST_ROOT
+  # 在 publish.conf 里显式指定。
+  local host="$1" hn
+  if [ -n "${BUILD_HOST_ROOT:-}" ]; then printf '%s' "$BUILD_HOST_ROOT"; return 0; fi
+  hn="$(ssh -G "$host" 2>/dev/null | awk '/^hostname /{print $2; exit}')"
+  [ -n "$hn" ] || die "无法从 ssh 配置解析 ${host} 的主机名；请在 publish.conf 设置 BUILD_HOST_ROOT"
+  printf 'root@%s' "$hn"
+}
+
 publish_ensure_arch_builders() { # publish_ensure_arch_builders <module>；该模块全部目标架构必须都有可用原生 builder
   # 逐架构预检，不产生任何构建/上传副作用（resolve_build_host_for_arch 只读配置、
   # 最多探一次 uname -m）。任一架构缺少 builder 就在这里 die，早于对该模块任何
@@ -991,7 +1002,26 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
 
   log "[$m/$arch] 构建于 $BUILD_HOST ..."
   local out recipe_stdout
-  if ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+  if [ "$m" = dbdog-agent ] && [ "$arch" = aarch64 ]; then
+    # Agent 的安装前缀 /opt/dbdog-agent 烤进 rpath 与 embedded python，产物不可重定位；
+    # 而构建机宿主同一路径上正跑着它自己的 dbdog-agent。因此构建放进私有挂载命名空间：
+    # 把随锚的构建安装根 bind 到 canonical 前缀之上再降回 dbdog 跑配方——配方看到的
+    # 路径与旧流程逐字节相同，宿主路径与在跑服务全程不受影响，构建期不停服。
+    # bind 源固定在 /var/lib 下：配方要求安装根与 /var/lib 同文件系统（root 盘预算）。
+    local root_login install_src ns_prelude
+    root_login="$(build_host_root_login "$BUILD_HOST")"
+    install_src="/var/lib/dbdog-agent-install-roots/$sha"
+    ns_prelude="set -euo pipefail
+install -d -o dbdog -g dbdog -m 0755 $install_src
+exec unshare --mount --propagation private /usr/bin/bash -c 'mount --bind \"\$1\" /opt/dbdog-agent && exec runuser -u dbdog -- env $(printf '%q ' \
+      MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" ARCH="$arch" \
+      REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
+      PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}")/usr/bin/bash -s' _ $install_src"
+    if ! recipe_stdout="$(ssh -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
+          "$root_login" "$ns_prelude" <"$recipe")"; then
+      die "[$m/$arch] 远端构建配方执行失败"
+    fi
+  elif ! recipe_stdout="$(ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=12 \
         "$BUILD_HOST" MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" \
         ARCH="$arch" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
         PG_PREFIX="${PG_PREFIX:-}" CH_BIN="${CH_BIN:-}" bash -s <"$recipe")"; then

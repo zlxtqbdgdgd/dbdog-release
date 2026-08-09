@@ -1287,8 +1287,14 @@ runner_executed=0
 if [[ ! -e $BUILD_DIR/omnibus.success && ! -L $BUILD_DIR/omnibus.success ]]; then
   # resume/adopt 仅属于历史 build1 的一次性恢复合同。release attempt 若根据共享的
   # /opt/dbdog-agent 状态猜测续跑模式，会被 runner 拒绝，也可能把旧 attempt 当成
-  # 当前输入。因此只允许显式 fresh；管理员需先把上一轮 runtime 移到其历史
-  # build 目录并准备一个 canonical、dbdog-owned 的空 install root。
+  # 当前输入。因此只允许显式 fresh。
+  # fresh 构建必须在私有挂载命名空间内进行：publish.sh 以 root 把
+  # /var/lib/dbdog-agent-install-roots/<SHA> bind 到 $INSTALL_DIR 之上再降回 dbdog
+  # 执行本配方。这里 fail closed 地验证 bind 真的在位——否则「按旧方式直跑配方」会
+  # 直接吃掉宿主上正在跑的 dbdog-agent 运行时（2026-08-09 之前的旧流程正是如此，
+  # 每次构建都得停服数十分钟）。
+  grep -qsE "^[^ ]+ [^ ]+ [^ ]+ [^ ]+ $INSTALL_DIR " /proc/self/mountinfo || \
+    die "fresh install root 不是挂载点：本配方必须由 publish.sh 在私有挂载命名空间内调用（bind /var/lib/dbdog-agent-install-roots/$SHA → $INSTALL_DIR），拒绝直接改写宿主运行时"
   [[ -d $INSTALL_DIR && ! -L $INSTALL_DIR ]] || \
     die "fresh install root 不是实际目录: $INSTALL_DIR"
   [[ $(readlink -e -- "$INSTALL_DIR") == "$INSTALL_DIR" ]] || \
@@ -1330,4 +1336,4 @@ fi
 
 require_root_control 'canonical finalizer' "$FINALIZER" 555 "$FINALIZER_SHA256"
 require_root_control 'narrow root finalizer wrapper' "$FINALIZER_WRAPPER" 555 "$FINALIZER_WRAPPER_SHA256"
-die "Omnibus handoff 已验证，但缺少 root 最终化产物。请管理员交互式执行：sudo $FINALIZER_WRAPPER $VERSION；不要为该命令配置 NOPASSWD。完成后重新运行 publish，配方将验证并复用 canonical 产物"
+die "Omnibus handoff 已验证，但缺少 root 最终化产物。请管理员在构建机上以 root 交互式执行（finalize 也必须在 bind 了构建安装根的私有命名空间内进行，宿主运行时不受影响）：unshare --mount --propagation private /usr/bin/bash -c 'mount --bind /var/lib/dbdog-agent-install-roots/$SHA /opt/dbdog-agent && exec $FINALIZER_WRAPPER $VERSION'；不要为该命令配置 NOPASSWD。完成后重新运行 publish，配方将验证并复用 canonical 产物"

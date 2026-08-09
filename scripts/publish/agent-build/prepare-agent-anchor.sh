@@ -525,6 +525,19 @@ fi
 [[ $(stat -c '%U:%G:%a' -- "$to_build_dir") == dbdog:dbdog:775 ]] || \
   die 'build attempt 必须是 dbdog:dbdog mode 0775'
 
+# 构建安装根（命名空间 bind 源）：构建/最终化在私有挂载命名空间内把它 bind 到
+# /opt/dbdog-agent 之上，宿主同路径上在跑的 dbdog-agent 不受影响（构建期不停服）。
+# 必须落在 /var/lib 同文件系统（配方按同一设备核算 root 盘预算）。
+to_install_root="/var/lib/dbdog-agent-install-roots/$to_agent_sha"
+if [[ -e $to_install_root ]]; then
+  log "构建安装根已存在: $to_install_root"
+else
+  install -d -o dbdog -g dbdog -m 0755 -- "$to_install_root"
+  log "已创建构建安装根（命名空间 bind 源）: $to_install_root"
+fi
+[[ $(stat -c '%U:%G:%a' -- "$to_install_root") == dbdog:dbdog:755 ]] || \
+  die '构建安装根必须是 dbdog:dbdog mode 0755'
+
 log '完成。ANCHOR-INFO：'
 cat -- "$to_anchor_dir/ANCHOR-INFO"
 log "下一步：把 RELEASE-BASELINE.tsv 的 agent_release_source_commit 改为 $to_agent_sha、"
