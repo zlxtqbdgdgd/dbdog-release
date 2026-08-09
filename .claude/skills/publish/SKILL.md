@@ -16,12 +16,20 @@ GitHub 资产来绕过脚本。
 | 「发布到本机」 | **发布到本机** | 把已发布的 agent 在构建机上走**与内网完全相同的升级路径**装回（免下载，其余校验/cutover/验收一步不少）。agent 发布到 GH 后的标准收尾 |
 
 **「本机」的定义：出这个包的那台构建机**（编译在哪台，装回哪台）。当前发布矩阵只出
-aarch64，所以本机就是 `dbdog-build`；将来某架构（如 x86_64）进了发布矩阵，其「本机」就是
-那台对应架构的 builder。x86 靶机目前**不走发布流程**（本机构建自装，dbdog-deploy 路径），
-不在本 skill 范围内。
+aarch64，所以本机就是 `dbdog-build`；将来某架构进了发布矩阵，其「本机」就是那台对应
+架构的 builder。x86 现状：发布域的多架构槽位（`BUILD_HOST_X86_64`、manifest arch 矩阵、
+逐架构 fail closed）都在，`dbdog-build-x86`（146.56.217.73，CentOS Stream，兼 GaussDB
+靶机）ssh 别名已备；编译域缺口是 server/web 的 cargo/node 工具链（机械活）与 agent 的
+整条 x86 封存/换锚链（真项目，需专门排期）。mcp 是 noarch，天然全架构。在 x86 入矩阵前，
+x86 靶机的 agent 仍走 dbdog-deploy 本机构建自装，不在本 skill 范围内。
 
-发 agent 时两个动作按顺序都做：先发布到 GH，再发布到本机。只说「发布」而范围含 agent 时，
-默认把「发布到本机」一起做完。server/web/mcp 没有「发布到本机」一说（见文末）。
+发 agent 时两个动作按顺序都做：先发布到 GH，再发布到本机。只说「发布」时，默认把范围内
+模块的「发布到本机」一起做完（栈模块见下文前提）。
+
+**开发测试频繁提交怎么办（统一性与效率的分界）**：日常 dev 迭代继续走快路径（dev 栈直接
+换二进制/重启），**不**要求每个提交走发布；但每次正式发布（版本切点）必须「发布到 GH +
+发布到本机」成对做完——所有正式版本都经真实升级路径落到构建机，升级流程的问题在这里
+先暴露，而高频提交不被发版仪式拖慢。
 
 ## 发布到 GH
 
@@ -65,27 +73,34 @@ aarch64，所以本机就是 `dbdog-build`；将来某架构（如 x86_64）进�
    其 size/digest 等于 manifest，并运行 `./scripts/publish/publish.sh prune` 确认无孤儿资产。
 7. **汇报**：列出模块、版本、发布提交、资产 SHA-256；提示内网走正常升级路径。
 
-## 发布到本机（agent 发布后的标准收尾）
+## 发布到本机（发布到 GH 后的标准收尾）
 
-前提：该版本已完成发布到 GH（本机装回会核对产物与 manifest 的名字/SHA-256 一字不差，
-不一致 fail closed）。执行：
+前提：该版本已完成发布到 GH——本机装回会核对留存产物与 manifest 的名字/SHA-256
+一字不差，不一致 fail closed。统一入口（agent 与栈模块同一话术、同一命令形）：
 
 ```bash
-ssh root@<构建机> 'DBDOG_POSTGRES_EXCLUDE_PORTS=5432 bash -s -- local-upgrade <agent_sha>' \
+# agent（sha 可省略，按 manifest 锚自动解析；这台构建机要带 5432 排除，见下）
+ssh root@<构建机> 'DBDOG_POSTGRES_EXCLUDE_PORTS=5432 bash -s -- local-upgrade dbdog-agent' \
+  < scripts/publish/agent-build/build-host-prep.sh
+# 栈模块（可多个；agent 不能与栈模块混在一次里）
+ssh root@<构建机> 'bash -s -- local-upgrade dbdog-server dbdog-web dbdog-mcp' \
   < scripts/publish/agent-build/build-host-prep.sh
 ```
 
-它做的事：fast-forward 构建机上的 dbdog-release 检出 → 核对产物与 manifest → 播种进
-`/root/dbdog/cache`（升级器缓存命中即免下载）→ 执行与内网 DB 主机完全相同的
-`upgrade.sh dbdog-agent`：解包验收、root cutover、conf 渲染、逐引擎 check、稳定窗验收，
-失败自动事务回滚。停服窗口只有 cutover 那约 2 分钟。
+它做的事：fast-forward 构建机上的 dbdog-release 检出 → 核对留存产物（agent 在
+`anchors/<sha>` 对应 build 目录、栈模块在 `$BUILD_WORK/<模块>/out/`）与 manifest →
+播种进 `/root/dbdog/cache`（升级器缓存命中即免下载）→ 执行与内网完全相同的
+`upgrade.sh`：解包验收、cutover、配置、验收，失败自动事务回滚。agent 的停服窗口只有
+cutover 那约 2 分钟。
 
-- **`DBDOG_POSTGRES_EXCLUDE_PORTS=5432` 在这台构建机上每次都要带**：5432 是私人 dev PG
-  实例，监控体系拿不到其凭证；不带会在凭证探测处回滚。哪天该实例配好 dbdog 凭证即可去掉。
+- **`DBDOG_POSTGRES_EXCLUDE_PORTS=5432` 在这台构建机上发 agent 时每次都要带**：5432 是
+  私人 dev PG 实例，监控体系拿不到其凭证；不带会在凭证探测处回滚。配好凭证即可去掉。
+- **栈模块前提（一次性迁移，owner 安排）**：栈的「发布到本机」只升级**已按 release 布局
+  安装**（`/root/dbdog/modules/<模块>/current` 存在）的模块。这台构建机的 server/web/mcp
+  目前是 `dbdogt-*` 手工 dev 栈（端口/数据/服务与 release 布局冲突），首次安装=栈迁移
+  （涉及 CH/PG 数据与端口切换），须由 owner 安排窗口执行；迁移前命令会 fail closed 指路。
 - 升级流程的问题在这一步暴露在构建机上，而不是等到内网——验收失败要当真排查
-  （`/var/log/dbdog-agent/install-*.log`），不要绕过。
-- server/web/mcp 不走这套：构建机上的应用栈要升级就正常 `scripts/upgrade.sh <模块>`
-  （它们的包从 GitHub 拉，构建机可直连）。
+  （agent 看 `/var/log/dbdog-agent/install-*.log`），不要绕过。
 
 ## 注意
 

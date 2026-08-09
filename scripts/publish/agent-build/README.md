@@ -102,13 +102,15 @@ preparer that derives each new generation from the previous one.
    一步不少）：
 
    ```bash
-   ssh root@<build-host> 'bash -s -- local-upgrade <agent_sha>' \
+   ssh root@<build-host> 'bash -s -- local-upgrade dbdog-agent' \
      < scripts/publish/agent-build/build-host-prep.sh
    ```
 
-   它核对 manifest 与产物一致后播种 `/root/dbdog/cache`，然后执行
+   它按 manifest 锚自动解析该发哪个锚的产物（也接受显式 40 位 sha），核对 manifest 与
+   产物一致后播种 `/root/dbdog/cache`，然后执行
    `repo/dbdog-release/scripts/upgrade.sh dbdog-agent`。升级流程的问题在这里暴露，
-   而不是等到内网。
+   而不是等到内网。栈模块同一子命令（`local-upgrade dbdog-server ...`），话术与前提见
+   publish skill。
 
 配方本身**不含任何随锚变的字面量**——路径由传入的 `$SHA`/`$CORE_SHA` 派生，overlay 代号
 与 finalizer/wrapper 哈希从 `ANCHOR-INFO` 读取。所以换锚不需要改 `recipes/dbdog-agent.sh`。

@@ -15,9 +15,11 @@
 #   check <agent_sha> <core_sha>          只读；报全部前置条件与漂移，缺项给修复命令
 #   fetch-mirrors                         以属主 dbdog 身份 fetch 两个 bare mirror
 #   install-wheels <agent_sha> <core_sha> root；照锚册 PINNED-WHEELS 安装锚定 wheel
-#   local-upgrade <agent_sha>             root；发布收尾：把该锚 canonical 产物播种进本机
-#                                         cache 后走与内网完全相同的 upgrade.sh 升级路径
-#                                         （缓存命中即免下载，其余校验/cutover/验收一步不少）
+#   local-upgrade dbdog-agent [<sha>]     root；「发布到本机」：把留存的 canonical 产物播种进
+#   local-upgrade <栈模块>...             本机 cache 后走与内网完全相同的 upgrade.sh 升级路径
+#                                         （缓存命中即免下载，其余校验/cutover/验收一步不少）。
+#                                         agent 的 sha 缺省按 manifest 锚解析；栈模块要求已按
+#                                         release 布局安装（首次安装=栈迁移，owner 安排）
 #
 # 锚定 wheel 的权威是换锚时落下的 anchors/<sha>/PINNED-WHEELS（摘要记在 ANCHOR-INFO）。
 # 旧版准备器建的锚没有它，那类退回按封存 core 现场推导，并会明确提示是旧锚。
@@ -266,43 +268,94 @@ install_one_wheel() { # <引擎> <wheel 绝对路径>
   printf 'installed %s from %s\n' "$1" "$2"
 }
 
-# 发布收尾的本机装回：不再手工把运行时 mv 回宿主 /opt/dbdog-agent（那是纯拷二进制，
-# 升级流程的问题只会等到内网才暴露）。这里把 canonical 产物播种进本机 cache，然后
-# 执行与内网 DB 主机完全相同的 upgrade.sh 路径——download_artifact 缓存命中即跳过
-# 下载，manifest 校验、解包验收、root cutover、配置与真实采集验收一步不少。
-cmd_local_upgrade() { # <agent_sha>
-  local agent_sha="$1" build_dir artifact art_name repo manifest cache
-  local m_version m_artifact m_sha file_sha
-  [ "$(id -u)" -eq 0 ] || die "local-upgrade 必须以 root 执行"
-  build_dir="$(anchor_value "$agent_sha" build_dir)" || die "读不到 ANCHOR-INFO"
-  [ -n "$build_dir" ] || die "ANCHOR-INFO 缺 build_dir"
-  artifact="$(find "$build_dir/out" -maxdepth 1 -name 'dbdog-agent-*.tar.gz' -print -quit 2>/dev/null)"
-  [ -n "$artifact" ] || die "该锚还没有 canonical 产物（先完成 publish/finalize）: $build_dir/out"
-  art_name="$(basename "$artifact")"
+# 发布收尾的本机装回（「发布到本机」）：不再手工搬运行时/二进制（那是纯拷贝，升级流程
+# 的问题只会等到内网才暴露）。这里把构建机上留存的 canonical 产物播种进本机 cache，然后
+# 执行与内网完全相同的 upgrade.sh 路径——download_artifact 缓存命中即跳过下载，manifest
+# 校验、解包验收、cutover、配置与验收一步不少。
+#   local-upgrade dbdog-agent [<agent_sha>]   # sha 缺省时按 manifest 短锚在 anchors/ 解析
+#   local-upgrade <栈模块>...                 # dbdog-server/dbdog-web/dbdog-mcp 等
+# agent 与栈模块不能混在一次调用里（upgrade.sh 的既有规则）。
+LOCAL_BUILD_WORK="${DBDOG_BUILD_WORK:-/home/dbdog/dbdog-release-build}"
 
-  repo="${DBDOG_RELEASE_REPO:-/home/dbdog/repo/dbdog-release}"
+local_upgrade_sync_repo() { # → stdout manifest 路径；顺带把检出对齐远端 main
+  local repo="${DBDOG_RELEASE_REPO:-/home/dbdog/repo/dbdog-release}"
   [ -d "$repo/.git" ] || die "构建机上没有 dbdog-release 检出: $repo"
-  # manifest 是升级权威：先把检出对齐远端 main，再核对产物与 manifest 一字不差。
   # 检出属主是 dbdog，root 直接 fetch 会往 .git 里留 root 属主对象（同 mirror 的坑）。
   su -s /bin/bash dbdog -c "git -C '$repo' fetch -q origin main && git -C '$repo' merge -q --ff-only origin/main" \
     || die "无法把 $repo fast-forward 到 origin/main"
-  manifest="$repo/manifest.tsv"
-  [ -f "$manifest" ] || die "缺 manifest: $manifest"
-  m_version="$(awk -F'\t' '$1=="dbdog-agent"{print $5; exit}' "$manifest")"
-  m_artifact="$(awk -F'\t' '$1=="dbdog-agent"{print $6; exit}' "$manifest")"
-  m_sha="$(awk -F'\t' '$1=="dbdog-agent"{print $7; exit}' "$manifest")"
-  [ -n "$m_version" ] && [ "$m_version" != - ] || die "manifest 里 dbdog-agent 尚未发布"
+  [ -f "$repo/manifest.tsv" ] || die "缺 manifest: $repo/manifest.tsv"
+  printf '%s' "$repo"
+}
+
+local_upgrade_seed() { # <模块> <产物绝对路径> <manifest>；核对一字不差后播种 cache
+  local m="$1" artifact="$2" manifest="$3" art_name m_version m_artifact m_sha file_sha cache
+  art_name="$(basename "$artifact")"
+  m_version="$(awk -F'\t' -v m="$m" '$1==m{print $5; exit}' "$manifest")"
+  m_artifact="$(awk -F'\t' -v m="$m" '$1==m{print $6; exit}' "$manifest")"
+  m_sha="$(awk -F'\t' -v m="$m" '$1==m{print $7; exit}' "$manifest")"
+  [ -n "$m_version" ] && [ "$m_version" != - ] || die "manifest 里 $m 尚未发布"
   [ "$art_name" = "$m_artifact" ] || \
-    die "构建产物 $art_name 与 manifest 记录 $m_artifact 不一致——先完成发布再本机装回"
+    die "$m 构建产物 $art_name 与 manifest 记录 $m_artifact 不一致——先完成发布到 GH 再发布到本机"
   file_sha="$(sha256sum "$artifact" | awk '{print $1}')"
   [ "$file_sha" = "$m_sha" ] || \
-    die "构建产物 SHA-256 与 manifest 不一致（产物=$file_sha manifest=$m_sha）"
-
+    die "$m 构建产物 SHA-256 与 manifest 不一致（产物=$file_sha manifest=$m_sha）"
   cache="${DBDOG_HOME:-$HOME/dbdog}/cache"
   install -d -m 0755 "$cache"
   install -m 0644 "$artifact" "$cache/$art_name"
   printf 'seeded %s (%s) -> %s\n' "$art_name" "$m_version" "$cache/$art_name"
-  exec "$repo/scripts/upgrade.sh" dbdog-agent
+}
+
+cmd_local_upgrade() { # <模块|agent_sha>...
+  local repo manifest agent_sha="" build_dir artifact m short
+  local -a stack_modules=()
+  [ "$(id -u)" -eq 0 ] || die "local-upgrade 必须以 root 执行"
+  repo="$(local_upgrade_sync_repo)"
+  manifest="$repo/manifest.tsv"
+
+  local want_agent=0
+  for m in "$@"; do
+    if [ "$m" = dbdog-agent ]; then
+      want_agent=1
+    elif printf '%s' "$m" | grep -qE '^[0-9a-f]{40}$'; then
+      # 兼容旧用法：直接给 40 位 agent 锚
+      want_agent=1
+      agent_sha="$m"
+    else
+      stack_modules+=("$m")
+    fi
+  done
+  if [ "$want_agent" -eq 1 ] && [ "${#stack_modules[@]}" -gt 0 ]; then
+    die "dbdog-agent 位于 DB 主机语义，不能与栈模块混在一次本机升级里（分两次跑）"
+  fi
+
+  if [ "$want_agent" -eq 1 ]; then
+    if [ -z "$agent_sha" ]; then
+      # 从 manifest 的 agent:<短锚> 在 anchors/ 解析出全长锚——发布到本机永远装 manifest 记录的那个。
+      short="$(awk -F'\t' '$1=="dbdog-agent"{print $8; exit}' "$manifest" | sed -n 's/^agent:\([0-9a-f]*\),.*/\1/p')"
+      [ -n "$short" ] || die "manifest 里读不到 dbdog-agent 的源码锚"
+      agent_sha="$(find "$CACHE_ROOT/anchors" -maxdepth 1 -type d -name "${short}*" -printf '%f\n' 2>/dev/null | head -1)"
+      [ -n "$agent_sha" ] || die "anchors/ 里没有匹配 manifest 锚 ${short} 的锚目录——这台构建机没出过该版本？"
+    fi
+    build_dir="$(anchor_value "$agent_sha" build_dir)" || die "读不到 ANCHOR-INFO"
+    [ -n "$build_dir" ] || die "ANCHOR-INFO 缺 build_dir"
+    artifact="$(find "$build_dir/out" -maxdepth 1 -name 'dbdog-agent-*.tar.gz' -print -quit 2>/dev/null)"
+    [ -n "$artifact" ] || die "该锚还没有 canonical 产物（先完成 publish/finalize）: $build_dir/out"
+    local_upgrade_seed dbdog-agent "$artifact" "$manifest"
+    exec "$repo/scripts/upgrade.sh" dbdog-agent
+  fi
+
+  [ "${#stack_modules[@]}" -gt 0 ] || die "用法: local-upgrade dbdog-agent [<agent_sha>] | local-upgrade <栈模块>..."
+  for m in "${stack_modules[@]}"; do
+    # 栈模块的「发布到本机」只覆盖**已按 release 布局安装**的模块。这台构建机上的
+    # dev 栈（dbdogt-* 单元）若尚未迁移到 release 布局，首次安装涉及端口/数据/服务
+    # 切换，必须由 owner 按迁移计划安排窗口，不能由本命令顺手做掉。
+    [ -e "${DBDOG_HOME:-$HOME/dbdog}/modules/$m/current" ] || \
+      die "$m 尚未按 release 布局安装（${DBDOG_HOME:-$HOME/dbdog}/modules/$m/current 不存在）——首次安装是栈迁移动作，见 publish skill 的迁移说明"
+    artifact="$LOCAL_BUILD_WORK/$m/out/$(awk -F'\t' -v m="$m" '$1==m{print $6; exit}' "$manifest")"
+    [ -f "$artifact" ] || die "$m 在本构建机没有留存的构建产物: $artifact（发布到 GH 的那次构建须出自本机）"
+    local_upgrade_seed "$m" "$artifact" "$manifest"
+  done
+  exec "$repo/scripts/upgrade.sh" "${stack_modules[@]}"
 }
 
 cmd_fetch_mirrors() {
@@ -367,8 +420,9 @@ case "${1:-}" in
     cmd_install_wheels "$2" "$3"
     ;;
   local-upgrade)
-    [ "$#" -eq 2 ] || die "用法: build-host-prep.sh local-upgrade <agent_sha>"
-    cmd_local_upgrade "$2"
+    [ "$#" -ge 2 ] || die "用法: build-host-prep.sh local-upgrade dbdog-agent [<agent_sha>] | local-upgrade <栈模块>..."
+    shift
+    cmd_local_upgrade "$@"
     ;;
   *)
     die "用法: build-host-prep.sh check|fetch-mirrors|install-wheels|local-upgrade [参数...]"

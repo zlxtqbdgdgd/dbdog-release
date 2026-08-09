@@ -4,6 +4,9 @@
 # 每个受支持架构都必须有一台独立的原生 builder，严禁 QEMU / 交叉编译 / 把未登记的
 # VM 顶替成 builder。没有为某架构配置原生 builder 时，该架构整体在任何构建/上传前失败。
 BUILD_HOST_AARCH64="dbdog-build"     # 标准维护机，在 ~/.ssh/config 中定义
+# x86_64 候选机是 dbdog-build-x86（146.56.217.73，CentOS Stream，兼 GaussDB 靶机，ssh 别名已备）。
+# 入矩阵前置：装 cargo/node 工具链、建 /home/dbdog/dbdog-release-build；agent 还需整条
+# x86 封存/换锚链（专门排期）。工具链未就绪前保持占位——发布器对该架构会 fail closed。
 BUILD_HOST_X86_64="z1@CHANGE-ME"     # 独立的原生 x86_64 builder；未配置真实机器前留占位值
 
 # Agent 构建以 root 建私有挂载命名空间（把构建安装根 bind 到 /opt/dbdog-agent 上，
