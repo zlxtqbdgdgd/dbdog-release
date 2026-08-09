@@ -96,8 +96,10 @@ fast_agent_local() {
     || die "rtloader 相对上游基线已有改动，组件级快升级前提失效（须整套 omnibus 慢路径）"
 
   log "[agent] dda 构建 Go agent（源 $short，--build-exclude=systemd）"
-  as_stack_user bash -c "cd '$agent_repo' && unset LD_LIBRARY_PATH && exec dda inv -- agent.build --build-exclude=systemd" \
-    || die "agent Go 构建失败（构建机应有 dda legacy venv；见 omnibus 构建日志里的 DDA 行）"
+  # 工具链 PATH 与 omnibus overlay runner 同源（dda-venv/ruby/python312/go/tools/node/cargo）。
+  local build_path="/home/dbdog/tools/dda-venv/bin:/home/dbdog/tools/ruby27/bin:/home/dbdog/tools/python312/bin:/home/dbdog/tools/go/bin:/home/dbdog/tools/bin:/home/dbdog/tools/node/bin:/home/dbdog/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+  as_stack_user bash -c "cd '$agent_repo' && unset LD_LIBRARY_PATH && export PATH='$build_path' && exec dda inv -- agent.build --build-exclude=systemd" \
+    || die "agent Go 构建失败（构建机应有 /home/dbdog/tools/dda-venv；见 omnibus 构建日志里的 DDA 行）"
   [ -f "$agent_repo/bin/agent/agent" ] || die "构建产物缺失: $agent_repo/bin/agent/agent"
 
   log "[agent] 构建/复用 4 个集成 wheel（core $(printf '%.7s' "$core_sha")）"
