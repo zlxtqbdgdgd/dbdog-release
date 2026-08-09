@@ -277,9 +277,27 @@ validate_module_runtime() { # <模块> <版本目录> <aarch64|x86_64|noarch>
 upgrade_one() {
   local m="$1"
   local version artifact sha256 target artifact_arch
-  version="$(manifest_get "$m" 5)"
-  artifact="$(manifest_get "$m" 6)"
-  sha256="$(manifest_get "$m" 7)"
+  if [ -n "$LOCAL_ARTIFACT" ]; then
+    # 快升级：包自证身份（名字给模块与版本，内容给 SHA）。模块必须仍是 manifest 里
+    # 登记的 stack 模块——快升级放宽的只有「装哪个版本」，不放宽「这机器上能装什么」。
+    artifact="$(basename "$LOCAL_ARTIFACT")"
+    case "$artifact" in
+      "$m"-*.tar.gz) ;;
+      *) die "--artifact 产物名不属于模块 $m: $artifact" ;;
+    esac
+    version="${artifact#"$m"-}"
+    version="${version%.tar.gz}"
+    version="${version%-*}"
+    [ -n "$version" ] || die "无法从产物名解析版本: $artifact"
+    sha256="$(sha256sum "$LOCAL_ARTIFACT" | awk '{print $1}')"
+    mkdir -p "$CACHE_DIR"
+    install -m 0644 "$LOCAL_ARTIFACT" "$CACHE_DIR/$artifact"
+    log "$m: 快升级产物 ${artifact}（sha ${sha256:0:12}）已预置 cache"
+  else
+    version="$(manifest_get "$m" 5)"
+    artifact="$(manifest_get "$m" 6)"
+    sha256="$(manifest_get "$m" 7)"
+  fi
   target="$(manifest_get "$m" 3)"
 
   [ "$version" != "-" ] || { warn "$m 尚未发布，跳过"; return 0; }
@@ -436,6 +454,20 @@ start_target_services() {
   "$DBDOGCTL" start $pending \
     || die "升级后这些服务未能启动:${pending}；查看 $LOGS_DIR/ 下对应服务日志"
 }
+
+# 快升级（「部署」）：与慢升级共用**同一套部署代码路径**，只换包来源——版本与 SHA 取自
+# 给定产物本身（recipe 产出名 <模块>-<版本>-<arch|noarch>.tar.gz）而非 manifest；产物预置进
+# cache 后 download_artifact 直接缓存命中，其后的 staging/身份/钩子/服务/OAuth 验收与
+# manifest 路径逐行相同。不能搞两套部署——这是快慢升级同构的唯一实现点。
+LOCAL_ARTIFACT=""
+if [ "${1:-}" = "--artifact" ]; then
+  [ "$#" -ge 3 ] || die "用法: upgrade.sh --artifact <产物tar.gz> <模块>"
+  LOCAL_ARTIFACT="$2"
+  shift 2
+  [ "$#" -eq 1 ] || die "--artifact 一次只装一个模块"
+  [ -f "$LOCAL_ARTIFACT" ] || die "产物不存在: $LOCAL_ARTIFACT"
+  [ "$1" != dbdog-agent ] || die "dbdog-agent 的快升级是组件级路径（fast-upgrade.sh），不走 --artifact"
+fi
 
 # Agent 位于 DB 主机且拥有独立的 root/config/systemd 事务。统一入口在参数校验后
 # 直接 exec 同一份首装/升级实现，避免先创建 stack 布局，也避免维护第二套 cutover。
