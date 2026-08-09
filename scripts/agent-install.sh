@@ -1581,11 +1581,17 @@ append_agent_validation_logs() { # <start epoch> <agent.log cursor> <output>
     ;;
   esac
   if [ "$journal_bytes" -gt 1048576 ] || [ "$journal_lines" -gt 1000 ]; then
+    # 超限=截断保留、大声标记、继续验收。这个上限是读取量护栏，不是证据完整性合同：
+    # 4 个 unit 加上吵闹的采样错误，健康主机也能在验收窗内轻松超 1000 行 journal——
+    # 把「日志太吵」当「证据收集失败」会让这类主机的安装结构性必挂（2026-08-09 构建机
+    # 首演即如此：postgres explain 洪水撑爆上限、整单回滚）。已知错误扫描仍在截断后的
+    # 证据上照跑；只有 journalctl 缺失/退出异常才是真的证据收集失败（上面两处照旧 return 1）。
     printf 'journal_complete=false reason=bounded_output_exceeded lines=%s bytes=%s\n' \
       "$journal_lines" "$journal_bytes" >>"$output"
-    return 1
+    warn "验收窗口 journal 超出有界读取上限（lines=${journal_lines} bytes=${journal_bytes}），已截断保留并继续验收"
+  else
+    printf 'journal_complete=true lines=%s bytes=%s\n' "$journal_lines" "$journal_bytes" >>"$output"
   fi
-  printf 'journal_complete=true lines=%s bytes=%s\n' "$journal_lines" "$journal_bytes" >>"$output"
   printf '\n===== new agent.log bytes since validation start =====\n' >>"$output"
   append_agent_log_from_cursor "$log_cursor" "$output"
 }
