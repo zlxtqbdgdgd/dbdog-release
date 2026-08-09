@@ -144,6 +144,29 @@ agent_existing_top_scalar() { # <yaml> <key>；只读顶层简单标量
   agent_yaml_unquote "$raw"
 }
 
+agent_harvest_engine_passwords() { # <引擎 conf>；输出 port<TAB>password 对（每实例一行）
+  # 同引擎多实例的监控密码可以各不相同（构建机 5432/5433 实测就是两套），升级路径
+  # 必须按实例收割而不是拿首实例的密码套全引擎。conf 是我们自己的渲染/deploy 形制：
+  # 实例块内 port 先于 password 出现。
+  local file="$1" line port="" raw
+  [ -f "$file" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      '    port:'*)
+        port="${line#*:}"
+        port="$(printf '%s' "$port" | tr -d '[:space:]')"
+        ;;
+      '    password:'*)
+        [ -n "$port" ] || continue
+        raw="${line#*password:}"
+        raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//')"
+        printf '%s\t%s\n' "$port" "$(agent_yaml_unquote "$raw")"
+        port=""
+        ;;
+    esac
+  done <"$file"
+}
+
 agent_existing_gauss_scalar() { # <gauss conf> <key>；取第一实例的简单标量
   local file="$1" key="$2" raw
   [ -f "$file" ] || return 1
@@ -698,6 +721,11 @@ agent_detect_postgres() {
   # 未 reload。日志 glob 从 log_directory 推导（相对路径落在 data 目录下，PG 默认 log/），
   # 推不出时留空——logs 采集少一路是软缺口，不拦安装。
   local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args
+  # 显式排除口子（DBDOG_POSTGRES_EXCLUDE_PORTS，空格/逗号分隔）：停掉某实例的监控是
+  # 操作者决策，必须显式点名并大声记录，绝不允许静默缺口。典型场景：与监控无关的
+  # 私人 dev 实例（其超管凭证不归监控体系管）。
+  local excluded=",${DBDOG_POSTGRES_EXCLUDE_PORTS:-},"
+  excluded="$(printf '%s' "$excluded" | tr ' 	' ',,')"
   AGENT_PG_PORTS=()
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
@@ -719,6 +747,10 @@ agent_detect_postgres() {
     [ "$(sed -n '1p' "$data/postmaster.pid" | tr -d '[:space:]')" = "$pid" ] || continue
     port="$(sed -n '4p' "$data/postmaster.pid" | tr -d '[:space:]')"
     agent_valid_port "$port" || die "无法从 postgres PID $pid 确定有效监听端口（$data）"
+    case "$excluded" in *",$port,"*)
+      warn "按 DBDOG_POSTGRES_EXCLUDE_PORTS 显式排除 PostgreSQL 实例 127.0.0.1:${port}（$data）——不监控它是操作者决策，不是静默缺口"
+      continue ;;
+    esac
     case " ${AGENT_PG_PORTS[*]-} " in *" $port "*) \
       die "发现多个 PostgreSQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;; esac
     AGENT_PG_PORTS+=("$port")
@@ -928,11 +960,19 @@ agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <en
   if [ "$has_gauss" = 1 ] && [ -z "$password" ]; then
     die "GaussDB 监控密码为空，无法渲染"
   fi
-  if [ "$has_og" = 1 ] && [ -z "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" ]; then
-    die "发现 openGauss 实例但 DBDOG_OPENGAUSS_MONITOR_PASSWORD 为空；监控用户凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-opengauss-all-databases.sh 并提供密码"
+  # og/pg 凭证按实例走（同引擎多实例密码可各不相同）：渲染前每个端口都必须有密码。
+  local cred_i
+  if [ "$has_og" = 1 ]; then
+    for ((cred_i=0; cred_i<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; cred_i++)); do
+      [ -n "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$cred_i]-}" ] || \
+        die "openGauss 实例 127.0.0.1:${AGENT_OPENGAUSS_RENDER_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-opengauss-all-databases.sh，再以 DBDOG_OPENGAUSS_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
+    done
   fi
-  if [ "$has_pg" = 1 ] && [ -z "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}" ]; then
-    die "发现 PostgreSQL 实例但 DBDOG_POSTGRES_MONITOR_PASSWORD 为空；监控用户凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-pg-all-databases.sh 并提供密码"
+  if [ "$has_pg" = 1 ]; then
+    for ((cred_i=0; cred_i<${#AGENT_PG_PORTS[@]}; cred_i++)); do
+      [ -n "${AGENT_PG_RENDER_PASSWORDS[$cred_i]-}" ] || \
+        die "PostgreSQL 实例 127.0.0.1:${AGENT_PG_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-pg-all-databases.sh，再以 DBDOG_POSTGRES_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
+    done
   fi
   for check in cpu disk file_handle io load memory network system_core uptime; do
     dir="$confd/$check.d"
@@ -1070,7 +1110,8 @@ init_config:
 
 instances:
 EOF
-    for port in "${AGENT_OPENGAUSS_RENDER_PORTS[@]}"; do
+    for ((cred_i=0; cred_i<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; cred_i++)); do
+      port="${AGENT_OPENGAUSS_RENDER_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
     database_identifier:
@@ -1081,7 +1122,7 @@ EOF
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
-    password: $(agent_yaml_quote "$DBDOG_OPENGAUSS_MONITOR_PASSWORD")
+    password: $(agent_yaml_quote "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$cred_i]}")
     # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
     dbname: $(agent_yaml_quote "${DBDOG_OPENGAUSS_DBNAME:-postgres}")
     ignore_databases:
@@ -1140,7 +1181,8 @@ init_config:
 
 instances:
 EOF
-    for port in "${AGENT_PG_PORTS[@]}"; do
+    for ((cred_i=0; cred_i<${#AGENT_PG_PORTS[@]}; cred_i++)); do
+      port="${AGENT_PG_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
     database_identifier:
@@ -1150,7 +1192,7 @@ EOF
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
-    password: $(agent_yaml_quote "$DBDOG_POSTGRES_MONITOR_PASSWORD")
+    password: $(agent_yaml_quote "${AGENT_PG_RENDER_PASSWORDS[$cred_i]}")
     # explain 函数走 dbdog 命名(2026-07-24 hard-cut；上游 check 默认值是 datadog.explain_statement)
     query_samples:
       explain_function: dbdog.explain_statement

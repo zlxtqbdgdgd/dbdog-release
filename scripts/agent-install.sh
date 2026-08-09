@@ -52,6 +52,11 @@ usage() {
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
   DBDOG_GAUSSDB_DBNAME                   默认 postgres
   DBDOG_GAUSSDB_DEPLOYMENT               centralized 或 distributed
+  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
+  DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_POSTGRES_DBNAME                  PostgreSQL 主连接库，默认 postgres
+  DBDOG_POSTGRES_EXCLUDE_PORTS           显式排除的 PG 实例端口（空格/逗号分隔）；停监控是操作者决策，必须点名
   DBDOG_ENV                              默认 prod
   DBDOG_AGENT_HOSTNAME                   默认 hostname -s
   DBDOG_AGENT_HEALTH_TIMEOUT             全组件 readiness 截止时间，默认 90 秒（30–600）
@@ -485,26 +490,46 @@ agent_classify_gauss_engines() {
   done
 }
 
+agent_assemble_engine_credentials() {
+  # og/pg 凭证按实例组装：升级路径从现有 conf 的 port→password 对收割（同引擎多实例
+  # 密码可各不相同——构建机 5432/5433 实测就是两套），无命中的端口回退环境变量的
+  # 整引擎默认。空缺不在这里 die：渲染前的逐端口检查会带着 DBA 指路一次报清。
+  local pairs index port pw
+  AGENT_OPENGAUSS_RENDER_PASSWORDS=()
+  AGENT_PG_RENDER_PASSWORDS=()
+  pairs="$(agent_harvest_engine_passwords "$AGENT_CONFIG_DIR/conf.d/opengauss.d/conf.yaml")"
+  for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
+    port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
+    pw="$(printf '%s\n' "$pairs" | awk -F'\t' -v p="$port" '$1==p{print $2; exit}')"
+    [ -n "$pw" ] || pw="${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}"
+    AGENT_OPENGAUSS_RENDER_PASSWORDS+=("$pw")
+  done
+  pairs="$(agent_harvest_engine_passwords "$AGENT_CONFIG_DIR/conf.d/postgres.d/conf.yaml")"
+  for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
+    port="${AGENT_PG_PORTS[$index]}"
+    pw="$(printf '%s\n' "$pairs" | awk -F'\t' -v p="$port" '$1==p{print $2; exit}')"
+    [ -n "$pw" ] || pw="${DBDOG_POSTGRES_MONITOR_PASSWORD:-}"
+    AGENT_PG_RENDER_PASSWORDS+=("$pw")
+  done
+}
+
 agent_require_probe_credentials() {
   # openGauss/PostgreSQL 只验不建：凭证必须在启动验收前被 TCP 实测有效，失败即指路
   # DBA 工具（安装器不创建、不修改这两个引擎的用户与 HBA）。在 cutover 之后执行——
   # 探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
-  local index count port rc
-  count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  for ((index=0; index<count; index++)); do
-    [ "${AGENT_GAUSS_PID_ENGINES[$index]}" = opengauss ] || continue
-    port="${AGENT_GAUSS_PID_PORTS[$index]}"
+  local index port rc
+  for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
+    port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
     rc=0
     agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
-      "$DBDOG_OPENGAUSS_MONITOR_PASSWORD" "og.$index" || rc=$?
+      "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]}" "og.$index" || rc=$?
     [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 openGauss 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-opengauss-all-databases.sh 的执行结果与 HBA 后重试，本次安装会回滚"
   done
-  count="${#AGENT_PG_PORTS[@]}"
-  for ((index=0; index<count; index++)); do
+  for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
     port="${AGENT_PG_PORTS[$index]}"
     rc=0
     agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" \
-      "$DBDOG_POSTGRES_MONITOR_PASSWORD" "pg.$index" || rc=$?
+      "${AGENT_PG_RENDER_PASSWORDS[$index]}" "pg.$index" || rc=$?
     [ "$rc" -eq 0 ] || die "PostgreSQL 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 PostgreSQL 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-pg-all-databases.sh 的执行结果与 pg_hba 后重试，本次安装会回滚"
   done
 }
@@ -1713,6 +1738,7 @@ main() {
   agent_detect_gaussdb
   agent_detect_postgres
   agent_classify_gauss_engines
+  agent_assemble_engine_credentials
   [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
     die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || \

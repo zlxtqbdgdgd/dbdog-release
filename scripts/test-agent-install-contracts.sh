@@ -426,8 +426,9 @@ AGENT_OPENGAUSS_RENDER_PORTS=(15433)
 AGENT_OPENGAUSS_LOG_GLOBS=("$TEST_ROOT/ogdata/pg_log/postgresql-*.log")
 AGENT_PG_PORTS=(15434)
 AGENT_PG_LOG_GLOBS=("$TEST_ROOT/pgdata/log/*.log")
-DBDOG_OPENGAUSS_MONITOR_PASSWORD="og'pw"
-DBDOG_POSTGRES_MONITOR_PASSWORD="pg'pw"
+# og/pg 凭证按实例（agent_assemble_engine_credentials 的产出形态）：多实例密码可各不相同。
+AGENT_OPENGAUSS_RENDER_PASSWORDS=("og'pw")
+AGENT_PG_RENDER_PASSWORDS=("pg'pw")
 agent_render_checks "$CONF/conf.d" "pa'ss: #1" dbdog postgres prod
 agent_render_units "$UNITS"
 if command -v ruby >/dev/null 2>&1; then
