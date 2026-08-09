@@ -228,6 +228,16 @@ resolve_inputs() {
     old="$(agent_existing_gauss_scalar "$old_gauss" password 2>/dev/null || true)"
     [ -z "$old" ] || DBDOG_GAUSSDB_MONITOR_PASSWORD="$old"
   fi
+  # openGauss/PostgreSQL 凭证只验不建：升级路径从现有 conf 收割（首实例），
+  # 首装由环境变量提供；两个引擎的 conf 实例块与 gauss 同形，收割器可直接复用。
+  if [ -z "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" ]; then
+    old="$(agent_existing_gauss_scalar "$AGENT_CONFIG_DIR/conf.d/opengauss.d/conf.yaml" password 2>/dev/null || true)"
+    [ -z "$old" ] || DBDOG_OPENGAUSS_MONITOR_PASSWORD="$old"
+  fi
+  if [ -z "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}" ]; then
+    old="$(agent_existing_gauss_scalar "$AGENT_CONFIG_DIR/conf.d/postgres.d/conf.yaml" password 2>/dev/null || true)"
+    [ -z "$old" ] || DBDOG_POSTGRES_MONITOR_PASSWORD="$old"
+  fi
 
   prompt_value DBDOG_SERVER_URL "dbdog-server 地址（如 http://10.0.0.8:8080）" 0
   prompt_value DBDOG_API_KEY "dbdog-web 签发的 Agent ingest key" 1
@@ -246,6 +256,8 @@ resolve_inputs() {
     die "GaussDB 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类"
   case "$DBDOG_API_KEY" in *[!A-Za-z0-9._-]*) die "DBDOG_API_KEY 含不支持的字符" ;; esac
 
+  agent_require_single_line DBDOG_OPENGAUSS_MONITOR_PASSWORD "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}"
+  agent_require_single_line DBDOG_POSTGRES_MONITOR_PASSWORD "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}"
   agent_require_single_line DBDOG_GAUSSDB_ENV_FILE "${DBDOG_GAUSSDB_ENV_FILE:-}"
   agent_require_single_line DBDOG_GAUSSDB_PGHOST "${DBDOG_GAUSSDB_PGHOST:-}"
   agent_require_single_line DBDOG_GAUSSDB_LD_LIBRARY_PATH \
@@ -432,12 +444,80 @@ agent_hba_has_required_tcp_md5() { # <HBA 文件>
   ' "$1"
 }
 
+agent_classify_gauss_engines() {
+  # openGauss 的主进程/客户端与 GaussDB 同名同构，检测阶段无法区分；这里按 gsql
+  # --version 的自报身份分流（openGauss 的版本串含 "openGauss"）。分类结果决定渲染
+  # 归属与建号策略：GaussDB 走完整建号链，openGauss 凭证只验不建（与 PostgreSQL 同待遇）。
+  local index count out version_line
+  AGENT_GAUSS_PID_ENGINES=()
+  AGENT_GAUSSDB_RENDER_PORTS=()
+  AGENT_OPENGAUSS_RENDER_PORTS=()
+  AGENT_OPENGAUSS_LOG_GLOBS=()
+  count="${#AGENT_GAUSS_PID_PORTS[@]}"
+  for ((index=0; index<count; index++)); do
+    out="$WORK_DIR/engine-classify.$index.out"
+    if ! agent_gauss_timed_exec "$index" 20 "${AGENT_GAUSS_PID_GSQLS[$index]}" --version >"$out" 2>&1; then
+      agent_show_preflight_error "$out" "无法读取实例 gsql 版本以分类引擎（实例索引 ${index}）"
+    fi
+    version_line="$(head -1 "$out")"
+    if printf '%s' "$version_line" | grep -qi opengauss; then
+      AGENT_GAUSS_PID_ENGINES+=(opengauss)
+      agent_add_unique AGENT_OPENGAUSS_RENDER_PORTS "${AGENT_GAUSS_PID_PORTS[$index]}"
+      # openGauss 单机日志在 $PGDATA/pg_log（GAUSSLOG 常缺省），从数据目录直接推导。
+      [ ! -d "${AGENT_GAUSS_PID_DATA_DIRS[$index]}/pg_log" ] || \
+        agent_add_unique AGENT_OPENGAUSS_LOG_GLOBS "${AGENT_GAUSS_PID_DATA_DIRS[$index]}/pg_log/postgresql-*.log"
+    else
+      AGENT_GAUSS_PID_ENGINES+=(gaussdb)
+      agent_add_unique AGENT_GAUSSDB_RENDER_PORTS "${AGENT_GAUSS_PID_PORTS[$index]}"
+    fi
+    log "引擎分类: 127.0.0.1:${AGENT_GAUSS_PID_PORTS[$index]} -> ${AGENT_GAUSS_PID_ENGINES[$index]}"
+  done
+  # GaussDB 实例在场时 GAUSSLOG 仍是硬要求（openGauss 日志已另行从 PGDATA/pg_log 推导）。
+  if [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_GAUSS_LOG_GLOBS[*]-}" ]; then
+    die "存在 GaussDB 实例但无法发现 GAUSSLOG；请只在首次安装时显式设置 DBDOG_GAUSSDB_LOG_GLOB"
+  fi
+  # 三引擎共用 127.0.0.1 TCP 命名空间：跨引擎端口也必须唯一，否则渲染前 fail closed。
+  local port seen=" "
+  for port in ${AGENT_GAUSS_PORTS[@]+"${AGENT_GAUSS_PORTS[@]}"} ${AGENT_PG_PORTS[@]+"${AGENT_PG_PORTS[@]}"}; do
+    case "$seen" in *" $port "*) \
+      die "跨引擎端口冲突：127.0.0.1:${port} 被多个实例占用，TCP 监控无法唯一区分" ;; esac
+    seen="$seen$port "
+  done
+}
+
+agent_require_probe_credentials() {
+  # openGauss/PostgreSQL 只验不建：凭证必须在启动验收前被 TCP 实测有效，失败即指路
+  # DBA 工具（安装器不创建、不修改这两个引擎的用户与 HBA）。在 cutover 之后执行——
+  # 探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
+  local index count port rc
+  count="${#AGENT_GAUSS_PID_PORTS[@]}"
+  for ((index=0; index<count; index++)); do
+    [ "${AGENT_GAUSS_PID_ENGINES[$index]}" = opengauss ] || continue
+    port="${AGENT_GAUSS_PID_PORTS[$index]}"
+    rc=0
+    agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
+      "$DBDOG_OPENGAUSS_MONITOR_PASSWORD" "og.$index" || rc=$?
+    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 openGauss 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-opengauss-all-databases.sh 的执行结果与 HBA 后重试，本次安装会回滚"
+  done
+  count="${#AGENT_PG_PORTS[@]}"
+  for ((index=0; index<count; index++)); do
+    port="${AGENT_PG_PORTS[$index]}"
+    rc=0
+    agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" \
+      "$DBDOG_POSTGRES_MONITOR_PASSWORD" "pg.$index" || rc=$?
+    [ "$rc" -eq 0 ] || die "PostgreSQL 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 PostgreSQL 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-pg-all-databases.sh 的执行结果与 pg_hba 后重试，本次安装会回滚"
+  done
+}
+
 preflight_gaussdb_clients() {
   local index count gsql ldd_bin out value mode hba exists
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
+  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
+    return 0
+  fi
   log "预检目标 GaussDB 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
   for ((index=0; index<count; index++)); do
+    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
     gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
     ldd_bin="$(agent_find_in_path "${AGENT_GAUSS_PID_PATHS[$index]}" ldd 2>/dev/null || true)"
     [ -n "$ldd_bin" ] || die "GaussDB 客户端环境找不到 ldd（实例索引 ${index}）"
@@ -545,22 +625,23 @@ agent_warn_gaussdb_collection_gucs() { # <进程索引>
   esac
 }
 
-agent_monitor_password_works() { # 经 127.0.0.1 TCP 验证密码；0=有效，2=明确拒绝，1=基础设施失败
-  local index="$1" password="$2" python password_file out attempt rc success=0 rejected=0
+agent_tcp_password_probe() { # <端口> <库名> <密码> <输出标签>；经 127.0.0.1 TCP 验证；0=有效，2=明确拒绝，1=基础设施失败
+  local probe_port="$1" probe_dbname="$2" password="$3" probe_tag="$4"
+  local python password_file out attempt rc success=0 rejected=0
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
   python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
   [ -x "$python" ] && [ -x "$timeout_bin" ] || return 1
-  password_file="$WORK_DIR/monitor-password.$index"
+  password_file="$WORK_DIR/monitor-password.$probe_tag"
   printf '%s' "$password" >"$password_file" || return 1
   chmod 0600 "$password_file" || return 1
-  out="$WORK_DIR/gsql-monitor-auth.$index.out"
+  out="$WORK_DIR/monitor-auth.$probe_tag.out"
   for ((attempt=1; attempt<=5; attempt++)); do
     : >"$out"
     rc=0
     "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
       PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-      "$python" -I - "$password_file" "${AGENT_GAUSS_PID_PORTS[$index]}" \
-      "$DBDOG_GAUSSDB_DBNAME" >"$out" 2>&1 <<'PY' || rc=$?
+      "$python" -I - "$password_file" "$probe_port" \
+      "$probe_dbname" >"$out" 2>&1 <<'PY' || rc=$?
 import pathlib
 import sys
 
@@ -605,6 +686,10 @@ PY
   [ "$success" -eq 1 ] && return 0
   [ "$rejected" -eq 1 ] && return 2
   return 1
+}
+
+agent_monitor_password_works() { # <gauss 实例索引> <密码>；兼容包装，语义同 agent_tcp_password_probe
+  agent_tcp_password_probe "${AGENT_GAUSS_PID_PORTS[$1]}" "$DBDOG_GAUSSDB_DBNAME" "$2" "gauss.$1"
 }
 
 agent_active_auth_is_md5() { # <进程索引>；读取当前生效的 PostgreSQL v3 认证请求，不提交失败密码
@@ -667,8 +752,10 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
   local index count exists mode reset=0 password_status
   escaped="$(agent_sql_literal "$password")" || return 1
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ "$count" -gt 0 ] || return 1
+  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || return 1
   for ((index=0; index<count; index++)); do
+    # 建号链只属于真 GaussDB；openGauss 实例凭证只验不建（agent_require_probe_credentials）。
+    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
     exists="$(agent_gsql "$index" -c \
       "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
       | awk 'NF { value=$0 } END { print value }')" || return 1
@@ -746,15 +833,19 @@ install_dbm_init_scripts() {
 
 bootstrap_gaussdb_monitoring() {
   local sql="$SCRIPT_DIR/agent/init-gaussdb-perdb.sql" index count
+  # 建号链只属于真 GaussDB；主机没有 gauss 实例（纯 openGauss/PostgreSQL）时整段跳过。
+  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
+    return 0
+  fi
   [ -f "$sql" ] || die "缺少 GaussDB 兼容对象 SQL: $sql"
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ "$count" -gt 0 ] || die "安装验收要求 GaussDB 正在运行"
   log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与兼容视图（仅安装阶段）..."
   # password_encryption_type 与 HBA 已在预检中只读核对。这里仅创建/校验账号，
   # 并用交付给 integration 的同一凭证经内嵌 psycopg/libpq 做真实 TCP 登录探测。
   agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
     die "无法通过目标 GaussDB 的本地管理连接准备监控用户"
   for ((index=0; index<count; index++)); do
+    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
     agent_gsql "$index" <"$sql" || die "创建 GaussDB 兼容视图失败（实例索引 ${index}）"
   done
 }
@@ -1546,9 +1637,18 @@ start_and_verify() {
 
   : >"$check_out"
   chmod 0600 "$check_out"
-  timeout 180 "$AGENT_RUNTIME_DIR/bin/agent/agent" check gaussdb \
-    -c "$AGENT_CONFIG_DIR" >"$check_out" 2>&1 || \
-    die "GaussDB check 未通过；详情留在 ${check_out}，本次安装会回滚"
+  local engine
+  for engine in gaussdb opengauss postgres; do
+    case "$engine" in
+      gaussdb) [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || continue ;;
+      opengauss) [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || continue ;;
+      postgres) [ -n "${AGENT_PG_PORTS[*]-}" ] || continue ;;
+    esac
+    printf '\n===== agent check %s =====\n' "$engine" >>"$check_out"
+    timeout 180 "$AGENT_RUNTIME_DIR/bin/agent/agent" check "$engine" \
+      -c "$AGENT_CONFIG_DIR" >>"$check_out" 2>&1 || \
+      die "${engine} check 未通过；详情留在 ${check_out}，本次安装会回滚"
+  done
   for unit in "${AGENT_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" || die "验收时服务已退出: $unit"
   done
@@ -1607,14 +1707,26 @@ main() {
   old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
   AGENT_EXISTING_GAUSS_CONFIG="$old_gauss"
   export AGENT_EXISTING_GAUSS_CONFIG
+  # 零 gaussdb 进程不再直接 die：openGauss 主进程同名会进 gauss 检测链（随后分类分流），
+  # 纯 PostgreSQL 主机则由 agent_detect_postgres 兜住；「一个受支持引擎都没有」才是硬失败。
+  AGENT_GAUSS_ALLOW_NONE=1
   agent_detect_gaussdb
-  log "发现 GaussDB 端口: ${AGENT_GAUSS_PORTS[*]}"
-  log "发现 GaussDB 日志: ${AGENT_GAUSS_LOG_GLOBS[*]}"
+  agent_detect_postgres
+  agent_classify_gauss_engines
+  [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
+    die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"
+  [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || \
+    log "发现 GaussDB 端口: ${AGENT_GAUSSDB_RENDER_PORTS[*]}（日志: ${AGENT_GAUSS_LOG_GLOBS[*]-}）"
+  [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || \
+    log "发现 openGauss 端口: ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（日志: ${AGENT_OPENGAUSS_LOG_GLOBS[*]-}）"
+  [ -z "${AGENT_PG_PORTS[*]-}" ] || \
+    log "发现 PostgreSQL 端口: ${AGENT_PG_PORTS[*]}（日志: ${AGENT_PG_LOG_GLOBS[*]-}）"
   fetch_server_bootstrap
   preflight_gaussdb_clients
   render_install_state
   cutover
   install_dbm_init_scripts
+  agent_require_probe_credentials
   bootstrap_gaussdb_monitoring
   start_and_verify
 
@@ -1629,7 +1741,11 @@ main() {
   MUTATION_STARTED=0
   trap 'exit 130' INT TERM HUP
   log "dbdog-agent $version 安装/升级并验收通过"
-  log "已启用：GaussDB DBM、schema/settings/activity、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
+  local enabled_engines=""
+  [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || enabled_engines="GaussDB"
+  [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}openGauss"
+  [ -z "${AGENT_PG_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}PostgreSQL"
+  log "已启用：${enabled_engines} DBM（含 database_autodiscovery）、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"
   log "日常状态: systemctl status dbdog-agent dbdog-agent-process dbdog-agent-trace dbdog-agent-sysprobe"

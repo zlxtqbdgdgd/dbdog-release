@@ -502,6 +502,12 @@ agent_detect_gaussdb() {
   agent_find_gauss_pids
 
   if [ "${#AGENT_GAUSS_PIDS[@]}" -eq 0 ]; then
+    # openGauss 的主进程同样叫 gaussdb，会走到这条链上再由安装器分类；这里的
+    # 「零 gaussdb 进程」只有在主机也没有其它受支持引擎（postgres）时才是硬失败，
+    # 由安装器在全引擎检测后统一裁决（AGENT_GAUSS_ALLOW_NONE=1 时放行空结果）。
+    if [ "${AGENT_GAUSS_ALLOW_NONE:-0}" = 1 ]; then
+      return 0
+    fi
     die "未发现可由 PGDATA/postmaster.pid 验证的运行中 GaussDB 实例主进程"
   fi
 
@@ -662,8 +668,14 @@ agent_detect_gaussdb() {
     [ -n "$data" ] && AGENT_GAUSS_LOG_GLOBS+=("$data")
   fi
 
-  [ "${#AGENT_GAUSS_LOG_GLOBS[@]}" -gt 0 ] || \
-    die "无法发现 GAUSSLOG；请只在首次安装时显式设置 DBDOG_GAUSSDB_LOG_GLOB"
+  if [ "${#AGENT_GAUSS_LOG_GLOBS[@]}" -eq 0 ]; then
+    # openGauss 实例常不设 GAUSSLOG（日志在 $PGDATA/pg_log，由安装器分类后另行推导）。
+    # 只有当主机存在真 GaussDB 实例时缺 GAUSSLOG 才是硬失败——那由安装器在分类后裁决；
+    # 这里在放行模式下先不拦。
+    if [ "${AGENT_GAUSS_ALLOW_NONE:-0}" != 1 ]; then
+      die "无法发现 GAUSSLOG；请只在首次安装时显式设置 DBDOG_GAUSSDB_LOG_GLOB"
+    fi
+  fi
 
   AGENT_GAUSS_DEPLOYMENT="${DBDOG_GAUSSDB_DEPLOYMENT:-}"
   if [ -z "$AGENT_GAUSS_DEPLOYMENT" ]; then
@@ -677,6 +689,51 @@ agent_detect_gaussdb() {
     centralized | distributed) ;;
     *) die "DBDOG_GAUSSDB_DEPLOYMENT 只能是 centralized 或 distributed" ;;
   esac
+}
+
+agent_detect_postgres() {
+  # PostgreSQL 实例事实探测（只读）。主进程判据与 gauss 检测同一口径：argv 带 -D 的
+  # postgres 进程 + postmaster.pid 正向验证（辅助进程 cmdline 是 "postgres: xxx"，
+  # 天然被 -D 过滤掉）。端口一律取运行态 postmaster.pid 第 4 行——配置文件可能改过
+  # 未 reload。日志 glob 从 log_directory 推导（相对路径落在 data 目录下，PG 默认 log/），
+  # 推不出时留空——logs 采集少一路是软缺口，不拦安装。
+  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args
+  AGENT_PG_PORTS=()
+  AGENT_PG_DATA_DIRS=()
+  AGENT_PG_LOG_GLOBS=()
+  for pid in "$root"/[0-9]*; do
+    pid="${pid##*/}"
+    [ -r "$root/$pid/cmdline" ] || continue
+    cmdline="$(tr '\0' '\n' <"$root/$pid/cmdline" 2>/dev/null || true)"
+    [ -n "$cmdline" ] || continue
+    case "$(printf '%s\n' "$cmdline" | head -1)" in
+      */bin/postgres | postgres) ;;
+      *) continue ;;
+    esac
+    # 取 -D 的下一个参数为 data 目录；没有 -D 的不是 postmaster 主进程。
+    data="$(printf '%s\n' "$cmdline" | awk 'prev=="-D" { print; exit } { prev=$0 }')"
+    [ -n "$data" ] || continue
+    case "$data" in /*) ;; *) continue ;; esac
+    [ -r "$data/postmaster.pid" ] || continue
+    # postmaster.pid 首行必须就是该 PID——防把 standby 工具或残留 pid 文件当实例。
+    [ "$(sed -n '1p' "$data/postmaster.pid" | tr -d '[:space:]')" = "$pid" ] || continue
+    port="$(sed -n '4p' "$data/postmaster.pid" | tr -d '[:space:]')"
+    agent_valid_port "$port" || die "无法从 postgres PID $pid 确定有效监听端口（$data）"
+    case " ${AGENT_PG_PORTS[*]-} " in *" $port "*) \
+      die "发现多个 PostgreSQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;; esac
+    AGENT_PG_PORTS+=("$port")
+    AGENT_PG_DATA_DIRS+=("$data")
+    logdir="$(awk '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*log_directory[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, "")
+        gsub(/^'\''|'\''$/, ""); print; exit
+      }
+    ' "$data/postgresql.conf" 2>/dev/null || true)"
+    [ -n "$logdir" ] || logdir=log
+    case "$logdir" in /*) ;; *) logdir="$data/$logdir" ;; esac
+    [ ! -d "$logdir" ] || agent_add_unique AGENT_PG_LOG_GLOBS "$logdir/*.log"
+  done
 }
 
 agent_render_datadog_yaml() { # <文件> <server_url> <api_key> <hostname> <rc_root_json>
@@ -854,9 +911,29 @@ runtime_security_config:
 EOF
 }
 
-agent_render_checks() { # <conf.d> <db_password> <db_user> <db_name> <env>
+# 渲染语义的权威是 dbdog-agent/dbdog-deploy/conf/conf.d 的三引擎模板（84a58e3 对齐）：
+# 显式项只留 dbm/database_identifier/service/连接五元组/ignore_databases/relations/
+# database_autodiscovery/query_samples.explain_function/collect_column_statistics/
+# collect_activity_metrics/tags，其余采集开关一律用 check 默认值（避免部署漂移）。
+# 引擎在位由检测结果决定：GaussDB 走完整建号链，openGauss/PostgreSQL 凭证只验不建
+#（监控用户由 DBA 按 scripts/agent/init-dbdog-user-*-all-databases.sh 预先准备）。
+agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
   local confd="$1" password="$2" username="$3" dbname="$4" env_name="$5"
   local check dir port glob
+  local has_gauss=0 has_og=0 has_pg=0
+  [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || has_gauss=1
+  [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || has_og=1
+  [ -z "${AGENT_PG_PORTS[*]-}" ] || has_pg=1
+  [ "$has_gauss$has_og$has_pg" != 000 ] || die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL 均未发现）"
+  if [ "$has_gauss" = 1 ] && [ -z "$password" ]; then
+    die "GaussDB 监控密码为空，无法渲染"
+  fi
+  if [ "$has_og" = 1 ] && [ -z "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" ]; then
+    die "发现 openGauss 实例但 DBDOG_OPENGAUSS_MONITOR_PASSWORD 为空；监控用户凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-opengauss-all-databases.sh 并提供密码"
+  fi
+  if [ "$has_pg" = 1 ] && [ -z "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}" ]; then
+    die "发现 PostgreSQL 实例但 DBDOG_POSTGRES_MONITOR_PASSWORD 为空；监控用户凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-pg-all-databases.sh 并提供密码"
+  fi
   for check in cpu disk file_handle io load memory network system_core uptime; do
     dir="$confd/$check.d"
     install -d -m 0755 "$dir"
@@ -873,31 +950,47 @@ EOF
   cat >"$dir/conf.yaml" <<EOF
 init_config:
 instances:
-  - name: gaussdb
+EOF
+  # openGauss 的进程名同样是 gaussdb；两类同机并存时只渲染 gaussdb 一条，避免同一批
+  # 进程被两个实例重复聚合。
+  if [ "$has_gauss" = 1 ] || [ "$has_og" = 1 ]; then
+    local gauss_family_service=gaussdb
+    [ "$has_gauss" = 1 ] || gauss_family_service=opengauss
+    cat >>"$dir/conf.yaml" <<EOF
+  - name: $gauss_family_service
     # Agent 采集 cadence；前端查询 bucket/rollup 需独立选择。
     min_collection_interval: 15
     search_string: ['gaussdb']
     exact_match: false
     collect_children: true
     tags:
-      - service:gaussdb
+      - service:$gauss_family_service
 EOF
+  fi
+  if [ "$has_pg" = 1 ]; then
+    cat >>"$dir/conf.yaml" <<EOF
+  - name: postgres
+    min_collection_interval: 15
+    search_string: ['postgres']
+    exact_match: false
+    collect_children: true
+    tags:
+      - service:postgres
+EOF
+  fi
 
-  dir="$confd/gaussdb.d"
-  install -d -m 0755 "$dir"
-  cat >"$dir/conf.yaml" <<EOF
+  if [ "$has_gauss" = 1 ]; then
+    dir="$confd/gaussdb.d"
+    install -d -m 0755 "$dir"
+    cat >"$dir/conf.yaml" <<EOF
 # Generated from target-host facts; rerun agent-install.sh after moving/reconfiguring GaussDB.
 init_config:
 
 instances:
 EOF
-  [ "${#AGENT_GAUSS_PORTS[@]}" -gt 0 ] || die "没有可渲染的 GaussDB 运行实例"
-  for port in "${AGENT_GAUSS_PORTS[@]}"; do
-    cat >>"$dir/conf.yaml" <<EOF
+    for port in "${AGENT_GAUSSDB_RENDER_PORTS[@]}"; do
+      cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
-    # Agent 采集 cadence；不是前端查询 bucket，也不改变 DBM 子任务自己的周期。
-    min_collection_interval: 15
-    max_relations: 300
     database_identifier:
       # 分隔符用 '-' 不用 ':'（2026-08-06）：':' 是 DD 查询语法的 key/value 分隔符，标识里带它会让
       # 「按实例过滤」必须整体加引号——round-19 实证：裸写 database_instance:<host>:<port> 的调用
@@ -910,6 +1003,7 @@ EOF
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "$password")
+    # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
     dbname: $(agent_yaml_quote "$dbname")
     ignore_databases:
       - template0
@@ -919,42 +1013,36 @@ EOF
     relations:
       - relation_regex: .*
     query_samples:
-      enabled: true
       # canonical explain 入口在 public：GaussDB 的 SECURITY DEFINER 动态 SQL 按函数所属
       # schema 解析未限定表名，入口只在 dbdog schema 时解释不了 public 下的业务 SQL。
       explain_function: public.dbdog_explain_statement
-    collect_schemas:
+    # 库自动发现：逐库采集非模板库的表级指标（relations/schema/column_stats）。
+    # 默认关，这里显式开启；以 postgres 为 global_view_db，排除 GaussDB 模板库。
+    database_autodiscovery:
       enabled: true
-      collection_interval: 30
-      max_tables: 300
-      max_columns: 50
-    # 上游默认调 datadog.column_statistics()；dbdog 命名下必须显式指向，否则报
-    # schema "datadog" does not exist（2026-08-05 x86-gaussdb-73 实证）。
+      global_view_db: postgres
+      include:
+        - .*
+      exclude:
+        - template0
+        - template1
+        - templatea
+        - templatem
+    # 列统计(pg_stats 投影)。上游默认调 datadog.column_statistics()；dbdog 命名下必须显式
+    # 指向，否则报 schema "datadog" does not exist（2026-08-05 x86-gaussdb-73 实证）。
     collect_column_statistics:
       enabled: true
-      collection_interval: 300
       function_name: dbdog.column_statistics()
-    collect_settings:
-      enabled: true
-      collection_interval: 30
-    collect_database_size_metrics: true
+    # activity 直发指标(active_queries/transactions.open 等；上游默认 false)，显式开启。
     collect_activity_metrics: true
-    # GaussDB 对外报 PG 9.2 兼容版本但实际提供 pg_ls_waldir()；buffercache 走内核内置的
-    # pg_buffercache_pages()，不需要装扩展。
-    collect_wal_metrics: true
-    collect_bloat_metrics: true
-    collect_function_metrics: true
-    collect_buffercache_metrics: true
-    data_observability:
-      enabled: false
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - $(agent_yaml_quote "gaussdb_deployment:$AGENT_GAUSS_DEPLOYMENT")
 EOF
-  done
-  printf '\nlogs:\n' >>"$dir/conf.yaml"
-  for glob in "${AGENT_GAUSS_LOG_GLOBS[@]}"; do
-    cat >>"$dir/conf.yaml" <<EOF
+    done
+    printf '\nlogs:\n' >>"$dir/conf.yaml"
+    for glob in ${AGENT_GAUSS_LOG_GLOBS[@]+"${AGENT_GAUSS_LOG_GLOBS[@]}"}; do
+      cat >>"$dir/conf.yaml" <<EOF
   - type: file
     path: $(agent_yaml_quote "$glob")
     source: gaussdb
@@ -970,7 +1058,151 @@ EOF
         name: new_log_start_with_date
         pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
 EOF
-  done
+    done
+  fi
+
+  if [ "$has_og" = 1 ]; then
+    dir="$confd/opengauss.d"
+    install -d -m 0755 "$dir"
+    cat >"$dir/conf.yaml" <<EOF
+# Generated from target-host facts; rerun agent-install.sh after moving/reconfiguring openGauss.
+init_config:
+
+instances:
+EOF
+    for port in "${AGENT_OPENGAUSS_RENDER_PORTS[@]}"; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - dbm: true
+    database_identifier:
+      # opengauss- 前缀区分独立集成实例身份（与历史 gaussdb wire 模式实例不混淆）；
+      # 分隔符用 '-' 不用 ':'，同 gaussdb.d 的军规 5 登记。
+      template: 'opengauss-\$resolved_hostname-\$port'
+    service: opengauss
+    host: 127.0.0.1
+    port: $port
+    username: $(agent_yaml_quote "$username")
+    password: $(agent_yaml_quote "$DBDOG_OPENGAUSS_MONITOR_PASSWORD")
+    # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
+    dbname: $(agent_yaml_quote "${DBDOG_OPENGAUSS_DBNAME:-postgres}")
+    ignore_databases:
+      - template0
+      - template1
+      - templatea
+      - templatem
+    relations:
+      - relation_regex: .*
+    query_samples:
+      # openGauss 与 GaussDB 同规则：SECURITY DEFINER 动态 SQL 按函数所属 schema
+      # 解析未限定表名，canonical explain 入口在 public。
+      explain_function: public.dbdog_explain_statement
+    database_autodiscovery:
+      enabled: true
+      global_view_db: postgres
+      include:
+        - .*
+      exclude:
+        - template0
+        - template1
+        - templatea
+        - templatem
+    collect_column_statistics:
+      enabled: true
+      function_name: dbdog.column_statistics()
+    collect_activity_metrics: true
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+EOF
+    done
+    printf '\nlogs:\n' >>"$dir/conf.yaml"
+    for glob in ${AGENT_OPENGAUSS_LOG_GLOBS[@]+"${AGENT_OPENGAUSS_LOG_GLOBS[@]}"}; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - type: file
+    path: $(agent_yaml_quote "$glob")
+    source: opengauss
+    service: opengauss
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      - dbm_source:opengauss_logs
+    log_processing_rules:
+      - type: multi_line
+        name: new_log_start_with_date
+        pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
+EOF
+    done
+  fi
+
+  if [ "$has_pg" = 1 ]; then
+    dir="$confd/postgres.d"
+    install -d -m 0755 "$dir"
+    cat >"$dir/conf.yaml" <<EOF
+# Generated from target-host facts; rerun agent-install.sh after moving/reconfiguring PostgreSQL.
+init_config:
+
+instances:
+EOF
+    for port in "${AGENT_PG_PORTS[@]}"; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - dbm: true
+    database_identifier:
+      # 分隔符用 '-' 不用 ':'，同 gaussdb.d 的军规 5 登记。
+      template: '\$resolved_hostname-\$port'
+    service: postgres
+    host: 127.0.0.1
+    port: $port
+    username: $(agent_yaml_quote "$username")
+    password: $(agent_yaml_quote "$DBDOG_POSTGRES_MONITOR_PASSWORD")
+    # explain 函数走 dbdog 命名(2026-07-24 hard-cut；上游 check 默认值是 datadog.explain_statement)
+    query_samples:
+      explain_function: dbdog.explain_statement
+    # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
+    dbname: $(agent_yaml_quote "${DBDOG_POSTGRES_DBNAME:-postgres}")
+    # 主连接库即 postgres，不能再 ignore 它；template 等默认库不入库。
+    ignore_databases:
+      - template0
+      - template1
+      - rdsadmin
+      - azure_maintenance
+      - cloudsqladmin
+      - alloydbadmin
+      - alloydbmetadata
+    relations:
+      - relation_regex: .*
+    database_autodiscovery:
+      enabled: true
+      global_view_db: postgres
+      include:
+        - .*
+      exclude:
+        - template0
+        - template1
+    collect_column_statistics:
+      enabled: true
+      function_name: dbdog.column_statistics()
+    collect_activity_metrics: true
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
+      - do_connection_host:127.0.0.1
+      - do_connection_port:$port
+EOF
+    done
+    printf '\nlogs:\n' >>"$dir/conf.yaml"
+    for glob in ${AGENT_PG_LOG_GLOBS[@]+"${AGENT_PG_LOG_GLOBS[@]}"}; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - type: file
+    path: $(agent_yaml_quote "$glob")
+    source: postgresql
+    service: postgres
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      - dbm_source:postgres_logs
+    log_processing_rules:
+      - type: multi_line
+        name: new_log_start_with_date
+        pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
+EOF
+    done
+  fi
 }
 
 agent_render_units() { # <目录>

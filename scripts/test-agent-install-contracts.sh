@@ -419,12 +419,23 @@ mkdir -p "$CONF/conf.d"
 agent_render_datadog_yaml "$CONF/datadog.yaml" 'http://dbdog.internal:8080' \
   'key_abc-123' 'gauss-node-01' '{"signed":{"version":1}}'
 agent_render_system_probe_yaml "$CONF/system-probe.yaml"
+# 渲染的引擎归属来自安装器的分类结果（gauss 检测 + gsql 版本分流 + pg 检测）；
+# 这里直接给出分类后的事实，模拟三引擎同机：gauss:15432 / openGauss:15433 / PG:15434。
+AGENT_GAUSSDB_RENDER_PORTS=("${AGENT_GAUSS_PORTS[@]}")
+AGENT_OPENGAUSS_RENDER_PORTS=(15433)
+AGENT_OPENGAUSS_LOG_GLOBS=("$TEST_ROOT/ogdata/pg_log/postgresql-*.log")
+AGENT_PG_PORTS=(15434)
+AGENT_PG_LOG_GLOBS=("$TEST_ROOT/pgdata/log/*.log")
+DBDOG_OPENGAUSS_MONITOR_PASSWORD="og'pw"
+DBDOG_POSTGRES_MONITOR_PASSWORD="pg'pw"
 agent_render_checks "$CONF/conf.d" "pa'ss: #1" dbdog postgres prod
 agent_render_units "$UNITS"
 if command -v ruby >/dev/null 2>&1; then
   ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f) }' \
     "$CONF/datadog.yaml" "$CONF/system-probe.yaml" \
-    "$CONF/conf.d/gaussdb.d/conf.yaml" || fail "生成的 YAML 无法解析"
+    "$CONF/conf.d/gaussdb.d/conf.yaml" \
+    "$CONF/conf.d/opengauss.d/conf.yaml" \
+    "$CONF/conf.d/postgres.d/conf.yaml" || fail "生成的 YAML 无法解析"
 fi
 
 for expected in \
@@ -500,13 +511,44 @@ grep -Fq "hostname: 'gauss-node-01'" "$CONF/datadog.yaml" || fail "没有使用�
 grep -Fq "dd_url: 'http://dbdog.internal:8080'" "$CONF/datadog.yaml" || fail "没有使用安装输入的 server"
 pass "外网已验证功能集默认开启，机器事实与秘密在安装时渲染"
 
-for check in cpu disk file_handle io load memory network process system_core uptime gaussdb; do
+for check in cpu disk file_handle io load memory network process system_core uptime; do
   [ -f "$CONF/conf.d/$check.d/conf.yaml" ] || fail "缺少默认 check: $check"
   grep -Fq 'min_collection_interval: 15' "$CONF/conf.d/$check.d/conf.yaml" || \
     fail "默认 check 没有显式声明 15s Agent 采集 cadence: $check"
 done
-grep -Fq 'max_relations: 300' "$CONF/conf.d/gaussdb.d/conf.yaml" || \
-  fail "GaussDB 没有显式声明 schema 已支持的默认 relation 上限"
+# DB 引擎模板对齐 dbdog-deploy 权威（84a58e3）：显式项只留必需 + 三个显式开关，
+# 其余采集参数一律用 check 默认值——显式复述默认值曾造成部署漂移。
+for retired in 'max_relations:' 'min_collection_interval:' 'collect_schemas:' \
+  'collect_settings:' 'collect_database_size_metrics:' 'collect_wal_metrics:' \
+  'collect_bloat_metrics:' 'collect_function_metrics:' 'collect_buffercache_metrics:' \
+  'data_observability:' 'collection_interval:'; do
+  if grep -Fq "$retired" "$CONF/conf.d/gaussdb.d/conf.yaml" \
+      "$CONF/conf.d/opengauss.d/conf.yaml" "$CONF/conf.d/postgres.d/conf.yaml"; then
+    fail "DB 引擎模板仍显式复述 check 默认值（应对齐 deploy 模板）: $retired"
+  fi
+done
+for engine_conf in gaussdb opengauss postgres; do
+  grep -Fq 'database_autodiscovery:' "$CONF/conf.d/$engine_conf.d/conf.yaml" || \
+    fail "$engine_conf 模板缺少 database_autodiscovery（多库表级指标会静默缺失）"
+  grep -Fq 'global_view_db: postgres' "$CONF/conf.d/$engine_conf.d/conf.yaml" || \
+    fail "$engine_conf autodiscovery 缺少 cluster 级锚点 global_view_db"
+  grep -Fq 'function_name: dbdog.column_statistics()' "$CONF/conf.d/$engine_conf.d/conf.yaml" || \
+    fail "$engine_conf 列统计没有显式指向 dbdog schema 函数"
+  grep -Fq 'collect_activity_metrics: true' "$CONF/conf.d/$engine_conf.d/conf.yaml" || \
+    fail "$engine_conf activity 直发指标未显式开启"
+done
+grep -Fq "template: 'opengauss-\$resolved_hostname-\$port'" "$CONF/conf.d/opengauss.d/conf.yaml" || \
+  fail "openGauss database_identifier 缺少 opengauss- 前缀（与历史 gaussdb wire 实例会混淆）"
+grep -Fq 'explain_function: dbdog.explain_statement' "$CONF/conf.d/postgres.d/conf.yaml" || \
+  fail "PostgreSQL explain 函数没有走 dbdog 命名"
+grep -Fq 'explain_function: public.dbdog_explain_statement' "$CONF/conf.d/opengauss.d/conf.yaml" || \
+  fail "openGauss explain 入口不在 public"
+grep -Fq 'do_connection_port:15434' "$CONF/conf.d/postgres.d/conf.yaml" || \
+  fail "PostgreSQL 缺少控制面 schema 资产映射 tag do_connection_port"
+grep -Fq "password: 'og''pw'" "$CONF/conf.d/opengauss.d/conf.yaml" || \
+  fail "openGauss 密码 YAML 转义错误"
+grep -Fq "password: 'pg''pw'" "$CONF/conf.d/postgres.d/conf.yaml" || \
+  fail "PostgreSQL 密码 YAML 转义错误"
 if grep -R -Fq 'collect_core_metrics: false' "$CONF/conf.d"; then
   fail "没有运行时证据却擅自关闭了逐核 CPU 指标"
 fi
@@ -1017,6 +1059,9 @@ run_fake_gauss_action() { # <preflight|active-auth|ensure-user>
     AGENT_GAUSS_PID_LD_LIBRARY_PATHS=("$2/lib:$2/lib/libsimsearch")
     AGENT_GAUSS_PID_PATHS=("$2/bin:/usr/bin:/bin")
     AGENT_GAUSS_PID_GSQLS=("$2/bin/gsql")
+    # 分类事实：本夹具模拟的是真 GaussDB 实例（分类由 agent_classify_gauss_engines 产出）。
+    AGENT_GAUSS_PID_ENGINES=(gaussdb)
+    AGENT_GAUSSDB_RENDER_PORTS=(15432)
     case "$3" in
       preflight)
         preflight_gaussdb_clients
