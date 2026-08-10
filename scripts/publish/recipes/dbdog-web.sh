@@ -35,7 +35,12 @@ fi
 log "npm ci + next build"
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"   # 小内存编译机防 OOM
 npm ci --no-audit --no-fund >&2
-npm run build >&2
+# 只对「构建追踪抢跑」这一种已知偶发重试一次；其余失败照常炸（判定与次数见 lib 的注释，
+# 契约由 scripts/test-publish-web-build-retry.sh 钉住）。
+# shellcheck source=lib-next-build-retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib-next-build-retry.sh"
+run_next_build_with_one_retry "$WORK/out/next-build.log" npm run build \
+  || die "next build 失败（详见上方日志）"
 
 cp -a .next/standalone/. "$PKG/"
 mkdir -p "$PKG/.next"
