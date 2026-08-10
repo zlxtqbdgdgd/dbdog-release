@@ -1075,6 +1075,11 @@ EOF
       function_name: dbdog.column_statistics()
     # activity 直发指标(active_queries/transactions.open 等；上游默认 false)，显式开启。
     collect_activity_metrics: true
+    # 完成态(已结束语句)采集。check 默认 false，这里显式开启：它是 dbm_type:query_completion
+    # 这条流的唯一来源，关着的话流是空的，而空集在诊断语境下会被读成"这台库没有慢 SQL"。
+    # 来源是 dbe_perf.statement_history 系统表，不读服务器日志，故与下面 logs stanza 不重叠。
+    statement_history:
+      enabled: true
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - $(agent_yaml_quote "gaussdb_deployment:$AGENT_GAUSS_DEPLOYMENT")
@@ -1150,6 +1155,10 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
+    # 完成态(已结束语句)采集，同 gaussdb.d：check 默认 false，显式开启。读
+    # dbe_perf.statement_history 系统表，与下面 logs stanza 采的服务器日志不是同一份数据。
+    statement_history:
+      enabled: true
     tags:
       - $(agent_yaml_quote "env:$env_name")
 EOF
@@ -1221,6 +1230,13 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
+    # 完成态(已结束语句)采集。check 默认 false，这里显式开启。
+    # PG 没有服务端执行历史，来源只能是服务器日志：auto_explain(log_format=json) 为每条超过
+    # auto_explain.log_min_duration 的执行写一条 plan 记录，本 job 直接 tail 该文件。
+    # **必须与下面 logs stanza 的 exclude_at_match 同生共死**——两者读同一个文件，少了排除规则
+    # 同一条慢 SQL 会既进 log 流又进 completion 流。
+    query_completions:
+      enabled: true
     tags:
       - $(agent_yaml_quote "env:$env_name")
       # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
@@ -1242,6 +1258,17 @@ EOF
       - type: multi_line
         name: new_log_start_with_date
         pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
+      # 上面 query_completions 把每条 auto_explain 记录报成 query_completion 事件，而它读的就是
+      # 这个文件，所以不排掉的话同一条慢 SQL 会投递两次。pattern 与采集器的
+      # LOG_PIPELINE_EXCLUDE_PATTERN 一字不差(dbdog-agent-core postgres/query_completions.py，
+      # 那边有测试钉住二者)。
+      # 注意本段不能出现反引号：这是 unquoted heredoc，反引号会被当命令替换执行掉。
+      # 只排 auto_explain 写的 plan 记录：log_min_duration_statement 另写的
+      # "duration: N ms  statement:" / "execute" 行永远不是 completion 来源(两条记录配不上对)，
+      # 那批执行的唯一记录就是日志行，排掉即净丢数据。
+      - type: exclude_at_match
+        name: exclude_query_completions
+        pattern: 'LOG:\\s+duration: [0-9.]+ ms\\s+plan:'
 EOF
     done
   fi
