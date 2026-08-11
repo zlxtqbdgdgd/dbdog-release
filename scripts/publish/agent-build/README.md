@@ -176,6 +176,87 @@ ssh <build-host> 'bash -s -- check <agent_sha> <core_sha>' < scripts/publish/age
 `--self-check <已知core_sha>=<已知sha256>` 按 `ANCHOR-INFO` 里记着的值反验一次——
 复现不出历史 wheel 就说明这台机器的工具链不对，别急着出新包。
 
+## seal 是活目录，别让任何可写工具指着它
+
+`cache/dbdog-agent/bazel/repository` **不是"seal 的一份副本"，它就是 seal 本体的一部分**。
+seal 对 `bazel-repository-expanded` 这一类按 `storage=cache-reference` 封存——只记 sha256，
+**不存内容副本**（见 `CATEGORY-SUMMARY.tsv`：该类的 `reference_only_files` 等于 `files`）。
+所以那些文件一旦被删，seal 自己救不回自己。
+
+2026-08-10 因此断过一次发布：`fast-upgrade.sh` 里写了
+`common --repository_cache=$AGENT_CACHE/bazel/repository`，把 bazel 的**可写**工作缓存指到了
+封存目录本体。bazel 认为 repository_cache 归它管，会新建条目也会 GC 旧条目——一次快升级之后
+7 个条目共 26783 个文件消失（Go SDK、clang+llvm 19、python3.12 三棵展开树等），seal VERIFY 失败，
+配方按设计拒绝回退下载，正式发布路径当场断掉。已在 `d638af9` 改为 dev 专用目录
+`bazel/repository-dev`（硬链接播种，几乎不占盘、离线即热）。
+
+**规矩**：`distdir`、`content_addressable` 这类只读复用随便用；**任何会被工具写入的缓存路径
+都不许落在 `cache/dbdog-agent/bazel/repository` 上**。新加构建路径时先问一句「这个工具会往
+这个目录写吗」。
+
+### 万一还是被写坏了
+
+先按内容哈希捞（`CACHE-REFERENCES.sha256` 逐条比对，**只写哈希相符的内容**，所以不可能写错，
+最坏是补不全）。内容源按命中率依次是：seal `objects/sha256/<前2位>/<hash>`、封存 CAS
+`bazel/repository/content_addressable/sha256/*/file`、`distdir/*`、`go/mod/cache/download/**/*.zip`。
+两个坑会让你误判「归档里没有」：
+
+- `sha256sum` 必须 `xargs -n 200` 分批。不分批会静默漏算大批文件——2026-08-10 那次 clang 包里
+  1058 份所需内容因此没被看见。
+- 空间紧时用 `tar -T <成员清单>` **定点抽取**，别整包展开。clang+llvm 整包要十几 G，
+  `/home/dbdog` 常年 95%+ 满（注意 `df /home` 看的是另一块盘，见下），
+  而 `tar ... 2>/dev/null` 会把 ENOSPC 吞掉，表现成"归档里没这个文件"。
+
+捞不回来的是 bazel **生成物**（`BUILD.bazel`、`defs.bzl`、gazelle/fetch_repo 等编译产物、
+`.recorded_inputs`）：同一 entry hash 下不同 uuid 的同名文件哈希互不相同，**不可复现**，
+重新 fetch 也拿不回原字节。老构建机 `dbdog-build-old` 也不顶用——它不是 arm。
+
+### 重新封存 SOP（2026-08-11 实跑通过）
+
+到这一步就只能重新封存。顺序固定，每一步都踩过坑：
+
+1. **封存脚本必须作为文件放到构建机上跑**（`scp` 过去再执行）。它用 `$0` re-exec 自己去拿
+   pipeline lock，经 `bash -s` 走 stdin 会炸在 `cannot execute binary file`。
+2. **以 root 跑，但先 `cd` 出 `/root`**（0700）。脚本内部降权到 dbdog 后 `find` 恢复不了 cwd 会退 1，
+   `set -e` 下**静默中止、不打印任何消息**。同一个坑在 `publish.sh` 的 agent 构建路径也咬过一次
+   （已修，见 `a651a67`）。
+3. **`omnibus.success` 必须精确匹配 v10 handoff**。若构建目录的标记已被别的 overlay 覆盖，
+   得用 v10 overlay 重跑一遍 omnibus（约 14 分钟）再封存。**不要改那个标记文件**——那是伪造
+   完整性记录。（2026-07-28 有过一次 v11 实验重跑覆盖了它；v11 overlay 属主是 `dbdog` 而非
+   `root:root`，本就不是受控代，不能拿它封存。）
+4. 重跑 v10 runner 的前提：`omnibus/`、`stage-config/` 必须为空（改名保留即可），
+   `/opt/dbdog-agent` 必须为空——**用挂载命名空间 bind 一个空的 install root 顶上**，
+   宿主 agent 不必停服。v10 runner 早于命名空间设计，直跑会覆盖宿主运行时。
+5. `exact-system-probe-assets/SYSTEM-PROBE-OUTPUTS.sha256` 记的是 **build1 的绝对路径**。
+   发布配方走 `prepare_fresh_system_probe_seed` 重定位所以不依赖它，裸 runner 依赖。
+   build1 早已不在时，那 69 个产物在 build2 里哈希全吻合，硬链接回 build1 原路径即可。
+6. 新 seal 的 SEAL-INFO 身份字段与配方钉的常量天然一致（同一批常量写死在脚本里），**不必改代码**。
+   收尾必须做三件事：核对 SEAL-INFO 全部身份字段、以 dbdog 跑一次全量 `VERIFY.sh`（`RC=0`）、
+   旧 seal 改名保留到确认无碍后再删。
+
+## 构建机的两个文件系统
+
+`dbdog-build` 上 `/` 与 `/home/dbdog` 是**两个不同的文件系统**，是这台机器的特殊安排，保持现状：
+
+| 路径 | 设备 | 容量 |
+|---|---|---|
+| `/`（含 `/var/lib/dbdog-agent-install-roots/`） | `klas-root` | 35G |
+| `/home/dbdog`（cache/work/repo/go 全在这） | `vdb` | 160G，长期 95%+ 满 |
+
+`df -h /home` 显示的是 `/` 那块，看着宽裕；**真正的约束是 `df -h /home/dbdog`**。
+要落临时大文件前查后者。
+
+空间紧时可安全清理的（判据要机械，别凭印象）：
+
+- 已被取代的锚的 `work/dbdog-agent-<short>-build*/` 里的 `omnibus/`、`src/`、`bundle-work-cache/`、
+  `tmp/`——封存脚本自己就把 `omnibus/` 标为 `omnibus-work-tree | compiled build state`、
+  把 `bundle-work-cache` 标为 "never authoritative"，都不是缓存。**`out/` 与
+  `finalized-runtime-*` 按约定只移不删。**
+- 孤儿 bazel output base：`xdg/user/bazel/_bazel_dbdog/<hash>/` 里 `DO_NOT_BUILD_HERE` 记的
+  工作区目录已不存在的，bazel 永不再用。删前 `chmod -R u+w`（bazel 把 output 目录设成只读）。
+  2026-08-11 这两项合计释放了约 39G。
+- `xdg/` 整层不在 seal 覆盖范围内（封存的路径前缀里没有它）。
+
 ## 发布域 vs 编译域
 
 出问题时先分清归属，能省掉大半排查：
@@ -194,6 +275,11 @@ ssh <build-host> 'bash -s -- check <agent_sha> <core_sha>' < scripts/publish/age
 | 报错 | 含义 | 处置 |
 |---|---|---|
 | `缺少本次锚的 ANCHOR-INFO` | 没跑换锚准备器，或跑的是别的锚 | 按上面 SOP 第 2 步跑 `prepare-agent-anchor.sh` |
+| `依赖 seal 或它引用的持久 cache 校验失败` | seal 引用的文件被删/被改（多半是某个可写工具指到了封存目录） | 见「seal 是活目录」一节：先按哈希捞，捞不回再重新封存 |
+| 配方无任何 die 信息就「远端构建配方执行失败」 | 多半是 `x=$(find ...)` 在 `set -e` 下失败：以 root 登录时 cwd 是 `/root`(0700)，降权后 find 恢复不了 cwd 会退 1 且不打印 | 降权前先 `cd` 到 dbdog 进得去的目录（`publish.sh` 已修，手工跑控制脚本时要自己带上） |
+| `Omnibus success marker does not match the exact Kylin v10 handoff` | 构建目录的 `omnibus.success` 被别的 overlay 覆盖过 | **不要改那个文件**；用 v10 overlay 重跑 omnibus 再封存，见重新封存 SOP |
+| `<目录> is not empty; refusing to ...` | 上一次运行的 per-run 状态还在（`omnibus/`、`stage-config/`、install root） | 改名保留后重跑；install root 用命名空间 bind 一个空目录 |
+| `install-wheels` 只装了 gaussdb / 产物缺集成 | 锚册 `PINNED-WHEELS` 漏登记（历史上因 mirror 缺提交静默退化成空集） | 确认 mirror 已含本次锚提交后重跑换锚准备器，核对锚册条数与漂移集一致（已 fail closed，见 `195a90d`） |
 | `control overlay 自报的 release_agent_sha 不是新锚` | overlay 与基线对不上（拿了旧一代） | 核对 `--to-overlay-generation` 与基线是否同一锚 |
 | `CONTROL.sha256 必须精确包含固定顺序的四行清单` | overlay 内容与清单不符，或锚无关的两行（platform patch / patchelf）被改动 | 别手改 overlay，重跑准备器 |
 | `control overlay 目录必须是 root:root mode 0555` | 目录带了 setgid（父目录 `2755` 继承而来） | `chmod g-s <dir>`；注意这台 XFS 上 `chmod 0555` 不清该位 |

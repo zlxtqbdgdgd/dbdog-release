@@ -125,4 +125,11 @@ x86 靶机没有慢升级（发布物只出 arm）；它的 agent 只有「部�
   重跑（先核对 GitHub 资产、远端 `main`、manifest 三者未变）。
 - 依赖缓存优先复用（构建机 BUILD_WORK 各模块 out/、封存 bazel 缓存、锚册 wheel），
   不要重复下载；清理时只删后续构建确定不用的东西。
+- **`cache/dbdog-agent/bazel/repository` 是 seal 本体，不许任何会写它的工具指向它**
+  （`distdir`/CAS 只读复用没问题）。它按 `cache-reference` 封存——只记 sha256 不存副本，
+  被删就救不回来；2026-08-10 快升级的 bazel repository_cache 指到这里，GC 掉 26783 个文件、
+  正式发布路径当场断掉。恢复与重新封存 SOP 见 `scripts/publish/agent-build/README.md`
+  的「seal 是活目录」一节。
+- 构建机 `/` 与 `/home/dbdog` 是**两块盘**，`df /home` 看的是前者；真正的约束是
+  `df -h /home/dbdog`（长期 95%+ 满）。可安全清理的对象同上文档。
 - 中途退出检查 `git status`；保留用户的 `.codex/`、`bugs/` 与无关工作树修改。

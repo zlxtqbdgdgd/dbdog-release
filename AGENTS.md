@@ -9,4 +9,8 @@
 - Validate and upload artifacts directly from `dbdog-build`; do not relay release binaries through
   the developer workstation. GitHub credentials must be ephemeral and must not persist on the builder.
 - Keep formal module publications serial because they update the same manifest and branch.
+- Never point a writable tool cache at `cache/dbdog-agent/bazel/repository` on the builder: it *is*
+  the omnibus seal (sealed by reference — hashes only, no content copies), and anything that
+  garbage-collects it breaks releases irrecoverably. Read-only reuse of `distdir`/CAS is fine.
+  Recovery and re-seal SOP: `scripts/publish/agent-build/README.md`.
 - Preserve user-owned untracked `.codex/` and `bugs/` directories.
