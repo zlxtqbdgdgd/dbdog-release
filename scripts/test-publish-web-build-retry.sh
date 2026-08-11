@@ -119,4 +119,42 @@ fi
 [ "$(attempts)" = "1" ] || fail "类型错一次都不该重试（实跑 $(attempts) 次）"
 pass "类型错不重跑（跑 1 次）"
 
+# ── 传输环：lib 必须真能到达构建机 ────────────────────────────────────────────
+# 2026-08-10 首版把 lib 拆成文件后用 `source "$(dirname "$BASH_SOURCE")/lib..."` 引它，
+# 而配方是**经 stdin** 喂给构建机 bash 的：对端没有这个仓，$BASH_SOURCE[0] 也未绑定。
+# 上面那些用例全绿，dbdog-web 出包却在构建机上当场炸。所以这一段钉的不是判定逻辑，
+# 是「publish.sh 交给构建机的那份字节流里到底有没有这两个函数」。
+(
+  SRC_ROOT="$TEST_ROOT" BUILD_HOST="test@example.invalid" \
+  REPO_ROOT="/nonexistent" BUILD_WORK="/nonexistent" TOOL_PATH="" \
+  source "$SCRIPTS_DIR/publish/publish.sh"
+
+  resolve_module_recipe dbdog-web aarch64
+  composed="$RESOLVED_RECIPE"
+
+  [ -f "$composed" ] || fail "配方解析未产出文件"
+  grep -q 'run_next_build_with_one_retry()' "$composed" \
+    || fail "送往构建机的配方里没有重试函数定义——lib 没被内联，构建机上必炸"
+  grep -q 'is_retryable_next_build_failure()' "$composed" \
+    || fail "送往构建机的配方里没有判定函数定义"
+  ! grep -qE '^# @include ' "$composed" \
+    || fail "配方里还留着未展开的 @include"
+  ! grep -q 'BASH_SOURCE' "$composed" \
+    || fail "送往构建机的配方仍依赖 BASH_SOURCE——stdin 传输下未绑定"
+
+  # 展开后的字节流必须是合法 bash，且真能定义出这两个函数。
+  bash -n "$composed" || fail "展开后的配方语法不合法"
+
+  pass "配方内联了重试 lib（送往构建机的字节流自带两个函数）"
+
+  # fail closed：@include 指到不存在的文件必须当场炸，不能静默出一份缺函数的配方。
+  mkdir -p "$TEST_ROOT/badrecipe"
+  printf '%s\n' '#!/usr/bin/env bash' '# @include lib-does-not-exist.sh' \
+    >"$TEST_ROOT/badrecipe/r.sh"
+  if ( compose_recipe_includes "$TEST_ROOT/badrecipe/r.sh" ) 2>/dev/null; then
+    fail "@include 指向不存在的文件时应当场失败"
+  fi
+  pass "@include 缺文件 fail closed"
+) || exit 1
+
 printf '\n全部通过：%s\n' "$(basename "${BASH_SOURCE[0]}")"

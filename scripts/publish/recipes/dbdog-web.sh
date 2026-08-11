@@ -37,8 +37,8 @@ export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"   # 小内存�
 npm ci --no-audit --no-fund >&2
 # 只对「构建追踪抢跑」这一种已知偶发重试一次；其余失败照常炸（判定与次数见 lib 的注释，
 # 契约由 scripts/test-publish-web-build-retry.sh 钉住）。
-# shellcheck source=lib-next-build-retry.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib-next-build-retry.sh"
+# 配方经 stdin 送到构建机，source 同目录文件在对端不成立；由 publish.sh 内联展开。
+# @include lib-next-build-retry.sh
 run_next_build_with_one_retry "$WORK/out/next-build.log" npm run build \
   || die "next build 失败（详见上方日志）"
 
