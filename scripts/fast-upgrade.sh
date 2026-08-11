@@ -95,22 +95,41 @@ fast_agent_local() {
   as_stack_user git -C "$agent_repo" diff --quiet "$official"..origin/main -- rtloader/ \
     || die "rtloader 相对上游基线已有改动，组件级快升级前提失效（须整套 omnibus 慢路径）"
 
-  # bazel（schema 生成步骤）离线化：复用 omnibus 封存的 repository_cache/distdir/
-  # downloader 配置——这台机对部分外网源超时，在线拉取会卡死；缓存是现成的，照
-  # omnibus 的 user.bazelrc 同源落一份进 dev 仓（去掉单核限流，dev 构建要速度）。
-  if [ ! -f "$agent_repo/user.bazelrc" ]; then
+  # bazel（schema 生成步骤）离线化：复用 omnibus 封存的 distdir/downloader 配置——这台机
+  # 对部分外网源超时，在线拉取会卡死；缓存是现成的。
+  #
+  # ⚠️ repository_cache 必须**另起一份 dev 专用目录**，绝不能指向 `bazel/repository`。
+  # 那个目录不是"只读缓存"，它就是 omnibus seal 本体：seal 对这一类按
+  # `storage=cache-reference` 封存——只记 sha256，不存内容副本（CATEGORY-SUMMARY 里
+  # bazel-repository-expanded 的 reference_only_files 等于其 files）。而 bazel 对
+  # repository_cache 是可写的，会新建条目、回收旧条目。2026-08-10 dbdog.9 发布因此撞墙：
+  # 快升级跑过之后，7 个条目被 GC 掉共 26783 个文件，seal VERIFY 直接失败，发布路径断了，
+  # 且内容在 seal 里无副本、不可从 git 重建——只能靠别的机器拷回来。
+  #
+  # dev 目录用硬链接播种：几乎不占盘、离线即热，且 bazel 之后的删除/回收只摘掉 dev 这边的
+  # 目录项，封存路径的链接照在。
+  # 注意判据是「缺文件 **或** 文件里还指着封存目录」：早期版本写死了封存路径，只判存在
+  # 会让已经落地的坏配置永远留着，下一次快升级继续啃 seal。
+  local dev_repo_cache="$AGENT_CACHE/bazel/repository-dev"
+  if [ ! -f "$agent_repo/user.bazelrc" ] \
+    || grep -qE "^common --repository_cache=$AGENT_CACHE/bazel/repository/?\$" "$agent_repo/user.bazelrc"; then
     local dl_cfg
     dl_cfg="$(find "$AGENT_CACHE/manifests" -maxdepth 3 -name bazel-downloader.cfg 2>/dev/null | head -1)"
+    if [ ! -d "$dev_repo_cache" ] && [ -d "$AGENT_CACHE/bazel/repository" ]; then
+      log "[agent] 硬链接播种 dev bazel repository_cache（不动封存目录）"
+      as_stack_user cp -al "$AGENT_CACHE/bazel/repository" "$dev_repo_cache" \
+        || die "播种 dev repository_cache 失败: $dev_repo_cache"
+    fi
     as_stack_user bash -c "cat >'$agent_repo/user.bazelrc'" <<BRC
 startup --host_jvm_args=-Xms128m
 startup --host_jvm_args=-Xmx1200m
-common --repository_cache=$AGENT_CACHE/bazel/repository
+common --repository_cache=$dev_repo_cache
 common --http_max_parallel_downloads=2
 common --repo_env=GOSUMDB
 ${dl_cfg:+common --downloader_config=$dl_cfg}
 common --distdir=$AGENT_CACHE/distdir
 BRC
-    log "[agent] 已落 dev 仓 user.bazelrc（复用封存 bazel 缓存，离线构建）"
+    log "[agent] 已落 dev 仓 user.bazelrc（dev 专用 repository_cache，封存 distdir 只读复用）"
   fi
 
   log "[agent] dda 构建 Go agent（源 $short，--build-exclude=systemd）"
