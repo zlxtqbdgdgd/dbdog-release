@@ -1047,8 +1047,13 @@ build_one_arch() { # build_one_arch <module> <version(三方件传空)> <arch> �
     local root_login install_src ns_prelude
     root_login="$(build_host_root_login "$BUILD_HOST")"
     install_src="/var/lib/dbdog-agent-install-roots/$sha"
+    # cd 到 dbdog 进得去的目录再降权：这条 ssh 登录的是 root，cwd 是 /root（0700）。
+    # 配方降回 dbdog 后会继承它，而 GNU find 在收尾时恢复不了这个 cwd 就退 1 ——
+    # `x=$(find ...)` 在 set -e 下当场中止且**不打印任何消息**，表现为配方无故失败。
+    # 其余模块走 dbdog 登录、cwd 是自己的家目录，天然没这问题。
     ns_prelude="set -euo pipefail
 install -d -o dbdog -g dbdog -m 0755 $install_src
+cd $(printf '%q' "$BUILD_WORK")
 exec unshare --mount --propagation private /usr/bin/bash -c 'mount --bind \"\$1\" /opt/dbdog-agent && exec runuser -u dbdog -- env $(printf '%q ' \
       MODULE="$m" VERSION="$ver" SHA="$sha" CORE_SHA="$core" ARCH="$arch" \
       REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
