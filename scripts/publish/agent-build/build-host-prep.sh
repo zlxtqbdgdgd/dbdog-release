@@ -19,7 +19,9 @@
 #   local-upgrade <栈模块>...             本机 cache 后走与内网完全相同的 upgrade.sh 升级路径
 #                                         （缓存命中即免下载，其余校验/cutover/验收一步不少）。
 #                                         agent 的 sha 缺省按 manifest 锚解析；栈模块要求已按
-#                                         release 布局安装（首次安装=栈迁移，owner 安排）
+#                                         release 布局安装（首次安装=栈迁移，owner 安排）。
+#                                         两半边身份不同：agent 是 root 语义，栈归 $DBDOG_STACK_USER
+#                                         （默认 dbdog）——播种与 upgrade.sh 都降权到它执行
 #
 # 锚定 wheel 的权威是换锚时落下的 anchors/<sha>/PINNED-WHEELS（摘要记在 ANCHOR-INFO）。
 # 旧版准备器建的锚没有它，那类退回按封存 core 现场推导，并会明确提示是旧锚。
@@ -282,6 +284,12 @@ install_one_wheel() { # <引擎> <wheel 绝对路径>
 #   local-upgrade <栈模块>...                 # dbdog-server/dbdog-web/dbdog-mcp 等
 # agent 与栈模块不能混在一次调用里（upgrade.sh 的既有规则）。
 LOCAL_BUILD_WORK="${DBDOG_BUILD_WORK:-/home/dbdog/dbdog-release-build}"
+# 栈（server/web/mcp…）不归 root：它按 release 布局装在**栈属主**的家目录下
+# （构建机上是 dbdog，$HOME/dbdog/modules/<模块>/current），服务也以该身份运行。
+# 本命令要求 root 执行（agent 是 root 语义），所以栈这半边必须显式降权到属主，
+# 否则 $HOME 解析成 /root、模块判定与 cache 播种全落到空的 /root/dbdog，
+# 报成误导性的「尚未按 release 布局安装」（2026-08-11 实际踩中）。
+STACK_USER="${DBDOG_STACK_USER:-dbdog}"
 
 local_upgrade_sync_repo() { # → stdout manifest 路径；顺带把检出对齐远端 main
   local repo="${DBDOG_RELEASE_REPO:-/home/dbdog/repo/dbdog-release}"
@@ -293,8 +301,16 @@ local_upgrade_sync_repo() { # → stdout manifest 路径；顺带把检出对齐
   printf '%s' "$repo"
 }
 
-local_upgrade_seed() { # <模块> <产物绝对路径> <manifest>；核对一字不差后播种 cache
-  local m="$1" artifact="$2" manifest="$3" art_name m_version m_artifact m_sha file_sha cache
+stack_home() { # → stdout 栈属主的 release 布局根（$HOME/dbdog）
+  local home
+  home="$(getent passwd "$STACK_USER" | cut -d: -f6)" \
+    || die "解析不到栈属主 $STACK_USER 的家目录（改属主用 DBDOG_STACK_USER=）"
+  [ -n "$home" ] && [ -d "$home" ] || die "栈属主 $STACK_USER 的家目录不可用: ${home:-<空>}"
+  printf '%s' "${DBDOG_HOME:-$home/dbdog}"
+}
+
+local_upgrade_seed() { # <模块> <产物绝对路径> <manifest> [<属主>]；核对一字不差后播种 cache
+  local m="$1" artifact="$2" manifest="$3" owner="${4-}" art_name m_version m_artifact m_sha file_sha cache
   art_name="$(basename "$artifact")"
   m_version="$(awk -F'\t' -v m="$m" '$1==m{print $5; exit}' "$manifest")"
   m_artifact="$(awk -F'\t' -v m="$m" '$1==m{print $6; exit}' "$manifest")"
@@ -305,9 +321,17 @@ local_upgrade_seed() { # <模块> <产物绝对路径> <manifest>；核对一字
   file_sha="$(sha256sum "$artifact" | awk '{print $1}')"
   [ "$file_sha" = "$m_sha" ] || \
     die "$m 构建产物 SHA-256 与 manifest 不一致（产物=$file_sha manifest=$m_sha）"
-  cache="${DBDOG_HOME:-$HOME/dbdog}/cache"
-  install -d -m 0755 "$cache"
-  install -m 0644 "$artifact" "$cache/$art_name"
+  if [ -n "$owner" ]; then
+    # 栈：播进属主自己的 cache，且属主可读写——root 属主的文件会让后续以属主身份
+    # 跑的升级动不了它（同 mirror/检出那个坑）。
+    cache="$(stack_home)/cache"
+    install -d -o "$owner" -g "$owner" -m 0755 "$cache"
+    install -o "$owner" -g "$owner" -m 0644 "$artifact" "$cache/$art_name"
+  else
+    cache="${DBDOG_HOME:-$HOME/dbdog}/cache"
+    install -d -m 0755 "$cache"
+    install -m 0644 "$artifact" "$cache/$art_name"
+  fi
   printf 'seeded %s (%s) -> %s\n' "$art_name" "$m_version" "$cache/$art_name"
 }
 
@@ -351,17 +375,23 @@ cmd_local_upgrade() { # <模块|agent_sha>...
   fi
 
   [ "${#stack_modules[@]}" -gt 0 ] || die "用法: local-upgrade dbdog-agent [<agent_sha>] | local-upgrade <栈模块>..."
+  local stack_root
+  stack_root="$(stack_home)"
   for m in "${stack_modules[@]}"; do
     # 栈模块的「发布到本机」只覆盖**已按 release 布局安装**的模块。这台构建机上的
     # dev 栈（dbdogt-* 单元）若尚未迁移到 release 布局，首次安装涉及端口/数据/服务
     # 切换，必须由 owner 按迁移计划安排窗口，不能由本命令顺手做掉。
-    [ -e "${DBDOG_HOME:-$HOME/dbdog}/modules/$m/current" ] || \
-      die "$m 尚未按 release 布局安装（${DBDOG_HOME:-$HOME/dbdog}/modules/$m/current 不存在）——首次安装是栈迁移动作，见 publish skill 的迁移说明"
+    # 判定必须落在**栈属主**的家目录：本命令以 root 跑，用 $HOME 会指向 /root。
+    [ -e "$stack_root/modules/$m/current" ] || \
+      die "$m 尚未按 release 布局安装（$stack_root/modules/$m/current 不存在）——首次安装是栈迁移动作，见 publish skill 的迁移说明"
     artifact="$LOCAL_BUILD_WORK/$m/out/$(awk -F'\t' -v m="$m" '$1==m{print $6; exit}' "$manifest")"
     [ -f "$artifact" ] || die "$m 在本构建机没有留存的构建产物: $artifact（发布到 GH 的那次构建须出自本机）"
-    local_upgrade_seed "$m" "$artifact" "$manifest"
+    local_upgrade_seed "$m" "$artifact" "$manifest" "$STACK_USER"
   done
-  exec "$repo/scripts/upgrade.sh" "${stack_modules[@]}"
+  # 栈的升级必须以属主身份跑：upgrade.sh 按 $HOME 定位 release 布局，且切换后的
+  # 目录/进程都归属主。以 root 跑会写出 root 属主的模块目录，属主此后动不了。
+  exec runuser -u "$STACK_USER" -- bash -c 'cd ~ && exec "$0" "$@"' \
+    "$repo/scripts/upgrade.sh" "${stack_modules[@]}"
 }
 
 cmd_fetch_mirrors() {

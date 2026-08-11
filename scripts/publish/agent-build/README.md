@@ -112,6 +112,13 @@ preparer that derives each new generation from the previous one.
    而不是等到内网。栈模块同一子命令（`local-upgrade dbdog-server ...`），话术与前提见
    publish skill。
 
+   **agent 与栈的身份不同，别混**：agent 是 root 语义（`/opt/dbdog-agent`、`/root/dbdog/cache`）；
+   栈按 release 布局装在**栈属主**家目录（构建机上是 dbdog：`/home/dbdog/dbdog/modules/<模块>/current`，
+   由 `dbdogctl` 托管而非 systemd 单元）。所以栈这半边由本命令自动降权到
+   `$DBDOG_STACK_USER`（默认 dbdog）——按属主家目录判定布局、以属主属主播种 cache、
+   再 `runuser` 执行 upgrade.sh。2026-08-11 之前它统一用 `$HOME`，以 root 跑时解析成空的
+   `/root/dbdog`，把「身份用错」报成误导性的「尚未按 release 布局安装（首次安装是栈迁移动作）」。
+
 配方本身**不含任何随锚变的字面量**——路径由传入的 `$SHA`/`$CORE_SHA` 派生，overlay 代号
 与 finalizer/wrapper 哈希从 `ANCHOR-INFO` 读取。所以换锚不需要改 `recipes/dbdog-agent.sh`。
 
