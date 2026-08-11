@@ -162,7 +162,13 @@ BRC
   [ -f "$agent_repo/bin/agent/agent" ] || die "构建产物缺失: $agent_repo/bin/agent/agent"
 
   log "[agent] 构建/复用 4 个集成 wheel（core $(printf '%.7s' "$core_sha")）"
+  # mktemp -d 以 root 跑出来是 0700 root:root，而下面新建 wheel 那条路是 as_stack_user，
+  # 栈用户连目录都进不去（build-integration-wheel.sh 末尾 `cp -- "$w1" "$final"` 报
+  # `failed to access …whl: Permission denied`）。复用锚册 wheel 那条路是 root 自己 cp、
+  # 不会暴露此问题——只有 core 有新提交、锚册无缓存时才走到新建路径，故潜伏至今。
+  # 交给栈用户拥有：root 往里写不受影响（root 绕过 DAC），栈用户也写得进。
   wheel_dir="$(mktemp -d /tmp/dbdog-fast-wheels.XXXXXX)"
+  chown "$STACK_USER" "$wheel_dir" || die "移交 wheel 暂存目录属主失败: $wheel_dir"
   for e in datadog_checks_base gaussdb opengauss postgres; do
     cached="$(find "$AGENT_CACHE/sources/python/$e/$core_sha" -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null || true)"
     if [ -n "$cached" ]; then
