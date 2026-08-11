@@ -821,6 +821,11 @@ apm_config:
   enabled: true
   receiver_port: 5126
   apm_dd_url: $(agent_yaml_quote "$server")
+  # profiling 出口必须显式写。漏了不会静默外发（fork 把 DefaultSite 改成了 dbdog.invalid，
+  # 见 dbdog-agent PITFALLS §28 的 fail-closed 设计），而是变成 intake.profile.dbdog.invalid
+  # 的 DNS 失败 → trace-agent 转发回 502 → ddprof 产出的 profile 全部丢弃。
+  # 2026-08-11 实测 ecs-8ea7：CH profiles 表长期 0 行，根因就是这里漏了一行。
+  profiling_dd_url: $(agent_yaml_quote "$server/api/v2/profile")
   log_file: $(agent_yaml_quote "$AGENT_LOG_DIR/trace-agent.log")
   telemetry:
     enabled: false
