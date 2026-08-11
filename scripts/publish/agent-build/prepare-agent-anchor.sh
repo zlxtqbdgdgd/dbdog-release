@@ -85,6 +85,34 @@ require_generation --to-overlay-generation "$to_generation"
 [[ $(id -u) == 0 ]] || die '必须以 root 执行：本脚本要写 root:root 只读控制物'
 [[ $(uname -m) == aarch64 ]] || die '必须在 aarch64 构建机上执行'
 
+# ---- bare mirror 必须已含本次的两个锚提交 ---------------------------------------
+#
+# 下面判定「哪些集成需要锚定 wheel」全靠这两个 mirror：conf.d 引擎枚举读 agent 锚的
+# tree，通用漂移兜底读 core 锚与封存 core 的 diff。mirror 缺提交时这两处都只会得到
+# **空集**——不是报错，是静默的空：锚册于是只剩 finalizer 自带的 gaussdb，产物照发，
+# 缺集成/装旧版要等到线上采集归零才暴露。2026-08-10 的 v19 首版正是这么出的（mirror
+# 停在上一代，锚册 4 条变 1 条；当次只因 datadog_checks_base 恰好漂移、而 base 那段
+# 查的是锚册才被捅破）。所以这里先硬断言。
+#
+# mirror 属主是 dbdog，root 在里面 fetch 会留下 root 属主的对象——本脚本只判定不 fetch，
+# 缺提交时把 fetch 命令交给操作者（publish.sh 的 fetch-mirrors 以 dbdog 身份做这件事）。
+assert_mirror_has_commit() { # <mirror gitdir> <sha> <人话名字> <fetch 提示>
+  local gitdir=$1 sha=$2 label=$3 hint=$4
+  [[ -d $gitdir ]] || die "缺少 $label bare mirror: $gitdir"
+  git --git-dir="$gitdir" cat-file -e "$sha^{commit}" 2>/dev/null || die \
+    "$label mirror 里没有本次的锚提交 $sha。
+   锚定 wheel 的判定全靠 mirror，缺提交会让判定退化成空集并静默少登记集成。
+   先同步 mirror（以 dbdog 身份，别用 root）：
+     $hint"
+}
+assert_mirror_has_commit "$CACHE_ROOT/git/dbdog-agent.git" "$to_agent_sha" agent \
+  "runuser -u dbdog -- git --git-dir=$CACHE_ROOT/git/dbdog-agent.git fetch --prune origin '+refs/*:refs/*'"
+assert_mirror_has_commit "$CACHE_ROOT/git/dbdog-agent-core.git" "$to_core_sha" core \
+  "runuser -u dbdog -- git --git-dir=$CACHE_ROOT/git/dbdog-agent-core.git fetch --prune origin '+refs/*:refs/*'"
+assert_mirror_has_commit "$CACHE_ROOT/git/dbdog-agent-core.git" "$OMNIBUS_CORE_SHA" \
+  '封存 core' \
+  "runuser -u dbdog -- git --git-dir=$CACHE_ROOT/git/dbdog-agent-core.git fetch --prune origin '+refs/*:refs/*'"
+
 readonly from_short=${from_agent_sha:0:8}
 readonly to_short=${to_agent_sha:0:8}
 readonly from_overlay_name="$from_agent_sha-$OVERLAY_SUFFIX-$from_generation"
@@ -358,8 +386,13 @@ core_git="$CACHE_ROOT/git/dbdog-agent-core.git"
 tree_at() { # <gitdir> <sha> <路径> —— 不存在回显空串；--verify 不能少
   git --git-dir="$1" rev-parse --verify --quiet "$2:$3" 2>/dev/null || true
 }
-for conf_entry in $(git --git-dir="$agent_git" ls-tree --name-only \
-  "$to_agent_sha:dbdog-deploy/conf/conf.d" 2>/dev/null); do
+# 引擎清单取不到就是判定失效，不是「没有引擎」——空集会让锚册静默少登记。
+conf_entries=$(git --git-dir="$agent_git" ls-tree --name-only \
+  "$to_agent_sha:dbdog-deploy/conf/conf.d") \
+  || die "读不到 agent 锚的 conf.d（$to_agent_sha:dbdog-deploy/conf/conf.d）——无法判定该给哪些引擎出锚定 wheel"
+[[ -n $conf_entries ]] \
+  || die "agent 锚的 conf.d 为空，与已发布形态不符；拒绝据此生成锚册: $to_agent_sha"
+for conf_entry in $conf_entries; do
   engine=${conf_entry%/}
   engine=${engine%.d}
   case $engine in '' | *[!a-z0-9_]*) continue ;; esac
@@ -394,6 +427,16 @@ done
 # 之间所有漂移的顶层 Python 集成目录，凡不在锚册覆盖内的同样要求锚定 wheel 并入册，
 # 缺 wheel 即 fail closed。包名规则：引擎目录（postgres）的 wheel 是 datadog_<目录>-*，
 # datadog_ 开头的共享包目录（datadog_checks_base）的 wheel 就是 <目录>-*。
+# diff 必须在**主 shell** 里算：写进 `done < <(...)` 的进程替换里，其 die 只会退出子
+# shell，循环照样读到空集继续往下跑——那正是本段要防的静默。
+core_drift_raw=$(git --git-dir="$core_git" diff --name-only \
+  "$OMNIBUS_CORE_SHA" "$to_core_sha") \
+  || die "读不到封存 core 与发布锚之间的差异（$OMNIBUS_CORE_SHA..$to_core_sha）——漂移兜底失效"
+# 封存 core 与发布锚必然有差异（否则不必换锚）；零差异说明取到的不是这两个提交。
+[[ -n $core_drift_raw ]] \
+  || die "封存 core 与发布锚之间零差异，与换锚前提不符；拒绝据此生成锚册"
+core_drift_dirs=$(printf '%s\n' "$core_drift_raw" | cut -d/ -f1 | sort -u)
+
 while IFS= read -r drift_dir; do
   [[ -n $drift_dir ]] || continue
   # 只关心 Python 集成目录（其下有 datadog_checks/）
@@ -414,8 +457,7 @@ while IFS= read -r drift_dir; do
   printf '%s\t%s\t%s\n' "$drift_dir" "${drift_wheel#"$CACHE_ROOT/"}" "$(file_sha256 "$drift_wheel")" \
     >>"$pinned_wheels_file"
   log "锚定 wheel 入册(共享基座漂移): $drift_dir <- ${drift_wheel##*/}"
-done < <(git --git-dir="$core_git" diff --name-only "$OMNIBUS_CORE_SHA" "$to_core_sha" \
-  2>/dev/null | cut -d/ -f1 | sort -u)
+done <<<"$core_drift_dirs"
 
 pinned_wheels_sha256=$(file_sha256 "$pinned_wheels_file")
 

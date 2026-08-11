@@ -212,8 +212,14 @@ cmd_check() {
       fix "送到 $CACHE_ROOT/sources/python/$engine/$core_sha/（root:root 0444），再 install-wheels"
     elif [ "$(stat -c '%U:%G %a' "$wheel")" != "root:root 444" ]; then
       bad "$engine：wheel 属主模式应为 root:root 0444，实为 $(stat -c '%U:%G %a' "$wheel")"
+    elif [ -f "$manifest" ] && ! awk -F'\t' -v e="$engine" '$1 == e { found = 1 } END { exit !found }' "$manifest"; then
+      # wheel 躺在磁盘上 ≠ 会被装。install-wheels 照 PINNED-WHEELS 安装，锚册没登记就
+      # 一行不装——「盘上有」和「会装上」是两件事，只查前者等于没查。2026-08-10 的 v19
+      # 首版锚册漏登记 opengauss/postgres，这里当时报的却是 OK，把静默放行到了构建之后。
+      bad "$engine（$kind）：wheel 在盘上但锚册未登记——install-wheels 不会装它，$reason"
+      fix "重跑换锚准备器重建 PINNED-WHEELS（先确认 mirror 已含本次锚提交）"
     else
-      ok "$engine（$kind）：锚定 wheel 就位（install-wheels 会覆盖装）"
+      ok "$engine（$kind）：锚定 wheel 已登记入册（install-wheels 会覆盖装）"
     fi
   done <<EOF
 $(classify_engines "$agent_sha" "$core_sha" "$sealed")
