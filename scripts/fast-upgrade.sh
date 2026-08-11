@@ -120,10 +120,25 @@ fast_agent_local() {
     || grep -qE "^common --repository_cache=$AGENT_CACHE/bazel/repository/?\$" "$agent_repo/user.bazelrc"; then
     local dl_cfg
     dl_cfg="$(find "$AGENT_CACHE/manifests" -maxdepth 3 -name bazel-downloader.cfg 2>/dev/null | head -1)"
-    if [ ! -d "$dev_repo_cache" ] && [ -d "$AGENT_CACHE/bazel/repository" ]; then
-      log "[agent] 硬链接播种 dev bazel repository_cache（不动封存目录）"
-      as_stack_user cp -al "$AGENT_CACHE/bazel/repository" "$dev_repo_cache" \
+    if [ -d "$AGENT_CACHE/bazel/repository" ]; then
+      # 播种必须以 root 跑，不能 as_stack_user：seal 里有一批文件是初次封存时留下的
+      # root:root r--r--r--（2026-08-11 实测 724/73374，全在 content_addressable/），
+      # 而内核 fs.protected_hardlinks=1 规定「非属主且对目标无写权限时不许建硬链接」，
+      # 栈用户对这批必然 EPERM。这是 d638af9 引入播种以来一直潜伏、直到首次真跑才暴露的。
+      #
+      # 但**只 chown 目录、绝不 chown 文件**：硬链接共享 inode，chown 文件会连带改掉
+      # seal 本体的属主（隔着一层动 seal，正是本仓事故文档禁止的）。而 bazel 新建/GC
+      # 条目只需要目录的写权限，文件 inode 保持 root:root 只读与 seal 共享即可。
+      #
+      # 用 `cp -aln … src/. dst/` 而不是 `cp -al src dst`：前者可重复执行、只补缺失项，
+      # 于是守卫不必判「目录在不在」——只判存在会让**残缺**的播种永远留着（本仓早期
+      # 写死封存路径那次就是这么栽的，见 agent-build/README「万一还是被写坏了」）。
+      log "[agent] 硬链接播种/补齐 dev bazel repository_cache（不动封存目录）"
+      mkdir -p "$dev_repo_cache"
+      cp -aln "$AGENT_CACHE/bazel/repository/." "$dev_repo_cache/" \
         || die "播种 dev repository_cache 失败: $dev_repo_cache"
+      find "$dev_repo_cache" -type d ! -user "$STACK_USER" -exec chown "$STACK_USER" {} + \
+        || die "回收 dev repository_cache 目录属主失败: $dev_repo_cache"
     fi
     as_stack_user bash -c "cat >'$agent_repo/user.bazelrc'" <<BRC
 startup --host_jvm_args=-Xms128m
