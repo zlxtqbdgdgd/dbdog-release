@@ -21,6 +21,7 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../lib.sh"   # log/die/manifest_* （其内网路径变量在本机不使用）
+source "$HERE/recipe-compose.sh"   # compose_recipe_includes（与 fast-upgrade.sh 共用单源）
 
 REPO="zlxtqbdgdgd/dbdog-release"
 BUCKET_TAG="artifacts"
@@ -831,43 +832,11 @@ resolve_module_recipe() { # resolve_module_recipe <module> <arch> → 设置 RES
   else
     RESOLVED_RECIPE="$HERE/recipes/$m.sh"
   fi
-  compose_recipe_includes "$RESOLVED_RECIPE"
+  RESOLVED_RECIPE="$(compose_recipe_includes "$RESOLVED_RECIPE" "$HERE/recipes" "$SCRATCH")"
 }
 
-# 配方是**经 stdin** 喂给构建机 bash 的（见下面的 `bash -s <"$recipe"`），构建机上并没有
-# 这个仓——所以配方里 `source` 同目录的 lib 必然失败：既没有 $BASH_SOURCE[0] 可定位，
-# 文件本身也不在对端。要复用 lib，只能在本机把它**内联进配方流**。
-#
-# 约定：配方写 `# @include <recipes/ 下的文件名>`，本函数原地展开为该文件内容。
-# 没有 include 的配方原样使用，不产生临时文件。
-compose_recipe_includes() { # <配方路径> → 必要时把 RESOLVED_RECIPE 指向展开后的副本
-  local recipe="$1"
-  [ -f "$recipe" ] || die "缺少配方: $recipe"
-  grep -qE '^# @include ' "$recipe" || return 0
-
-  local composed="$SCRATCH/.recipe-$(basename "$recipe")"
-  mkdir -p "$SCRATCH"
-  : >"$composed"
-  local line inc
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      '# @include '*)
-        inc="${line#\# @include }"
-        inc="${inc%%[[:space:]]*}"
-        case "$inc" in
-          */*|'') die "配方 $(basename "$recipe") 的 @include 只接受 recipes/ 下的文件名: '$inc'" ;;
-        esac
-        [ -f "$HERE/recipes/$inc" ] \
-          || die "配方 $(basename "$recipe") @include 的文件不存在: recipes/$inc"
-        printf '# ---- @include recipes/%s（由 publish.sh 内联）----\n' "$inc" >>"$composed"
-        cat "$HERE/recipes/$inc" >>"$composed"
-        printf '# ---- end recipes/%s ----\n' "$inc" >>"$composed"
-        ;;
-      *) printf '%s\n' "$line" >>"$composed" ;;
-    esac
-  done <"$recipe"
-  RESOLVED_RECIPE="$composed"
-}
+# 配方 @include 的展开实现搬到了 recipe-compose.sh（本文件顶部 source），
+# 因为快升级 fast-upgrade.sh 跑的是同一份配方、也必须展开——留在这里就成了两份。
 
 # agent_preflight_build_host 在严格的控制物校验之前，先把构建机的前置条件**一次报全**。
 # 下面那个 anchor-controls 预检遇到第一处不满足就 die，一次只暴露一个问题；2026-08-06

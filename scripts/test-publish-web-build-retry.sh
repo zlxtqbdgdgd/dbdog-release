@@ -151,10 +151,42 @@ pass "类型错不重跑（跑 1 次）"
   mkdir -p "$TEST_ROOT/badrecipe"
   printf '%s\n' '#!/usr/bin/env bash' '# @include lib-does-not-exist.sh' \
     >"$TEST_ROOT/badrecipe/r.sh"
-  if ( compose_recipe_includes "$TEST_ROOT/badrecipe/r.sh" ) 2>/dev/null; then
+  if ( compose_recipe_includes "$TEST_ROOT/badrecipe/r.sh" \
+        "$SCRIPTS_DIR/publish/recipes" "$TEST_ROOT/badout" ) 2>/dev/null; then
     fail "@include 指向不存在的文件时应当场失败"
   fi
   pass "@include 缺文件 fail closed"
 ) || exit 1
+
+# ── 快升级环：fast-upgrade 跑的是同一份配方，也必须展开 ─────────────────────────
+# 2026-08-10：fast-upgrade.sh 直接 `bash "$recipe"` 跑原始配方，@include 只有 publish.sh
+# 会展开，于是 run_next_build_with_one_retry 未定义、dbdog-web 快升级当场炸。上面那段
+# 「传输环」只钉了 publish.sh 那条路，所以这个洞带着绿测上线——这里钉的是另一个调用方。
+(
+  die() { printf 'die: %s\n' "$*" >&2; exit 1; }
+  source "$SCRIPTS_DIR/publish/recipe-compose.sh"
+
+  composed="$(compose_recipe_includes "$SCRIPTS_DIR/publish/recipes/dbdog-web.sh" \
+    "$SCRIPTS_DIR/publish/recipes" "$TEST_ROOT/fastrecipe")"
+  [ -f "$composed" ] || fail "快升级路径没产出配方文件"
+  grep -q 'run_next_build_with_one_retry()' "$composed" \
+    || fail "快升级路径拿到的配方缺重试函数定义"
+  ! grep -qE '^# @include ' "$composed" \
+    || fail "快升级路径的配方还留着未展开的 @include"
+  bash -n "$composed" || fail "快升级路径展开后的配方语法不合法"
+  pass "快升级路径也展开了 @include"
+
+  # 无 @include 的配方原样回显，不产生多余临时文件。
+  printf '%s\n' '#!/usr/bin/env bash' 'echo hi' >"$TEST_ROOT/plain.sh"
+  [ "$(compose_recipe_includes "$TEST_ROOT/plain.sh" "$SCRIPTS_DIR/publish/recipes" \
+      "$TEST_ROOT/fastrecipe")" = "$TEST_ROOT/plain.sh" ] \
+    || fail "无 @include 的配方不该被复制"
+  pass "无 @include 的配方原样使用"
+) || exit 1
+
+# fast-upgrade.sh 必须真的走展开，而不是又直接 bash 原始配方。
+grep -q 'compose_recipe_includes' "$SCRIPTS_DIR/fast-upgrade.sh" \
+  || fail "fast-upgrade.sh 没走 @include 展开——快升级会拿到原始配方"
+pass "fast-upgrade.sh 走了 @include 展开"
 
 printf '\n全部通过：%s\n' "$(basename "${BASH_SOURCE[0]}")"

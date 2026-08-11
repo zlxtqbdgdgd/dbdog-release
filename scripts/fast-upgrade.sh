@@ -33,6 +33,8 @@ AGENT_CACHE=/home/dbdog/cache/dbdog-agent
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+source "$SCRIPTS_DIR/publish/recipe-compose.sh"   # 与 publish.sh 共用同一份 @include 展开
+
 [ "$(id -u)" -eq 0 ] || die "fast-upgrade 必须以 root 执行（栈构建会自动降到 $STACK_USER）"
 [ "$#" -ge 1 ] || die "用法: fast-upgrade.sh <模块>...（dbdog-server/dbdog-web/dbdog-mcp 或 dbdog-agent）"
 
@@ -66,6 +68,9 @@ fast_stack_one() { # <模块>
   version="${mver}-dev.g${short}"
   recipe="$SCRIPTS_DIR/publish/recipes/$m.sh"
   [ -f "$recipe" ] || die "缺 recipe: $recipe"
+  # 与正式发布同一份配方，@include 也必须在本机展开——否则配方里的 lib 函数未定义，
+  # 构建当场炸（2026-08-10 dbdog-web 快升级即此）。
+  recipe="$(compose_recipe_includes "$recipe" "$SCRIPTS_DIR/publish/recipes" "$BUILD_WORK/.recipes")"
   local arch=aarch64
   [ "$m" != dbdog-mcp ] || arch=noarch
   log "[$m] 出包 $version（源 $short，与正式发布同 recipe）"
