@@ -9,3 +9,6 @@ manifest.tsv.*
 
 # local Claude/Codex worktrees
 .claude/worktrees
+
+# slides deck build
+slides/node_modules/

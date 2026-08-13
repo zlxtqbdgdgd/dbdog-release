@@ -84,6 +84,40 @@ fast_stack_one() { # <模块>
   log "[$m] 安装（与慢升级同一套 upgrade.sh 代码路径）"
   as_stack_user bash -c "cd /home/$STACK_USER && exec '$SCRIPTS_DIR/upgrade.sh' --artifact '$rpath' '$m'" \
     || die "[$m] 快升级安装失败"
+  prune_build_out "$m" "$rpath"
+}
+
+# 出包目录只保留最近几个产物。
+#
+# 快升级每跑一次就往 out/ 落一个包、从不回收：2026-08-13 构建机 /home 被塞满，
+# dbdog-web 的 out/ 攒了 131 个包，当天的部署直接 "No space left on device" 失败。
+# 诊断时还绕了路——df 显示尚有空间、du 因硬链接重复计数，都不指向真凶。
+#
+# 保留数用 FAST_UPGRADE_KEEP 覆盖（默认 5）；只动本模块自己的 out/，按 mtime 留新删旧。
+# 刚装上的那个必然是最新的，不会被删。
+#
+# **只清与本次同名同后缀的产物**，不碰目录里的其他文件：干跑时发现 out/ 里还躺着
+# next-build.log 这类构建日志——按 mtime 一起排的话，它既会白占一个保留名额，
+# 排到后面时还会被当旧产物删掉，而那是排查构建失败要看的东西。
+prune_build_out() {
+  local m="$1" rpath="$2" dir keep base ext
+  dir="$(dirname -- "$rpath")"
+  keep="${FAST_UPGRADE_KEEP:-5}"
+  case "$dir" in
+    */out) ;;
+    *) return 0 ;;  # 布局不符预期就不动手——宁可不清也不误删
+  esac
+  base="$(basename -- "$rpath")"
+  case "$base" in
+    *.tar.gz) ext='*.tar.gz' ;;
+    *.tar.zst) ext='*.tar.zst' ;;
+    *) return 0 ;;  # 认不出的产物形态不清理
+  esac
+  local n
+  n="$(as_stack_user bash -c "cd '$dir' && ls -1t $ext 2>/dev/null | wc -l")"
+  [ "${n:-0}" -gt "$keep" ] || return 0
+  log "[$m] 清理出包目录：$n 个产物，保留最近 $keep 个（不动构建日志）"
+  as_stack_user bash -c "cd '$dir' && ls -1t $ext | tail -n +$((keep + 1)) | xargs -r rm -f --"
 }
 
 fast_agent_local() {
