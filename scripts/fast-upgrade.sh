@@ -85,6 +85,7 @@ fast_stack_one() { # <模块>
   as_stack_user bash -c "cd /home/$STACK_USER && exec '$SCRIPTS_DIR/upgrade.sh' --artifact '$rpath' '$m'" \
     || die "[$m] 快升级安装失败"
   prune_build_out "$m" "$rpath"
+  prune_installed_versions "$m"
 }
 
 # 出包目录只保留最近几个产物。
@@ -118,6 +119,62 @@ prune_build_out() {
   [ "${n:-0}" -gt "$keep" ] || return 0
   log "[$m] 清理出包目录：$n 个产物，保留最近 $keep 个（不动构建日志）"
   as_stack_user bash -c "cd '$dir' && ls -1t $ext | tail -n +$((keep + 1)) | xargs -r rm -f --"
+}
+
+# 已装版本目录与安装包缓存也只保留最近几代。
+#
+# prune_build_out 只清了 out/，而每次快升级还会各留一份：modules/<m>/<版本>/ 里解开的
+# 安装树，以及 cache/ 里下载/产出的安装包。两处都从不回收——2026-08-16 盘点时
+# /home/dbdog 已 95%：modules 24G（dbdog-web 攒了 141 个版本目录、server 59 个）、
+# cache 15G（461 个包）。这台机器**既是构建机又是运行机**，塞满不只是构建失败，
+# 会拖垮线上服务，所以别再等满了紧急处理。
+#
+# 保留数复用 FAST_UPGRADE_KEEP（默认 5），按 mtime 留新删旧。
+# **current 及其指向的目录永不参与排序、永不删**——回滚要靠它，刚装上的那个也在里面。
+# 布局不符预期就不动手，与 prune_build_out 同一条守则：宁可不清也不误删。
+prune_installed_versions() {
+  local m="$1" keep root
+  keep="${FAST_UPGRADE_KEEP:-5}"
+  root="${DBDOG_HOME:-/home/$STACK_USER/dbdog}"
+
+  # 布局校验：modules/<m>/current 必须是软链且指向真实目录，否则这个模块没走标准安装
+  # 约定（check-upgrade.sh:46 提到确有这类模块），一律不碰——与 prune_build_out 同一条守则。
+  as_stack_user bash -c 'test -L "$1/modules/$2/current" && test -d "$(readlink -f "$1/modules/$2/current")"' \
+    _ "$root" "$m" || return 0
+
+  # 传参进去，不把变量拼进脚本文本——省掉多层转义，也避免模块名里的特殊字符出事。
+  as_stack_user bash -c '
+    set -u
+    root=$1; m=$2; keep=$3
+    cur=$(readlink -f "$root/modules/$m/current")
+
+    # 候选逐个 readlink -f 后再与 cur 比：两边用同一种方式归一化。
+    # 别拿「ls 的输出」去字符串匹配「readlink 的输出」——路径里只要有一段是软链，
+    # 两条独立推导出来的串就对不上，保护会静默失效。2026-08-16 在假树上实测到过
+    # 正是这个写法把 current 指向的目录删掉了，而真机上没出事只是碰巧路径无软链。
+    cand=$(ls -1dt "$root/modules/$m/"*/ 2>/dev/null | while IFS= read -r d; do
+      [ "$(readlink -f "$d")" = "$cur" ] && continue
+      printf "%s\n" "$d"
+    done)
+    n=$(printf "%s" "$cand" | grep -c . || true)
+    if [ "${n:-0}" -gt "$keep" ]; then
+      printf "%s\n" "$cand" | tail -n +$((keep + 1)) | while IFS= read -r d; do
+        [ -n "$d" ] && rm -rf -- "$d"
+      done
+      echo "__pruned_versions $n"
+    fi
+
+    c=$(ls -1t "$root/cache/$m-"*.tar.gz 2>/dev/null | wc -l)
+    if [ "${c:-0}" -gt "$keep" ]; then
+      ls -1t "$root/cache/$m-"*.tar.gz 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm -f --
+      echo "__pruned_cache $c"
+    fi
+  ' _ "$root" "$m" "$keep" | while IFS=' ' read -r tag n; do
+    case "$tag" in
+      __pruned_versions) log "[$m] 清理已装版本目录：$n 个，保留最近 $keep 个（current 及其指向不参与）" ;;
+      __pruned_cache)    log "[$m] 清理安装包缓存：$n 个，保留最近 $keep 个" ;;
+    esac
+  done
 }
 
 fast_agent_local() {
