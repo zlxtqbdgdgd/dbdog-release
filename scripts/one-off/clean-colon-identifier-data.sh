@@ -19,6 +19,13 @@
 # 顺序铁律：**先换模板 + 重启 agent，再跑本脚本**。反过来会先删完、agent 又按旧模板写回来。
 # **多主机注意**：每台被采集的 DB 主机都要先切完。漏掉一台就会把那台的当前数据当历史删掉，
 # 且它立刻按旧模板写回来（2026-08-06 干跑即撞上：GaussDB 那台还没切，占 22864 行）。
+# **写入侧不止 agent（2026-08-16 补）**：profiling 面的写入者是 ddprof 的 systemd 单元
+# （`-T database_instance:<v>`，见 dbdog-agent/dbdog-deploy/systemd/dbdog-profiled-*.service），
+# 与 DBM 的 conf.d 模板是两套东西。08-06 只切了 agent 模板、漏了这些单元，于是 profiles /
+# profile_metrics 的冒号行删掉后立刻被 ddprof 写回来——直到 08-16 才被发现（agent 拿
+# find_dbdog_database_instances 的横线标识查 profiling 面 0 行，误判「本实例无 profiling 数据」）。
+# 跑本脚本前先确认这些单元已换成横线形并重部署：
+#   sh dbdog-agent/dbdog-deploy/scripts/test-profiling-instance-identifier.sh
 #
 # ── 2026-08-07 重写：原版漏了四类地方，报「全部为 0」时其实还剩约 5800 万行 ──────────
 # 原版只找「列名叫 instance 的 MergeTree 表」+ 手工特判 events，于是漏掉：

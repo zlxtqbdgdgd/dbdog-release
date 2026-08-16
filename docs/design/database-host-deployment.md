@@ -191,7 +191,11 @@ Agent 同一版本的多架构产物必须来自同一组 Agent/Agent Core 源�
 - `env` 与 DBM 一致；
 - `version` 为目标数据库真实版本；
 - `instance:<port>`；
-- `database_instance:<agent_hostname>:<port>`；
+- `database_instance:<agent_hostname>-<port>`——**必须与 DBM 面 `database_identifier.template`
+  逐字同形（横线，非冒号）**。两面对不上时，agent 拿 `find_dbdog_database_instances` 发出的
+  标识去查 profiles 表会 0 行，从而误判「本实例没有 profiling 数据」并放弃火焰图
+  （2026-08-16 订正：本条原写成冒号形，与 08-06 的 DBM 侧换代脱节，现网 ddprof 单元
+  据此写错了三个引擎的标识）；
 - 引擎专属 build 标识。
 
 上传周期显式固定，不依赖 ddprof 新版本的默认值。
