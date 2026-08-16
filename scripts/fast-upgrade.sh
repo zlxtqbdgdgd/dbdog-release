@@ -42,6 +42,60 @@ as_stack_user() { # <cmd...>；构建与栈安装都以栈属主身份执行
   runuser -u "$STACK_USER" -- env HOME="/home/$STACK_USER" "$@"
 }
 
+# 同模块串行：两个会话同时部署同一模块会互相拆台。
+#
+# 构建目录按模块固定在 $BUILD_WORK/<模块>，而每份配方开头都是
+# `rm -rf "$WORK/pkg" "$WORK/src"` 后重新 clone——两个同模块的快升级并行时，
+# 后到者的 rm -rf 会把先到者正在用的检出直接删掉，症状全是「文件凭空消失」，
+# 且报错点离真凶很远。2026-08-16 一天内被三个会话独立撞到：
+#   - npm ci 解包时 dbdog-web/src/package.json ENOENT
+#   - next build 收尾时 .next/required-server-files.json ENOENT
+#   - rm -rf node_modules 报 Directory not empty（rm 删条目的同时对方在建新条目）
+#   - node_modules/tsx/.../esbuild ENOENT
+# 结果都是**构建失败**而非静默出错包（发不出坏版本），但每次都要花时间排查一圈、
+# 再靠人工 rm -rf 构建目录重跑才恢复。
+#
+# 互斥粒度取「模块」：同模块串行，不同模块的 $WORK/源仓/产物互不相交，仍可并行。
+# 锁加在 root 这一层（fast-upgrade.sh 本身只能以 root 跑），持有整个模块区段——
+# 从 ff_repo 拉源仓一直到 upgrade.sh 装完，中间的 runuser 子进程都在保护范围内。
+# 拿不到锁时**等待**而不是抢：抢等于把今天这四种怪错重新制造一遍。
+# 等待上限 FAST_UPGRADE_LOCK_WAIT 秒（默认 1200 = 20 分钟），超时报错退出而非硬闯。
+LOCK_WAIT="${FAST_UPGRADE_LOCK_WAIT:-1200}"
+
+with_module_lock() { # <模块> <cmd...>
+  local m="$1"; shift
+  local lockfile="$BUILD_WORK/$m.lock"
+  # 目录/锁文件都以栈属主建：$BUILD_WORK 归 dbdog，root 在里面留 root:root 的东西
+  # 会让后续以栈属主跑的步骤莫名其妙地写不进去（本仓已有先例）。
+  as_stack_user mkdir -p "$BUILD_WORK"
+  [ -e "$lockfile" ] || as_stack_user touch "$lockfile"
+  # 用固定 fd 9（本脚本内未占用）：exec 打开的数字 fd 必然被 flock(1) 继承。
+  # 中途 die/被杀也不会漏锁——进程一退出内核就释放。
+  exec 9>>"$lockfile"
+  if ! flock -n 9; then
+    log "[$m] 另一部署正在进行中（$(head -n1 "$lockfile" 2>/dev/null || echo '持有者未知')），等待…（最多 $((LOCK_WAIT / 60)) 分钟）"
+    flock -w "$LOCK_WAIT" 9 \
+      || die "[$m] 等锁超时 ${LOCK_WAIT}s，另一部署仍未结束。别手工删 $lockfile 硬闯——先确认对方进程已结束再重试（或调大 FAST_UPGRADE_LOCK_WAIT）"
+    log "[$m] 已拿到锁，继续"
+  fi
+  printf 'pid=%s 模块=%s 起始=%s\n' "$$" "$m" "$(date -u +%FT%TZ)" >"$lockfile"
+  # `9>&-` 不是可有可无的收尾——它是这把锁能不能用的关键。
+  #
+  # flock 锁跟的是「打开的文件描述」，只要还有**任何**进程持着这个 fd，锁就不放。
+  # 而快升级的收尾正是 upgrade.sh 起服务，服务由调用方直接拉起（不是交给 systemd 重新
+  # fork），于是 next-server 会把 fd 9 一路继承下去、跟着服务常驻——锁就再也回不来了。
+  # 2026-08-16 首版实现就是这么栽的：第一次部署好好的，第二次卡满 20 分钟等锁超时，
+  # 查 /proc/<web pid>/fd/9 才看见指着 dbdog-web.lock 的正是刚被自己拉起来的 web 服务。
+  # 相当于每次部署都给下一次埋一颗雷，比原来没有锁更糟。
+  #
+  # 这里给临界区整体加 `9>&-`：fd 只在本脚本进程里留着（锁照持），子孙进程一律看不到它。
+  # 与本仓 seal/omnibus 那几处 `flock -o`（--close）是同一条经验，只是换成 bash 原生写法。
+  # 代价：本进程若被 SIGKILL，锁立刻释放，而它拉起的构建子进程可能还在跑——
+  # 但那是「极小概率下退回到今天之前的行为」，远好于「服务一起就永久占锁」。
+  "$@" 9>&-
+  exec 9>&-   # 一次只锁一个模块：多模块快升级要先放掉上一个才能锁下一个
+}
+
 ff_repo() { # <仓目录>；fast-forward 到 origin/main，输出全长 sha
   as_stack_user git -C "$1" fetch -q origin
   as_stack_user git -C "$1" merge -q --ff-only origin/main \
@@ -73,6 +127,13 @@ fast_stack_one() { # <模块>
   recipe="$(compose_recipe_includes "$recipe" "$SCRIPTS_DIR/publish/recipes" "$BUILD_WORK/.recipes")"
   local arch=aarch64
   [ "$m" != dbdog-mcp ] || arch=noarch
+  # 这里**不**再额外强制清 $BUILD_WORK/$m：三份栈配方开头都已经是
+  # `rm -rf "$WORK/pkg" "$WORK/src"` 再重新 clone，本来就是全量重建（npm/cargo 缓存在
+  # $HOME 下，不在 $WORK 里，清了也不会变慢）。2026-08-16 那几次要人工 rm -rf 才能恢复，
+  # 是因为并发下**配方自己的 rm -rf 被对方的写入撞失败**（Directory not empty）——
+  # 残留是并发的产物而不是独立故障源，串行之后配方自带的清理就够了。
+  # 反过来若在这里 rm -rf 整个 $WORK，会连 out/ 的产物和 next-build.log 一起删掉，
+  # 而那正是构建失败时要看的东西（见 prune_build_out 的注释）。
   log "[$m] 出包 $version（源 $short，与正式发布同 recipe）"
   out="$(as_stack_user env MODULE="$m" VERSION="$version" SHA="$sha" CORE_SHA="" \
       ARCH="$arch" REPO_ROOT="$REPO_ROOT" BUILD_WORK="$BUILD_WORK" TOOL_PATH="$TOOL_PATH" \
@@ -312,7 +373,10 @@ declare -a stack=()
 for m in "$@"; do
   case "$m" in
     dbdog-agent) want_agent=1 ;;
-    *) stack+=("$m") ;;
+    # 模块名在**取锁之前**先验白名单：否则一个拼错的模块名会先在 $BUILD_WORK 里
+    # 留下一个 <错名>.lock 再报错。（fast_stack_one 里那份同样的判断保留，它是函数自己的契约。）
+    dbdog-server | dbdog-web | dbdog-mcp) stack+=("$m") ;;
+    *) die "快升级不支持模块: $m（栈仅 dbdog-server/dbdog-web/dbdog-mcp；三方件走正式发布）" ;;
   esac
 done
 if [ "$want_agent" -eq 1 ] && [ "${#stack[@]}" -gt 0 ]; then
@@ -320,10 +384,10 @@ if [ "$want_agent" -eq 1 ] && [ "${#stack[@]}" -gt 0 ]; then
 fi
 
 if [ "$want_agent" -eq 1 ]; then
-  fast_agent_local
+  with_module_lock dbdog-agent fast_agent_local
 else
   for m in "${stack[@]}"; do
-    fast_stack_one "$m"
+    with_module_lock "$m" fast_stack_one "$m"
   done
 fi
 log "快升级完成: $*"
