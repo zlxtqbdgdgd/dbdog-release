@@ -263,6 +263,18 @@ seal 对 `bazel-repository-expanded` 这一类按 `storage=cache-reference` 封�
   工作区目录已不存在的，bazel 永不再用。删前 `chmod -R u+w`（bazel 把 output 目录设成只读）。
   2026-08-11 这两项合计释放了约 39G。
 - `xdg/` 整层不在 seal 覆盖范围内（封存的路径前缀里没有它）。
+- `~/dbdog/cache/`（运行时下载缓存）是**栈模块快升级每装一次攒一个包、从不回收**的目录：
+  2026-08-15 实测 454 个包 / 14G，而在跑的只有 3 个版本。它与 `dbdog-release-build/<模块>/out/`
+  是两处独立积压，后者已由 `fast-upgrade.sh` 自动保留最近 5 个（2026-08-13 补），**前者至今无人回收**。
+  清理判据：每模块留最近 5 个 + `modules/<模块>/current` 指向的在跑版本必留；删掉只影响
+  「回滚到老版本能否免构建直装」，不影响运行中的服务（modules/ 下是解包实体，不依赖缓存包）。
+
+**盘满对栈模块的杀伤是隐蔽的**（2026-08-15 实测）：`/home/dbdog` 剩 2.7G 时跑
+`fast-upgrade.sh dbdog-web`，npm 装依赖会**静默装残**，构建走到最后一步才报
+`Cannot find module 'next/dist/server/route-modules/app-page/module.compiled'`——
+报错指向 next 内部模块，读起来像依赖版本问题或 next 自身 bug，与磁盘毫无字面关联，
+且此前 54 个页面全部编译成功、只死在 collect-build-traces，更像偶发。
+**判据**：栈模块构建报任何 `MODULE_NOT_FOUND`，先 `df -h /home/dbdog`，别先去查 next/npm。
 
 ## 发布域 vs 编译域
 

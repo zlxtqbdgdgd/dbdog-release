@@ -131,5 +131,7 @@ x86 靶机没有慢升级（发布物只出 arm）；它的 agent 只有「部�
   正式发布路径当场断掉。恢复与重新封存 SOP 见 `scripts/publish/agent-build/README.md`
   的「seal 是活目录」一节。
 - 构建机 `/` 与 `/home/dbdog` 是**两块盘**，`df /home` 看的是前者；真正的约束是
-  `df -h /home/dbdog`（长期 95%+ 满）。可安全清理的对象同上文档。
+  `df -h /home/dbdog`（长期 95%+ 满）。可安全清理的对象同上文档。**盘满会让栈模块快升级
+  以 `MODULE_NOT_FOUND`（npm 静默装残）失败，报错完全不提磁盘**——构建报缺模块先查磁盘，
+  别去查 next/npm 版本（2026-08-15 实测踩过；同文档「盘满对栈模块的杀伤」段）。
 - 中途退出检查 `git status`；保留用户的 `.codex/`、`bugs/` 与无关工作树修改。
