@@ -36,7 +36,12 @@ AGENT_HEALTH_WAIT_REASON="not-started"
 
 usage() {
   cat <<'EOF'
-用法：sudo ./scripts/agent-install.sh
+用法：sudo ./scripts/agent-install.sh [--host-only]
+
+--host-only    通用主机模式：跳过数据库引擎发现与密码验收、不渲染引擎 check，只装
+               主机基线（cpu/disk/file_handle/io/load/memory/network/system_core/uptime
+               九项系统 check + process.d + 日志能力 + 四 systemd 服务）。数据库引擎
+               接入事后由本脚本（不带 --host-only）或 upgrade.sh dbdog-agent 交互式补装。
 
 首次安装需要两个外部值；可通过环境变量传入，终端执行时缺失项会安全提示输入：
   DBDOG_SERVER_URL                       dbdog-server origin，例如 http://10.0.0.8:8080
@@ -246,19 +251,21 @@ resolve_inputs() {
 
   prompt_value DBDOG_SERVER_URL "dbdog-server 地址（如 http://10.0.0.8:8080）" 0
   prompt_value DBDOG_API_KEY "dbdog-web 签发的 Agent ingest key" 1
-  if [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
-    DBDOG_GAUSSDB_MONITOR_PASSWORD="$(agent_generate_gaussdb_password)" || \
-      die "无法生成 GaussDB 监控用户随机密码"
-    log "已生成 GaussDB dbdog 监控用户随机密码（只写入 root 0600 配置）"
-  fi
 
   DBDOG_SERVER_URL="$(agent_validate_server_url "$DBDOG_SERVER_URL")"
   agent_require_single_line DBDOG_API_KEY "$DBDOG_API_KEY"
-  agent_require_single_line DBDOG_GAUSSDB_MONITOR_PASSWORD "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
   [ -n "$DBDOG_API_KEY" ] || die "DBDOG_API_KEY 不能为空"
-  [ -n "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ] || die "GaussDB 监控密码不能为空"
-  agent_validate_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
-    die "GaussDB 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类"
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
+    if [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
+      DBDOG_GAUSSDB_MONITOR_PASSWORD="$(agent_generate_gaussdb_password)" || \
+        die "无法生成 GaussDB 监控用户随机密码"
+      log "已生成 GaussDB dbdog 监控用户随机密码（只写入 root 0600 配置）"
+    fi
+    agent_require_single_line DBDOG_GAUSSDB_MONITOR_PASSWORD "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
+    [ -n "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ] || die "GaussDB 监控密码不能为空"
+    agent_validate_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
+      die "GaussDB 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类"
+  fi
   case "$DBDOG_API_KEY" in *[!A-Za-z0-9._-]*) die "DBDOG_API_KEY 含不支持的字符" ;; esac
 
   agent_require_single_line DBDOG_OPENGAUSS_MONITOR_PASSWORD "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}"
@@ -1710,6 +1717,7 @@ main() {
   case "${1:-}" in
     "") ;;
     -h | --help) usage; return 0 ;;
+    --host-only) AGENT_HOST_ONLY=1 ;;
     *) usage >&2; die "不支持的参数: $1" ;;
   esac
   [ "$#" -le 1 ] || { usage >&2; die "参数过多"; }
@@ -1735,31 +1743,39 @@ main() {
   prepare_runtime "$package" "$version" "$sha256"
 
   resolve_inputs
-  old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
-  AGENT_EXISTING_GAUSS_CONFIG="$old_gauss"
-  export AGENT_EXISTING_GAUSS_CONFIG
-  # 零 gaussdb 进程不再直接 die：openGauss 主进程同名会进 gauss 检测链（随后分类分流），
-  # 纯 PostgreSQL 主机则由 agent_detect_postgres 兜住；「一个受支持引擎都没有」才是硬失败。
-  AGENT_GAUSS_ALLOW_NONE=1
-  agent_detect_gaussdb
-  agent_detect_postgres
-  agent_classify_gauss_engines
-  agent_assemble_engine_credentials
-  [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
-    die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"
-  [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || \
-    log "发现 GaussDB 端口: ${AGENT_GAUSSDB_RENDER_PORTS[*]}（日志: ${AGENT_GAUSS_LOG_GLOBS[*]-}）"
-  [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || \
-    log "发现 openGauss 端口: ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（日志: ${AGENT_OPENGAUSS_LOG_GLOBS[*]-}）"
-  [ -z "${AGENT_PG_PORTS[*]-}" ] || \
-    log "发现 PostgreSQL 端口: ${AGENT_PG_PORTS[*]}（日志: ${AGENT_PG_LOG_GLOBS[*]-}）"
+  if [ "${AGENT_HOST_ONLY:-0}" = 1 ]; then
+    # host-only：不做引擎探测/密码验收/DBM 对象，事实数组清空让渲染自然退化为纯主机基线。
+    agent_clear_engine_facts
+    log "--host-only：跳过数据库引擎发现与密码验收，仅安装主机基线"
+  else
+    old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
+    AGENT_EXISTING_GAUSS_CONFIG="$old_gauss"
+    export AGENT_EXISTING_GAUSS_CONFIG
+    # 零 gaussdb 进程不再直接 die：openGauss 主进程同名会进 gauss 检测链（随后分类分流），
+    # 纯 PostgreSQL 主机则由 agent_detect_postgres 兜住；「一个受支持引擎都没有」才是硬失败。
+    AGENT_GAUSS_ALLOW_NONE=1
+    agent_detect_gaussdb
+    agent_detect_postgres
+    agent_classify_gauss_engines
+    agent_assemble_engine_credentials
+    [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
+      die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"
+    [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || \
+      log "发现 GaussDB 端口: ${AGENT_GAUSSDB_RENDER_PORTS[*]}（日志: ${AGENT_GAUSS_LOG_GLOBS[*]-}）"
+    [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || \
+      log "发现 openGauss 端口: ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（日志: ${AGENT_OPENGAUSS_LOG_GLOBS[*]-}）"
+    [ -z "${AGENT_PG_PORTS[*]-}" ] || \
+      log "发现 PostgreSQL 端口: ${AGENT_PG_PORTS[*]}（日志: ${AGENT_PG_LOG_GLOBS[*]-}）"
+  fi
   fetch_server_bootstrap
   preflight_gaussdb_clients
   render_install_state
   cutover
-  install_dbm_init_scripts
-  agent_require_probe_credentials
-  bootstrap_gaussdb_monitoring
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
+    install_dbm_init_scripts
+    agent_require_probe_credentials
+    bootstrap_gaussdb_monitoring
+  fi
   start_and_verify
 
   # marker 是事务提交记录。屏蔽可捕获信号覆盖“原子写入 → 提交内存状态”的极短窗口：
@@ -1777,11 +1793,20 @@ main() {
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || enabled_engines="GaussDB"
   [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}openGauss"
   [ -z "${AGENT_PG_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}PostgreSQL"
-  log "已启用：${enabled_engines} DBM（含 database_autodiscovery）、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
+  if [ "${AGENT_HOST_ONLY:-0}" = 1 ]; then
+    log "已启用：主机基线（九项系统 check、process.d、日志、Live Processes、NPM/USM、APM/OpenLineage、Remote Config）"
+    log "数据库引擎接入（DBM）是第二步：在本机 dbdog-release 仓执行 sudo ./scripts/upgrade.sh dbdog-agent 交互选择实例"
+  else
+    log "已启用：${enabled_engines} DBM（含 database_autodiscovery）、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
+  fi
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"
   log "日常状态: systemctl status dbdog-agent dbdog-agent-process dbdog-agent-trace dbdog-agent-sysprobe"
-  log "一键诊断: sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent"
+  if [ "${AGENT_HOST_ONLY:-0}" = 1 ]; then
+    log "一键诊断: 在 dbdog-release 仓执行 sudo ./scripts/dbdogctl diagnose dbdog-agent（一行安装未落仓脚本）"
+  else
+    log "一键诊断: sudo ${SCRIPT_DIR}/dbdogctl diagnose dbdog-agent"
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

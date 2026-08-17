@@ -454,7 +454,7 @@ done
   fail "私有部署没有显式关闭 Agent/APM 公网遥测"
 grep -A1 '^agent_telemetry:' "$CONF/datadog.yaml" | grep -Fq 'enabled: false' || \
   fail "Agent instrumentation telemetry 仍会访问 Datadog 公网"
-grep -A6 '^apm_config:' "$CONF/datadog.yaml" | grep -A1 'telemetry:' | \
+grep -A12 '^apm_config:' "$CONF/datadog.yaml" | grep -A1 'telemetry:' | \
   grep -Fq 'enabled: false' || fail "APM telemetry 仍会访问 Datadog 公网"
 grep -Fq 'network_config:' "$CONF/system-probe.yaml" || fail "NPM 未启用"
 grep -Fq 'service_monitoring_config:' "$CONF/system-probe.yaml" || fail "USM 未启用"
@@ -1571,4 +1571,60 @@ case "$manifest_agent_ver" in
     ;;
 esac
 
-printf 'ALL PASS: 26 agent install contract groups\n'
+# ---- host-only 模式（通用主机 agent）----
+
+# 27. host-only 渲染：清空引擎事实后渲染成功，产出纯主机基线。
+HOSTONLY_CONF="$TEST_ROOT/hostonly-conf"
+mkdir -p "$HOSTONLY_CONF/conf.d"
+AGENT_HOST_ONLY=1
+agent_clear_engine_facts
+agent_render_checks "$HOSTONLY_CONF/conf.d" "" dbdog postgres prod
+AGENT_HOST_ONLY=0
+for sys_check in cpu disk file_handle io load memory network system_core uptime; do
+  [ -f "$HOSTONLY_CONF/conf.d/$sys_check.d/conf.yaml" ] || \
+    fail "host-only 缺系统 check: $sys_check"
+done
+[ -f "$HOSTONLY_CONF/conf.d/process.d/conf.yaml" ] || fail "host-only 缺 process.d"
+grep -q 'search_string' "$HOSTONLY_CONF/conf.d/process.d/conf.yaml" && \
+  fail "host-only 的 process.d 不应包含引擎进程条目"
+for engine_dir in gaussdb opengauss postgres; do
+  [ ! -e "$HOSTONLY_CONF/conf.d/$engine_dir.d" ] || \
+    fail "host-only 不应渲染引擎目录: $engine_dir"
+done
+pass "host-only 渲染产出九项系统 check + 无引擎条目的 process.d，无引擎 conf"
+
+# 28. 默认模式 fail closed：无引擎事实且未设 host-only 必须拒绝渲染。
+# 注：die() 是 exit 1，会终止本测试进程，必须在子 shell 里跑。
+if (AGENT_HOST_ONLY=0 agent_render_checks "$TEST_ROOT/hostonly-refuse/conf.d" "" dbdog postgres prod \
+    >"$TEST_ROOT/hostonly-refuse.out" 2>"$TEST_ROOT/hostonly-refuse.err"); then
+  fail "无引擎事实且未设 AGENT_HOST_ONLY 时渲染不应成功"
+fi
+grep -Fq "没有可渲染的数据库实例" "$TEST_ROOT/hostonly-refuse.err" || \
+  fail "默认模式拒绝文案缺「没有可渲染的数据库实例」"
+pass "默认模式无引擎事实仍 fail closed"
+
+# 29. 清单同步：agent-lib 的 CONTRACT_FILES 与 server 配方 staging 清单必须同源同刻。
+RECIPE="$SCRIPTS_DIR/publish/recipes/dbdog-server.sh"
+recipe_stage_pattern="$(grep -c 'AGENT_INSTALLER_CONTRACT_FILES' "$RECIPE" || true)"
+[ "$recipe_stage_pattern" -ge 2 ] || \
+  fail "server 配方未通过 AGENT_INSTALLER_CONTRACT_FILES 消费同一份清单（staging+指纹两处）"
+grep -Fq 'bootstrap.sh' "$RECIPE" || fail "server 配方未 staging bootstrap.sh"
+pass "server 配方从 AGENT_INSTALLER_CONTRACT_FILES 单源 staging 且包含 bootstrap.sh"
+
+# 30. bootstrap 契约：先验后执行、key 预验、host-only 转调、清单解析不硬编码。
+BOOTSTRAP="$SCRIPTS_DIR/bootstrap.sh"
+[ -f "$BOOTSTRAP" ] || fail "缺 bootstrap.sh"
+grep -q 'sha256sum -c' "$BOOTSTRAP" || fail "bootstrap 缺指纹校验（sha256sum -c）"
+grep -Fq '/api/v1/validate' "$BOOTSTRAP" || fail "bootstrap 缺 key 预验"
+grep -Fq -- '--host-only' "$BOOTSTRAP" || fail "bootstrap 未转调 agent-install.sh --host-only"
+grep -q "awk '{print \$2}'" "$BOOTSTRAP" || \
+  fail "bootstrap 文件清单必须从 sha256s 解析而非硬编码"
+grep -Eq 'sudo -E env' "$BOOTSTRAP" || fail "bootstrap 缺非 root 自提升（显式 env 传递）"
+pass "bootstrap 先验后执行 + key 预验 + 清单单源 + root 自提升齐备"
+
+# 31. upgrade.sh 透传：仅允许附加 --host-only，其余多参拒绝。
+grep -Fq 'exec "$SCRIPTS_DIR/agent-install.sh" ${2:+--host-only}' "$SCRIPTS_DIR/upgrade.sh" || \
+  fail "upgrade.sh 缺 --host-only 透传"
+pass "upgrade.sh dbdog-agent --host-only 透传正确"
+
+printf 'ALL PASS: 31 agent install contract groups\n'

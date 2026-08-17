@@ -4,6 +4,7 @@
 #   upgrade.sh                 # 升级所有「已安装且版本/产物 SHA 与 manifest 不同」的 stack 模块
 #   upgrade.sh <模块>...       # 升级/安装指定模块（未装的也会装，但不负责初始化配置）
 #   upgrade.sh dbdog-agent     # DB 主机上的 Agent 首装/升级（含配置、数据库准备和验收）
+#   upgrade.sh dbdog-agent --host-only  # 通用主机模式（仅主机基线，不接数据库引擎）
 # 回滚：把 current 恢复为升级前 readlink 记录的目标后重启；旧身份目录不会自动删除。
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -473,8 +474,9 @@ fi
 # 直接 exec 同一份首装/升级实现，避免先创建 stack 布局，也避免维护第二套 cutover。
 for requested in "$@"; do
   if [ "$requested" = dbdog-agent ]; then
-    [ "$#" -eq 1 ] || die "dbdog-agent 位于 DB 主机，不能与 stack 模块混合升级"
-    exec "$SCRIPTS_DIR/agent-install.sh"
+    [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = "--host-only" ]; } || \
+      die "dbdog-agent 位于 DB 主机，不能与 stack 模块混合升级；仅支持附加 --host-only"
+    exec "$SCRIPTS_DIR/agent-install.sh" ${2:+--host-only}
   fi
 done
 
