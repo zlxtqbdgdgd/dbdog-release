@@ -1641,6 +1641,27 @@ grep -Fq 'exec bash "$tmp/agent-install.sh"' <<<"$auto_block" || \
   fail "bootstrap auto 分支必须不带 --host-only 直接 exec 安装器"
 pass "bootstrap DBDOG_INSTALL_MODE 分流（host 缺省不变 / auto 完整安装）"
 
+# 31b. 引擎白名单 DBDOG_ENGINES：设置后名单外引擎探测结果清空并大声记日志；
+#      不设置 = 不过滤零影响；白名单内无实例 fail closed；非法值 die。
+grep -Fq 'agent_apply_engine_allowlist' "$INSTALL_SCRIPT" || \
+  fail "安装器缺 agent_apply_engine_allowlist 白名单过滤"
+grep -Fq 'agent_classify_gauss_engines
+    agent_apply_engine_allowlist
+    agent_assemble_engine_credentials' "$INSTALL_SCRIPT" || \
+  fail "白名单过滤必须在 classify 之后、凭证装配之前（否则分类/收割做无用功）"
+ALLOWLIST_FN="$(awk '/^agent_apply_engine_allowlist\(\)/{f=1} f{print} f&&/^}/{exit}' "$INSTALL_SCRIPT")"
+grep -Fq '[ -z "${DBDOG_ENGINES:-}" ] && return 0' <<<"$ALLOWLIST_FN" || \
+  fail "白名单函数缺省必须直接 return（不过滤=零影响）"
+grep -Fq '显式跳过 PostgreSQL 端口' <<<"$ALLOWLIST_FN" || fail "白名单跳过须大声记日志（不允许静默缺口）"
+grep -Fq '显式跳过 openGauss 端口' <<<"$ALLOWLIST_FN" || fail "白名单跳过 og 须记日志"
+grep -Fq '显式跳过 GaussDB 端口' <<<"$ALLOWLIST_FN" || fail "白名单跳过 gauss 须记日志"
+grep -Fq '内未发现任何运行中的数据库实例' <<<"$ALLOWLIST_FN" || \
+  fail "白名单内无实例必须 fail closed"
+grep -Fq 'DBDOG_ENGINES 含未知引擎' "$INSTALL_SCRIPT" || fail "白名单非法值须 die（postgres/opengauss/gaussdb）"
+grep -Fq 'DBDOG_ENGINES="${DBDOG_ENGINES:-}"' "$BOOTSTRAP" || \
+  fail "bootstrap sudo re-exec 未透传 DBDOG_ENGINES"
+pass "安装器 DBDOG_ENGINES 白名单（缺省零影响/跳过记日志/空名单 fail closed）"
+
 # 31. upgrade.sh 透传：仅允许附加 --host-only，其余多参拒绝。
 grep -Fq 'exec "$SCRIPTS_DIR/agent-install.sh" ${2:+--host-only}' "$SCRIPTS_DIR/upgrade.sh" || \
   fail "upgrade.sh 缺 --host-only 透传"
