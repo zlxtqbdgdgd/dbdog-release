@@ -824,7 +824,10 @@ agent_detect_postgres() {
         gsub(/^'\''|'\''$/, ""); split($0, first, ","); print first[1]; exit
       }
     ' "$data/postgresql.conf" 2>/dev/null || true)"
-    [ -n "$socket" ] && [ -d "$socket" ] || socket=""
+    # conf 里注释掉该行时（默认 /tmp,ecs-f82e 实测形态）按 PG 默认兜底——空着会让
+    # 建号链退回 psql 自身默认,和这里殊途同归,但显式记录事实让 die 时的报错可读。
+    [ -n "$socket" ] || socket="/tmp"
+    [ -d "$socket" ] || socket=""
     AGENT_PG_PID_SOCKETS+=("${socket:-}")
     logdir="$(awk '
       /^[[:space:]]*#/ { next }

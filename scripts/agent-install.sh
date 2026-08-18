@@ -61,6 +61,8 @@ usage() {
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
   DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（缺用户时安装器建号用同一密码；
                                          升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_POSTGRES_SUPER_PASSWORD          PostgreSQL 超管密码（仅安装期建号链用：HBA local 行
+                                         非 peer 的主机走 127.0.0.1 TCP 认证;不落盘不进日志）
   DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb）；
                                          设置后只探测并渲染名单内引擎，名单外实例显式跳过并记日志。
                                          不设置 = 现状全引擎探测（upgrade.sh 与历史行为零变化）。
@@ -591,24 +593,60 @@ agent_require_probe_credentials() {
   done
 }
 
-agent_pg_admin_psql() { # <实例索引> [psql 参数...]；以 postgres 进程属主经本地 socket 跑 psql
-  # 管理员连接不碰任何密码：root runuser 转成 PG 进程的 OS 属主，走 socket peer 认证。
+agent_pg_admin_psql() { # <实例索引> [psql 参数...]；管理员连接跑 psql
+  # 两条认证路径,按可用性自动选:
+  #  ① socket peer(root runuser 转 postgres 进程属主,零密码)——HBA local 行是
+  #    peer/trust 的主机(源码装/多数发行版默认)。
+  #  ② 127.0.0.1 TCP + 超管密码(DBDOG_POSTGRES_SUPER_PASSWORD 经 0600 pgpass
+  #    文件)——HBA local 行是 scram 的主机(ecs-f82e 形态:local all all
+  #    scram-sha-256,peer 根本不会被匹配,socket 兜底也过不去)。未提供超管
+  #    密码且 peer 不可用时 die 指路。
   # psql 直接取自实例自己的 bin（探测时从 postmaster exe 推导），不存在 PATH 漂移。
   # psql 路径在函数内解析——调用方若传 "$arr[$idx]"（引号内不展开数组）会得到字面量
   # "name[0]"，ecs-f82e 首验实锤；集中在此处取值，调用方只给索引和 psql 参数。
-  local index="$1" owner psql socket port
+  local index="$1" owner psql socket port super_pw pw_file auth_out
   shift
   owner="${AGENT_PG_PID_OWNERS[$index]}"
   psql="${AGENT_PG_PID_PSQLS[$index]}"
   socket="${AGENT_PG_PID_SOCKETS[$index]:-}"
   port="${AGENT_PG_PORTS[$index]}"
+  super_pw="${DBDOG_POSTGRES_SUPER_PASSWORD:-}"
   [ -n "$owner" ] || die "无法从 postgres 进程确定运行用户（实例 127.0.0.1:${port}）"
   [ -x "$psql" ] || die "目标 PostgreSQL 没有可用 psql: ${psql:-<探测期未从 postmaster exe 推导出>}（实例 127.0.0.1:${port}）"
-  runuser -u "$owner" -- env -i \
-    HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
-    PGPORT="$port" PGCONNECT_TIMEOUT=8 \
-    ${socket:+PGHOST="$socket"} \
-    PATH="$(dirname "$psql"):/usr/bin:/bin" "$psql" "$@"
+
+  # 先试 socket peer（零凭证,最优）;失败且有超管密码则走 TCP scram,再失败才 die。
+  auth_out="$WORK_DIR/pg-admin-auth.$index.out"
+  if [ -n "$socket" ] && runuser -u "$owner" -- env -i \
+      HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
+      PGPORT="$port" PGCONNECT_TIMEOUT=8 PGHOST="$socket" \
+      PATH="$(dirname "$psql"):/usr/bin:/bin" \
+      "$psql" -X -q -A -t -d postgres -c 'SELECT 1;' >"$auth_out" 2>&1; then
+    runuser -u "$owner" -- env -i \
+      HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
+      PGPORT="$port" PGCONNECT_TIMEOUT=8 PGHOST="$socket" \
+      PATH="$(dirname "$psql"):/usr/bin:/bin" "$psql" "$@"
+    return
+  fi
+
+  [ -n "$super_pw" ] || { agent_show_preflight_error "$auth_out" \
+    "无法经本地 socket peer 认证连接 PostgreSQL（实例 127.0.0.1:${port}；HBA local 行可能非 peer）。请 export DBDOG_POSTGRES_SUPER_PASSWORD（PG 超管密码,仅安装期建号用,不落盘）后重跑"; }
+  # 超管密码走 0600 pgpass 文件，不进 argv/环境赋值（凭证卫生与 GaussDB 建号链同口径）。
+  pw_file="$WORK_DIR/pg-super-pw.$index"
+  printf '127.0.0.1:%s:*:postgres:%s\n' "$port" "$super_pw" >"$pw_file" || return 1
+  chmod 0600 "$pw_file" || return 1
+  if ! env -i HOME="/" LC_ALL=C PATH="$(dirname "$psql"):/usr/bin:/bin" \
+      PGHOST=127.0.0.1 PGPORT="$port" PGCONNECT_TIMEOUT=8 \
+      PGPASSFILE="$pw_file" \
+      "$psql" -X -q -A -t -U postgres -d postgres -c 'SELECT 1;' >"$auth_out" 2>&1; then
+    rm -f -- "$pw_file"
+    agent_show_preflight_error "$auth_out" \
+      "PostgreSQL 超管密码无效或 127.0.0.1 TCP 认证失败（实例 127.0.0.1:${port}）；请核对 DBDOG_POSTGRES_SUPER_PASSWORD 与 pg_hba"
+  fi
+  env -i HOME="/" LC_ALL=C PATH="$(dirname "$psql"):/usr/bin:/bin" \
+    PGHOST=127.0.0.1 PGPORT="$port" PGCONNECT_TIMEOUT=8 \
+    PGPASSFILE="$pw_file" \
+    "$psql" -X -U postgres "$@"
+  rm -f -- "$pw_file"
 }
 
 agent_pg_role_exists() { # <实例索引>；输出 1/0
