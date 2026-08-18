@@ -591,9 +591,11 @@ agent_require_probe_credentials() {
   done
 }
 
-agent_pg_admin_exec() { # <实例索引> <命令> [参数...]；以 postgres 进程属主经本地 socket 管理员连接
+agent_pg_admin_psql() { # <实例索引> [psql 参数...]；以 postgres 进程属主经本地 socket 跑 psql
   # 管理员连接不碰任何密码：root runuser 转成 PG 进程的 OS 属主，走 socket peer 认证。
   # psql 直接取自实例自己的 bin（探测时从 postmaster exe 推导），不存在 PATH 漂移。
+  # psql 路径在函数内解析——调用方若传 "$arr[$idx]"（引号内不展开数组）会得到字面量
+  # "name[0]"，ecs-f82e 首验实锤；集中在此处取值，调用方只给索引和 psql 参数。
   local index="$1" owner psql socket port
   shift
   owner="${AGENT_PG_PID_OWNERS[$index]}"
@@ -601,17 +603,17 @@ agent_pg_admin_exec() { # <实例索引> <命令> [参数...]；以 postgres 进
   socket="${AGENT_PG_PID_SOCKETS[$index]:-}"
   port="${AGENT_PG_PORTS[$index]}"
   [ -n "$owner" ] || die "无法从 postgres 进程确定运行用户（实例 127.0.0.1:${port}）"
-  [ -x "$psql" ] || die "目标 PostgreSQL 没有可用 psql: $psql（实例 127.0.0.1:${port}）"
+  [ -x "$psql" ] || die "目标 PostgreSQL 没有可用 psql: ${psql:-<探测期未从 postmaster exe 推导出>}（实例 127.0.0.1:${port}）"
   runuser -u "$owner" -- env -i \
     HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
     PGPORT="$port" PGCONNECT_TIMEOUT=8 \
     ${socket:+PGHOST="$socket"} \
-    PATH="$(dirname "$psql"):/usr/bin:/bin" "$@"
+    PATH="$(dirname "$psql"):/usr/bin:/bin" "$psql" "$@"
 }
 
 agent_pg_role_exists() { # <实例索引>；输出 1/0
   local out
-  out="$(agent_pg_admin_exec "$1" "$AGENT_PG_PID_PSQLS[$1]" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
+  out="$(agent_pg_admin_psql "$1" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
     -c "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='dbdog') THEN 1 ELSE 0 END;")" || return 1
   printf '%s\n' "$out" | tr -d '[:space:]'
 }
@@ -652,7 +654,7 @@ agent_prepare_pg_user() { # PostgreSQL 建号链：缺了就建（env 密码）�
     esac
     chmod 0600 "$sql_file" || return 1
     out="$WORK_DIR/prepare-pg-user.$index.out"
-    if ! agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -v ON_ERROR_STOP=1 \
+    if ! agent_pg_admin_psql "$index" -X -q -v ON_ERROR_STOP=1 \
       -d postgres -f "$sql_file" >"$out" 2>&1; then
       agent_show_preflight_error "$out" \
         "无法通过本地管理员连接准备 PostgreSQL 监控用户（实例 127.0.0.1:${port}）"
@@ -685,13 +687,13 @@ bootstrap_postgres_monitoring() {
 agent_prepare_pg_instance_dbs() { # <实例索引> <perdb.sql 路径>
   local index="$1" sql="$2" port dbs db out
   port="${AGENT_PG_PORTS[$index]}"
-  dbs="$(agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
+  dbs="$(agent_pg_admin_psql "$index" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
     -c "SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false AND datallowconn ORDER BY datname;")" || \
     die "无法枚举 PostgreSQL 数据库（实例 127.0.0.1:${port}）"
   while IFS= read -r db; do
     [ -n "$db" ] || continue
     out="$WORK_DIR/pg-perdb.${port}.${db}.out"
-    if ! agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -v ON_ERROR_STOP=1 \
+    if ! agent_pg_admin_psql "$index" -X -q -v ON_ERROR_STOP=1 \
       -d "$db" -f "$sql" >"$out" 2>&1; then
       agent_show_preflight_error "$out" \
         "应用 PostgreSQL 每库对象 SQL 失败（实例 127.0.0.1:${port} 数据库 ${db}）"
