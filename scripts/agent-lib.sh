@@ -16,6 +16,20 @@ AGENT_SYSTEMD_UNITS=(
   dbdog-agent-process.service
 )
 
+# Agent 安装器合约文件清单（单源）：指纹函数、发布配方（server /install/* staging）与
+# 契约测试共用这一份，见 test-agent-install-contracts.sh 的清单同步用例。
+AGENT_INSTALLER_CONTRACT_FILES=(
+  lib.sh
+  agent-install.sh
+  agent-lib.sh
+  agent/init-gaussdb-perdb.sql
+  agent/init-dbdog-user-gaussdb-all-databases.sh
+  agent/init-dbdog-user-pg-all-databases.sh
+  agent/init-dbdog-user-pg-perdb.sql
+  agent/init-dbdog-user-opengauss-all-databases.sh
+  agent/init-dbdog-user-opengauss-perdb.sql
+)
+
 # 诊断输出可能来自 journal 或 Agent CLI，两者都不是我们能完全约束的
 # 文本。这里只保留定位所需的错误和时序信息，统一遮掉常见凭证形态。
 agent_redact_diagnostic_stream() {
@@ -57,11 +71,7 @@ agent_sha256_stdin() {
 
 agent_installer_contract_fingerprint() { # <scripts 目录>；覆盖 Agent 专属脚本及其共享 shell 运行库
   local scripts="$1" relative path digest payload=""
-  for relative in lib.sh agent-install.sh agent-lib.sh agent/init-gaussdb-perdb.sql \
-    agent/init-dbdog-user-gaussdb-all-databases.sh \
-    agent/init-dbdog-user-pg-all-databases.sh agent/init-dbdog-user-pg-perdb.sql \
-    agent/init-dbdog-user-opengauss-all-databases.sh \
-    agent/init-dbdog-user-opengauss-perdb.sql; do
+  for relative in "${AGENT_INSTALLER_CONTRACT_FILES[@]}"; do
     path="$scripts/$relative"
     if [ ! -e "$path" ] && [ ! -L "$path" ]; then
       printf 'Agent 安装器合约缺少文件: %s\n' "$path" >&2
@@ -77,6 +87,36 @@ agent_installer_contract_fingerprint() { # <scripts 目录>；覆盖 Agent 专�
     payload+="${relative}:${digest}"$'\n'
   done
   printf '%s' "$payload" | agent_sha256_stdin
+}
+
+# host-only 模式：跳过引擎探测后把全部「目标机事实」数组清到确定空值——下游渲染与
+# 密码检查都以数组非空为 has 位，全空即自然退化为纯主机基线，无需在各处补判空。
+agent_clear_engine_facts() {
+  AGENT_GAUSS_PORTS=()
+  AGENT_GAUSS_LOG_GLOBS=()
+  AGENT_GAUSS_PID_ENGINES=()
+  AGENT_GAUSS_PID_PORTS=()
+  AGENT_GAUSS_PID_DATA_DIRS=()
+  AGENT_GAUSS_PID_HOMES=()
+  AGENT_GAUSS_PID_OWNERS=()
+  AGENT_GAUSS_PID_OWNER_HOMES=()
+  AGENT_GAUSS_PID_HOSTS=()
+  AGENT_GAUSS_PID_LD_LIBRARY_PATHS=()
+  AGENT_GAUSS_PID_PATHS=()
+  AGENT_GAUSS_PID_GSQLS=()
+  AGENT_GAUSS_PID_SOURCE_PIDS=()
+  AGENT_OWNER_ENV_CACHE_KEYS=()
+  AGENT_OWNER_ENV_CACHE_HOMES=()
+  AGENT_OWNER_ENV_CACHE_LOGS=()
+  AGENT_OWNER_ENV_CACHE_DATA=()
+  AGENT_GAUSSDB_RENDER_PORTS=()
+  AGENT_OPENGAUSS_RENDER_PORTS=()
+  AGENT_OPENGAUSS_LOG_GLOBS=()
+  AGENT_OPENGAUSS_RENDER_PASSWORDS=()
+  AGENT_PG_PORTS=()
+  AGENT_PG_DATA_DIRS=()
+  AGENT_PG_LOG_GLOBS=()
+  AGENT_PG_RENDER_PASSWORDS=()
 }
 
 agent_generate_gaussdb_password() {
@@ -961,7 +1001,8 @@ agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <en
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || has_gauss=1
   [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || has_og=1
   [ -z "${AGENT_PG_PORTS[*]-}" ] || has_pg=1
-  [ "$has_gauss$has_og$has_pg" != 000 ] || die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL 均未发现）"
+  [ "$has_gauss$has_og$has_pg" != 000 ] || [ "${AGENT_HOST_ONLY:-0}" = 1 ] || \
+    die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL 均未发现）"
   if [ "$has_gauss" = 1 ] && [ -z "$password" ]; then
     die "GaussDB 监控密码为空，无法渲染"
   fi

@@ -48,6 +48,27 @@ git clone -q --shared "$REPO_ROOT/dbdog-server" "$WORK/src"
 git -C "$WORK/src" checkout -q "$SHA" || die "构建机仓库缺 ${SHA}（先在构建机上刷新该仓）"
 cd "$WORK/src"
 
+# /install/* 分发资产 staging（单一推导源）：安装器脚本与指纹清单在构建期从本仓
+# scripts/（清单 = AGENT_INSTALLER_CONTRACT_FILES）拷入 server 源树，随 go:embed 进
+# 二进制——指纹与脚本同刻同源生成，随产物 manifest sha 一起钉死，无运行时可篡改文件。
+REL_SCRIPTS="$REPO_ROOT/dbdog-release/scripts"
+STAGE="$WORK/src/internal/installassets/scripts"
+# shellcheck disable=SC1091
+source "$REL_SCRIPTS/agent-lib.sh"
+mkdir -p "$STAGE/agent"
+for rel in "${AGENT_INSTALLER_CONTRACT_FILES[@]}"; do
+  cp "$REL_SCRIPTS/$rel" "$STAGE/$rel" || die "staging 安装脚本失败: $rel"
+done
+cp "$REL_SCRIPTS/bootstrap.sh" "$STAGE/bootstrap.sh" || die "staging bootstrap.sh 失败"
+(
+  cd "$STAGE"
+  : >"$WORK/src/internal/installassets/fingerprints.txt"
+  for rel in "${AGENT_INSTALLER_CONTRACT_FILES[@]}"; do
+    sha256sum "$rel"
+  done >>"$WORK/src/internal/installassets/fingerprints.txt"
+) || die "生成安装脚本指纹清单失败"
+log "已 staging /install/* 分发资产（${#AGENT_INSTALLER_CONTRACT_FILES[@]} 个合约脚本 + bootstrap.sh）"
+
 # 固定通用 ARMv8 基线，避免构建机 CPU 特性泄漏进 Go 产物。
 export GOARM64=v8.0
 
