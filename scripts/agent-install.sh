@@ -1182,7 +1182,10 @@ render_install_state() {
     printf '      dbdog-release/scripts/one-off/clean-colon-identifier-data.sh --apply  # 确认后再删\n'
     printf '    全部环境切完后请把该一次性脚本删掉，别留成常驻工具。\n\n'
   fi
-  agent_render_checks "$CONFIG_STAGE/conf.d" "$DBDOG_GAUSSDB_MONITOR_PASSWORD" \
+  # host-only 未走密码生成/收割路径（resolve_inputs 跳过），渲染时以空串传入——
+  # render 对空密码的校验只挂在 has_gauss 位上，host-only 引擎事实已清空，不会触发。
+  local gauss_password="${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}"
+  agent_render_checks "$CONFIG_STAGE/conf.d" "$gauss_password" \
     "$DBDOG_GAUSSDB_USER" "$DBDOG_GAUSSDB_DBNAME" "$DBDOG_ENV"
   find "$CONFIG_STAGE" -type d -exec chmod 0700 {} +
   find "$CONFIG_STAGE" -type f -exec chmod 0600 {} +
