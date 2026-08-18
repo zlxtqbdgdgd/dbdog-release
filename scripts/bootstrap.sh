@@ -8,6 +8,12 @@
 # 页面命令形态（变量由 Install Agents 页预填）：
 #   DBDOG_SERVER_URL="http://<server>:8080" DBDOG_API_KEY="ddog_..." \
 #   bash -c "$(curl -s http://<server>:8080/install/bootstrap.sh)"
+#
+# 安装模式（DBDOG_INSTALL_MODE，缺省 host）：
+#   host  Install Agents 页：--host-only，只装主机基线（原行为，缺省零变化）。
+#   auto  Databases「添加数据库实例」向导：不带 --host-only——安装器探测数据库引擎、
+#         验收 *_MONITOR_PASSWORD、渲染引擎 conf.d。已装主机的机器重入此模式是幂等
+#         升级 + 引擎接入（runtime 一致则只刷新配置，见 agent-install.sh 幂等分支）。
 set -Eeuo pipefail
 
 die() {
@@ -22,12 +28,18 @@ if [ "$(id -u)" -ne 0 ]; then
   exec sudo -E env \
     DBDOG_SERVER_URL="${DBDOG_SERVER_URL:-}" \
     DBDOG_API_KEY="${DBDOG_API_KEY:-}" \
+    DBDOG_INSTALL_MODE="${DBDOG_INSTALL_MODE:-}" \
     bash -c "$(curl -fsS "${DBDOG_SERVER_URL%/}/install/bootstrap.sh")"
 fi
 
 [ -n "${DBDOG_SERVER_URL:-}" ] || die "缺少 DBDOG_SERVER_URL（在 dbdog-web「安装 Agent」页复制完整命令）"
 [ -n "${DBDOG_API_KEY:-}" ] || die "缺少 DBDOG_API_KEY（在 dbdog-web「安装 Agent」页复制完整命令）"
 DBDOG_SERVER_URL="${DBDOG_SERVER_URL%/}"
+case "${DBDOG_INSTALL_MODE:-host}" in
+  host) ;;
+  auto) ;;
+  *) die "DBDOG_INSTALL_MODE 只能是 host 或 auto，当前值: ${DBDOG_INSTALL_MODE}" ;;
+esac
 
 for tool in curl sha256sum awk; do
   command -v "$tool" >/dev/null 2>&1 || die "缺少 $tool，请先安装（内网源或系统镜像）"
@@ -76,4 +88,9 @@ curl -fsS --connect-timeout 10 --max-time 60 \
 
 export DBDOG_SERVER_URL DBDOG_API_KEY
 export MANIFEST="$tmp/manifest.tsv"
+# 模式分流：Install Agents 页保持 --host-only；向导 auto 走完整安装（引擎发现+渲染）。
+# 监控密码 env（DBDOG_*_MONITOR_PASSWORD）经进程环境透传，安装器自行收割。
+if [ "${DBDOG_INSTALL_MODE:-host}" = "auto" ]; then
+  exec bash "$tmp/agent-install.sh"
+fi
 exec bash "$tmp/agent-install.sh" --host-only

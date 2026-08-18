@@ -1626,6 +1626,21 @@ grep -q "awk '{print \$2}'" "$BOOTSTRAP" || \
 grep -Eq 'sudo -E env' "$BOOTSTRAP" || fail "bootstrap 缺非 root 自提升（显式 env 传递）"
 pass "bootstrap 先验后执行 + key 预验 + 清单单源 + root 自提升齐备"
 
+# 31a. bootstrap 安装模式分流：host（缺省，Install Agents 页）保持 --host-only；
+#      auto（Databases 向导）不带 --host-only 走引擎发现+渲染。非法值 fail closed。
+grep -Fq 'DBDOG_INSTALL_MODE="${DBDOG_INSTALL_MODE:-}"' "$BOOTSTRAP" || \
+  fail "bootstrap sudo re-exec 未透传 DBDOG_INSTALL_MODE"
+grep -Eq 'case "\$\{DBDOG_INSTALL_MODE:-host\}" in' "$BOOTSTRAP" || \
+  fail "bootstrap 缺 DBDOG_INSTALL_MODE 合法值校验（host|auto）"
+grep -Fq 'if [ "${DBDOG_INSTALL_MODE:-host}" = "auto" ]; then' "$BOOTSTRAP" || \
+  fail "bootstrap 缺 auto 分流分支"
+grep -Eq 'exec bash "\$tmp/agent-install\.sh" --host-only' "$BOOTSTRAP" || \
+  fail "bootstrap host 缺省路径必须仍是 --host-only"
+auto_block="$(sed -n '/if \[ "\${DBDOG_INSTALL_MODE:-host}" = "auto" \]; then/,/^fi$/p' "$BOOTSTRAP")"
+grep -Fq 'exec bash "$tmp/agent-install.sh"' <<<"$auto_block" || \
+  fail "bootstrap auto 分支必须不带 --host-only 直接 exec 安装器"
+pass "bootstrap DBDOG_INSTALL_MODE 分流（host 缺省不变 / auto 完整安装）"
+
 # 31. upgrade.sh 透传：仅允许附加 --host-only，其余多参拒绝。
 grep -Fq 'exec "$SCRIPTS_DIR/agent-install.sh" ${2:+--host-only}' "$SCRIPTS_DIR/upgrade.sh" || \
   fail "upgrade.sh 缺 --host-only 透传"
