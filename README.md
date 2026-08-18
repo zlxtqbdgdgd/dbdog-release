@@ -292,7 +292,7 @@ sudo ./scripts/upgrade.sh dbdog-agent
 
 目标机不能访问 GitHub 时，应从可联网机器同步同一个 commit 的完整 `dbdog-release` checkout；
 不要只挑拣 `agent-install.sh` 等几个文件。`manifest.tsv`、整个 `scripts/`（包括
-`scripts/agent/init-gaussdb-perdb.sql`）共同组成安装事务和内容指纹，缺失会明确报出具体路径并
+`scripts/agent/init-dbdog-user-gaussdb-perdb.sql`）共同组成安装事务和内容指纹，缺失会明确报出具体路径并
 fail closed。对应 manifest 文件名的 Agent tarball 可预置到目标机有效 `DBDOG_HOME/cache/`
 （默认是执行安装命令用户的 `~/dbdog/cache/`），安装器仍会校验 SHA-256 后才使用。
 
