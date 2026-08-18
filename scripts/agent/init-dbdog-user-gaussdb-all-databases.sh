@@ -74,10 +74,12 @@ Connection environment:
   GAUSSDB_PERDB_SQL   per-database SQL file override (default:
                       init-dbdog-user-gaussdb-perdb.sql next to this script)
 
-Prerequisite: the dbdog login role must already exist (init-dbdog-user-gaussdb-global.sql,
-run once per instance). Authentication stays in gsql's normal protected mechanisms
-(for example an OS database account or password environment/file). This script never
-accepts or prints a password argument.
+Prerequisite: the dbdog login role must already exist (created by agent-install.sh
+without --host-only — including the password_encryption_type=1 and MD5 HBA preflight —
+or run init-dbdog-user-gaussdb-global.sql once per instance; it is installed next to
+this script). Authentication stays in gsql's normal protected mechanisms (for example
+an OS database account or password environment/file). This script never accepts or
+prints a password argument.
 EOF
 }
 
@@ -205,7 +207,12 @@ set_search_path() { # <database>
   done
   (( ${#final[@]} > 0 )) || { echo "SEARCH_PATH_SKIP database=$database (no schemas)" >&2; return 0; }
   joined="$(IFS=,; echo "${final[*]}")"
-  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};"
+  # run_sql 失败必须立刻冒出来:本函数常在 &&/|| 链里被调(set -e 失效),若继续走到
+  # echo,其退出码会把失败洗白(2026-08-19 ecs-f82e 实锤,三引擎同修)。
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};" || {
+    echo "SEARCH_PATH_FAILED database=$database" >&2
+    return 1
+  }
   echo "SEARCH_PATH database=$database -> ${joined}"
 }
 
@@ -322,6 +329,18 @@ else
 fi
 
 [[ ${#databases[@]} -gt 0 ]] || { echo "no databases selected" >&2; exit 1; }
+
+# 前置门:监控角色必须先存在(实例级对象,归安装器建号链或 global SQL 管)。
+# GaussDB 查 pg_user,提示里带上 MONADMIN 语义;HBA/密码加密模式的讲究在
+# 安装器预检里管,这里只管角色在不在。
+global_hint="$SCRIPT_DIR/init-dbdog-user-gaussdb-global.sql"
+role_exists=$(run_sql "$GAUSSDB_ADMIN_DB" "SELECT 1 FROM pg_catalog.pg_user WHERE usename='${MONITOR_ROLE}';")
+if [[ "$role_exists" != 1 ]]; then
+  echo "PREREQ_MISSING: monitoring role '${MONITOR_ROLE}' does not exist on this instance." >&2
+  echo "This script never creates it (no password handling). Create it once per instance:" >&2
+  echo "  gsql -d ${GAUSSDB_ADMIN_DB} -p ${GAUSSDB_PORT} -v dbdog_pw=\"'密码'\" -f ${global_hint}" >&2
+  exit 1
+fi
 
 failures=0
 

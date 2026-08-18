@@ -24,10 +24,13 @@ AGENT_INSTALLER_CONTRACT_FILES=(
   agent-lib.sh
   agent/init-dbdog-user-gaussdb-perdb.sql
   agent/init-dbdog-user-gaussdb-all-databases.sh
+  agent/init-dbdog-user-gaussdb-global.sql
   agent/init-dbdog-user-pg-all-databases.sh
   agent/init-dbdog-user-pg-perdb.sql
+  agent/init-dbdog-user-pg-global.sql
   agent/init-dbdog-user-opengauss-all-databases.sh
   agent/init-dbdog-user-opengauss-perdb.sql
+  agent/init-dbdog-user-opengauss-global.sql
 )
 
 # 诊断输出可能来自 journal 或 Agent CLI，两者都不是我们能完全约束的
@@ -117,6 +120,9 @@ agent_clear_engine_facts() {
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
   AGENT_PG_RENDER_PASSWORDS=()
+  AGENT_PG_PID_OWNERS=()
+  AGENT_PG_PID_PSQLS=()
+  AGENT_PG_PID_SOCKETS=()
 }
 
 agent_generate_gaussdb_password() {
@@ -760,7 +766,7 @@ agent_detect_postgres() {
   # 天然被 -D 过滤掉）。端口一律取运行态 postmaster.pid 第 4 行——配置文件可能改过
   # 未 reload。日志 glob 从 log_directory 推导（相对路径落在 data 目录下，PG 默认 log/），
   # 推不出时留空——logs 采集少一路是软缺口，不拦安装。
-  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args
+  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args uid owner exe psql socket
   # 显式排除口子（DBDOG_POSTGRES_EXCLUDE_PORTS，空格/逗号分隔）：停掉某实例的监控是
   # 操作者决策，必须显式点名并大声记录，绝不允许静默缺口。典型场景：与监控无关的
   # 私人 dev 实例（其超管凭证不归监控体系管）。
@@ -769,6 +775,9 @@ agent_detect_postgres() {
   AGENT_PG_PORTS=()
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
+  AGENT_PG_PID_OWNERS=()
+  AGENT_PG_PID_PSQLS=()
+  AGENT_PG_PID_SOCKETS=()
   for pid in "$root"/[0-9]*; do
     pid="${pid##*/}"
     [ -r "$root/$pid/cmdline" ] || continue
@@ -795,6 +804,28 @@ agent_detect_postgres() {
       die "发现多个 PostgreSQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;; esac
     AGENT_PG_PORTS+=("$port")
     AGENT_PG_DATA_DIRS+=("$data")
+    # 建号链事实：进程属主（runuser 目标）、实例自带 psql（exe 同 bin 目录）、socket
+    # 目录（postgresql.conf 的 unix_socket_directories 首个）。拿不到的留空，由
+    # agent_prepare_pg_user 在使用点 die——探测期留软缺口感，错误信息聚在动手前。
+    uid="$(awk '/^Uid:/ { print $2; exit }' "$root/$pid/status" 2>/dev/null || true)"
+    owner="$(agent_owner_name "$uid" 2>/dev/null || true)"
+    AGENT_PG_PID_OWNERS+=("${owner:-}")
+    psql=""
+    if [ -L "$root/$pid/exe" ]; then
+      exe="$(readlink -f "$root/$pid/exe" 2>/dev/null || true)"
+      case "$exe" in */bin/postgres) psql="${exe%/bin/postgres}/bin/psql" ;; esac
+    fi
+    [ -n "$psql" ] && [ -x "$psql" ] || psql=""
+    AGENT_PG_PID_PSQLS+=("$psql")
+    socket="$(awk '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*unix_socket_directories[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, "")
+        gsub(/^'\''|'\''$/, ""); split($0, first, ","); print first[1]; exit
+      }
+    ' "$data/postgresql.conf" 2>/dev/null || true)"
+    [ -n "$socket" ] && [ -d "$socket" ] || socket=""
+    AGENT_PG_PID_SOCKETS+=("${socket:-}")
     logdir="$(awk '
       /^[[:space:]]*#/ { next }
       /^[[:space:]]*log_directory[[:space:]]*=/ {

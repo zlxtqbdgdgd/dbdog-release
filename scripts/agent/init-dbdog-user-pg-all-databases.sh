@@ -71,10 +71,11 @@ Connection environment:
   PG_ADMIN_USER   administrative user passed to psql with -U (optional)
   PG_PERDB_SQL    per-database SQL file override (optional)
 
-Prerequisite: the dbdog login role must already exist (init-dbdog-user-pg-global.sql,
-run once per instance). Authentication stays in psql's normal protected mechanisms
-(for example an OS database account, PGPASSFILE, or an interactive prompt). This
-script never accepts or prints a password argument.
+Prerequisite: the dbdog login role must already exist (created by agent-install.sh
+without --host-only, or run init-dbdog-user-pg-global.sql once per instance — it is
+installed next to this script). Authentication stays in psql's normal protected
+mechanisms (for example an OS database account, PGPASSFILE, or an interactive
+prompt). This script never accepts or prints a password argument.
 EOF
 }
 
@@ -198,7 +199,13 @@ set_search_path() { # <database>
   done
   (( ${#final[@]} > 0 )) || { echo "SEARCH_PATH_SKIP database=$database (no schemas)" >&2; return 0; }
   joined="$(IFS=,; echo "${final[*]}")"
-  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};"
+  # run_sql 失败必须立刻冒出来:本函数常在 &&/|| 链里被调(set -e 失效),若继续走到
+  # echo,其退出码会把失败洗白(2026-08-19 ecs-f82e 实锤:ALTER ROLE 因角色不存在报错,
+  # 后面的 SEARCH_PATH 行照样打出来,像成功了一样)。
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};" || {
+    echo "SEARCH_PATH_FAILED database=$database" >&2
+    return 1
+  }
   echo "SEARCH_PATH database=$database -> ${joined}"
 }
 
@@ -322,6 +329,18 @@ else
 fi
 
 [[ ${#databases[@]} -gt 0 ]] || { echo "no databases selected" >&2; exit 1; }
+
+# 前置门:监控角色必须先存在。本脚本不建角色(永不碰密码),角色是实例级对象,归
+# agent-install.sh 建号链或 global SQL 管。以前缺角色要等 perdb.sql 跑到第一条 GRANT
+# 才炸,TOPOFF 分支的 ALTER ROLE 报错还会被误读(2026-08-19 ecs-f82e);进门一句人话。
+global_hint="$SCRIPT_DIR/init-dbdog-user-pg-global.sql"
+role_exists=$(run_sql "$PG_ADMIN_DB" "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='${MONITOR_ROLE}';")
+if [[ "$role_exists" != 1 ]]; then
+  echo "PREREQ_MISSING: monitoring role '${MONITOR_ROLE}' does not exist on this instance." >&2
+  echo "This script never creates it (no password handling). Create it once per instance:" >&2
+  echo "  su - postgres -c \"psql -p ${PG_PORT} -d ${PG_ADMIN_DB} -v dbdog_pw=\"'密码'\" -f ${global_hint}\"" >&2
+  exit 1
+fi
 
 failures=0
 
