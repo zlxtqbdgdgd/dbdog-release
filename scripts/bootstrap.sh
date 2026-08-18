@@ -67,5 +67,13 @@ if ! (cd "$tmp" && sha256sum -c sha256s.txt); then
   exit 1
 fi
 
+# manifest.tsv（agent-install 解析产物版本的发布事实）不在指纹清单里，单独拉取；
+# 完整性由产物下载自身的 sha 校验兜底。
+printf '下载: manifest.tsv\n'
+curl -fsS --connect-timeout 10 --max-time 60 \
+  -o "$tmp/manifest.tsv" "${DBDOG_SERVER_URL}/install/scripts/manifest.tsv" || \
+  die "下载失败: manifest.tsv"
+
 export DBDOG_SERVER_URL DBDOG_API_KEY
+export MANIFEST="$tmp/manifest.tsv"
 exec bash "$tmp/agent-install.sh" --host-only
