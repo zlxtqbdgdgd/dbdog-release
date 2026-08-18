@@ -204,8 +204,9 @@ set_search_path() { # <database>
     final+=("$(quote_ident "$token")")
   done
   (( ${#final[@]} > 0 )) || { echo "SEARCH_PATH_SKIP database=$database (no schemas)" >&2; return 0; }
-  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${final[*]};"
-  echo "SEARCH_PATH database=$database -> ${final[*]}"
+  joined="$(IFS=,; echo "${final[*]}")"
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};"
+  echo "SEARCH_PATH database=$database -> ${joined}"
 }
 
 # 就绪位串：schema|explain(public)|colstats|search_path。2026-08-02 起 DB 侧只保留

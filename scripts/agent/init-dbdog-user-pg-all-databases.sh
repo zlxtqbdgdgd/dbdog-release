@@ -166,10 +166,11 @@ quote_ident() { # <identifier>
 }
 
 # 追加语义：现有元素(我们只会写全双引号形，朴素逗号切分安全)在前，新发现的补后，
-# public/pg_catalog 兜底压尾；合并去重后整体重写。pg_db_role_setting 是全局目录，
-# ALTER ROLE ... IN DATABASE 在任意连接上执行即可，这里顺手用每库连接。
+# public/pg_catalog 兜底压尾；合并去重后整体重写。SET 的多值分隔符是逗号(list 语法)，
+# 数组 join 不能用 ${arr[*]}(空格连)——2026-08-18 116 机首验实锤。
+# pg_db_role_setting 是全局目录，ALTER ROLE ... IN DATABASE 在任意连接上执行即可。
 set_search_path() { # <database>
-  local database=$1 existing entry value token
+  local database=$1 existing entry value token joined
   local -a keep=() final=()
   local -A seen=()
   existing=$(current_role_setting "$database")
@@ -196,8 +197,9 @@ set_search_path() { # <database>
     final+=("$(quote_ident "$token")")
   done
   (( ${#final[@]} > 0 )) || { echo "SEARCH_PATH_SKIP database=$database (no schemas)" >&2; return 0; }
-  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${final[*]};"
-  echo "SEARCH_PATH database=$database -> ${final[*]}"
+  joined="$(IFS=,; echo "${final[*]}")"
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};"
+  echo "SEARCH_PATH database=$database -> ${joined}"
 }
 
 # 就绪位串：schema|explain|colstats|pg_stat_statements|pg_buffercache|search_path。
