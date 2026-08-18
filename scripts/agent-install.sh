@@ -840,7 +840,7 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
 # 三引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
 # 会让 PostgreSQL/openGauss 实例的页面指向不存在的文件。多出的两套是惰性文本，无服务加载。
 AGENT_DBM_INIT_ASSETS="\
-init-dbdog-user-gaussdb-all-databases.sh:init-gaussdb-perdb.sql
+init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql
 init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql
 init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql"
 
@@ -860,25 +860,25 @@ install_dbm_init_scripts() {
     count=$((count + 1))
   done <<<"$AGENT_DBM_INIT_ASSETS"
   [ "$count" -eq 3 ] || die "每库 DBM 初始化工具数量异常: $count"
-  log "每库 DBM 初始化工具已就位: $target（新增库后用数据库 OS 账号跑对应引擎的 --all）"
+  log "每库 DBM 初始化工具已就位: $target（新增库后用数据库 OS 账号跑对应引擎脚本；已配置库重跑会先确认是否清理）"
 }
 
 bootstrap_gaussdb_monitoring() {
-  local sql="$SCRIPT_DIR/agent/init-gaussdb-perdb.sql" index count
+  local sql="$SCRIPT_DIR/agent/init-dbdog-user-gaussdb-perdb.sql" index count
   # 建号链只属于真 GaussDB；主机没有 gauss 实例（纯 openGauss/PostgreSQL）时整段跳过。
   if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
     return 0
   fi
-  [ -f "$sql" ] || die "缺少 GaussDB 兼容对象 SQL: $sql"
+  [ -f "$sql" ] || die "缺少 GaussDB 每库对象 SQL: $sql"
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与兼容视图（仅安装阶段）..."
+  log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与每库对象（仅安装阶段）..."
   # password_encryption_type 与 HBA 已在预检中只读核对。这里仅创建/校验账号，
   # 并用交付给 integration 的同一凭证经内嵌 psycopg/libpq 做真实 TCP 登录探测。
   agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
     die "无法通过目标 GaussDB 的本地管理连接准备监控用户"
   for ((index=0; index<count; index++)); do
     [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
-    agent_gsql "$index" <"$sql" || die "创建 GaussDB 兼容视图失败（实例索引 ${index}）"
+    agent_gsql "$index" <"$sql" || die "应用 GaussDB 每库对象 SQL 失败（实例索引 ${index}）"
   done
 }
 

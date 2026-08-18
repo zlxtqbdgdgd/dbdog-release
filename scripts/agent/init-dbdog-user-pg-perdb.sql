@@ -2,6 +2,10 @@
 -- 前置:先跑过一次 init-dbdog-user-pg-global.sql(建用户/角色)。
 -- 用法:
 --   psql -U postgres -d <被监控库> -f init-dbdog-user-pg-perdb.sql
+-- 2026-08-18 起完整 configure 语义(含把该库用户自建 schema 经
+--   ALTER ROLE dbdog IN DATABASE <库> SET search_path 追加到监控用户)由
+--   init-dbdog-user-pg-all-databases.sh 单入口承载;本文件只管库内 DDL 部分,
+--   直接 -f 执行不会配置 search_path。
 -- 配套:postgres.d/conf.yaml 须设 username: dbdog、
 --   query_samples.explain_function: dbdog.explain_statement 与
 --   collect_column_statistics.function_name: dbdog.column_statistics()

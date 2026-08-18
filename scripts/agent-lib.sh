@@ -22,7 +22,7 @@ AGENT_INSTALLER_CONTRACT_FILES=(
   lib.sh
   agent-install.sh
   agent-lib.sh
-  agent/init-gaussdb-perdb.sql
+  agent/init-dbdog-user-gaussdb-perdb.sql
   agent/init-dbdog-user-gaussdb-all-databases.sh
   agent/init-dbdog-user-pg-all-databases.sh
   agent/init-dbdog-user-pg-perdb.sql

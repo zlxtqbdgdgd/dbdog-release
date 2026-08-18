@@ -25,7 +25,7 @@ mkdir -p "$FINGERPRINT_ROOT/agent"
 printf 'shared-lib-v1\n' >"$FINGERPRINT_ROOT/lib.sh"
 printf 'install-v1\n' >"$FINGERPRINT_ROOT/agent-install.sh"
 printf 'lib-v1\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
-printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
+printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql"
 printf 'perdb-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-all-databases.sh"
 printf 'pg-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-all-databases.sh"
 printf 'pg-sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-perdb.sql"
@@ -37,17 +37,17 @@ FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
 printf 'unrelated\n' >"$FINGERPRINT_ROOT/README.md"
 [ "$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" = "$FINGERPRINT_1" ] || \
   fail "无关文件错误改变了 Agent 安装器合约指纹"
-mv "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql" \
-  "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql.missing"
+mv "$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql" \
+  "$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql.missing"
 if agent_installer_contract_fingerprint "$FINGERPRINT_ROOT" \
   >"$TEST_ROOT/fingerprint-missing-sql.out" 2>"$TEST_ROOT/fingerprint-missing-sql.err"; then
   fail "安装器合约指纹错误接受了缺失的 GaussDB 初始化 SQL"
 fi
-grep -Fq "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql" \
+grep -Fq "$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql" \
   "$TEST_ROOT/fingerprint-missing-sql.err" || \
   fail "初始化 SQL 缺失时 stderr 没有列出具体路径"
-mv "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql.missing" \
-  "$FINGERPRINT_ROOT/agent/init-gaussdb-perdb.sql"
+mv "$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql.missing" \
+  "$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql"
 printf 'lib-v2\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
 FINGERPRINT_2="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
   fail "安装器合约变更后无法重新计算指纹"
@@ -1241,15 +1241,15 @@ mkdir -p "$MARKER_RUNTIME"
 printf '7.81.1-dbdog.1\n' >"$MARKER_RUNTIME/.dbdog-release-version"
 [ "$(agent_marker_value "$MARKER_RUNTIME/.dbdog-release-version" "$MARKER_RUNTIME")" = 7.81.1-dbdog.1 ] || \
   fail "Agent 身份 marker 读取错误"
-grep -Fq 'CREATE OR REPLACE VIEW dbdog.statements' \
-  "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB query metrics 兼容视图"
-grep -Fq 'CREATE OR REPLACE VIEW dbdog.activity' \
-  "$SCRIPTS_DIR/agent/init-gaussdb-perdb.sql" || fail "缺少 GaussDB activity 兼容视图"
+# 2026-08-18 起 GaussDB perdb 已收敛为 dbdog-agent 的瘦身版(只留 schema+函数),
+# statements/activity 兼容视图由 collector 内联 SQL 取代(146 现网实证无消费)——
+# 这里不再断言视图存在,镜像逐字节校验在下方统一覆盖。
 
 # 每库初始化工具必须随包落到 DB 主机固定路径：控制台「采集配置」页按该绝对路径给命令，
 # 路径/文件名一变，页面上的命令就指向不存在的文件（dbdog-web DB_INIT_SCRIPT_DIR）。
+# CLI 是五合一后的单入口：--db 选目标库、--cleanup 显式清理、--yes 免 tty 确认。
 for engine_assets in \
-  'gaussdb:init-dbdog-user-gaussdb-all-databases.sh:init-gaussdb-perdb.sql:GAUSSDB' \
+  'gaussdb:init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:GAUSSDB' \
   'pg:init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:PG' \
   'opengauss:init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:OPENGAUSS'; do
   IFS=: read -r ENGINE PERDB_TOOL_NAME PERDB_SQL_NAME ENGINE_ENV <<<"$engine_assets"
@@ -1261,8 +1261,15 @@ for engine_assets in \
     fail "$ENGINE 每库初始化脚本默认没有指向随包同目录的每库 SQL"
   grep -Fq "/opt/dbdog-agent/scripts/$PERDB_TOOL_NAME" "$PERDB_TOOL" || \
     fail "$ENGINE 每库初始化脚本的 usage 没有给出落盘绝对路径"
-  grep -Fq -e '--check' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少只读验收开关"
-  grep -Fq -e '--exclude' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少跳过指定库的开关"
+  grep -Fq -- '--db' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少指定目标库的 --db 开关"
+  grep -Fq -- '--cleanup' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少显式清理开关"
+  grep -Fq -- '--yes' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少非交互确认开关"
+  # 旧三开关必须真的退役：留着会让控制台旧命令照跑、语义分叉。
+  if grep -Fq -e '--all)' -e '--check)' -e '--exclude)' "$PERDB_TOOL"; then
+    fail "$ENGINE 每库初始化脚本还残留旧开关 (--all/--check/--exclude)"
+  fi
+  grep -Fq "ALTER ROLE \${MONITOR_ROLE} IN DATABASE" "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本缺少 search_path 的 ALTER ROLE IN DATABASE 步骤"
   grep -Fq "$PERDB_TOOL_NAME:$PERDB_SQL_NAME" "$SCRIPTS_DIR/agent-install.sh" || \
     fail "安装器没有把 $ENGINE 那套列进随包安装清单"
 done
@@ -1291,19 +1298,16 @@ awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
 
 # per-db SQL 的源在 dbdog-agent（那边的 docker harness sandbox-test.sh 和 wire 契约测试直接
 # 消费），本仓存的是随包镜像。镜像与源必须逐字节一致，否则「DB 主机上跑的 DDL」会和研发仓
-# 里改的那份悄悄分家——GaussDB 那对已经这样漂过（见下面登记的例外）。
+# 里改的那份悄悄分家——GaussDB 那对曾漂移过(旧 init-gaussdb-perdb.sql 仍建兼容视图、缺
+# GRANT USAGE ON SCHEMA public),2026-08-18 已按瘦身版收敛并统一命名,三引擎全量比对。
 DEPLOY_SCRIPTS="$RELEASE_DIR/../dbdog-agent/dbdog-deploy/scripts"
 if [ -d "$DEPLOY_SCRIPTS" ]; then
-  for mirrored in init-dbdog-user-pg-perdb.sql init-dbdog-user-opengauss-perdb.sql; do
+  for mirrored in init-dbdog-user-pg-perdb.sql init-dbdog-user-gaussdb-perdb.sql init-dbdog-user-opengauss-perdb.sql; do
     [ -f "$DEPLOY_SCRIPTS/$mirrored" ] || fail "dbdog-agent 侧缺少每库 SQL 源: $mirrored"
     cmp -s "$DEPLOY_SCRIPTS/$mirrored" "$SCRIPTS_DIR/agent/$mirrored" || \
       fail "随包镜像与 dbdog-agent 源不一致: $mirrored（改了源就要同步本仓镜像）"
   done
-  # 登记的已知例外：init-gaussdb-perdb.sql 与 dbdog-agent 的
-  # init-dbdog-user-gaussdb-perdb.sql 已漂移（本仓仍建 statements/activity 兼容视图、缺
-  # GRANT USAGE ON SCHEMA public）。合并方向取决于现网 runtime 是否已含内联 collector，
-  # 未实证前不动；本行即差异登记，收敛后一并纳入上面的逐字节校验。
-  pass "每库 SQL 随包镜像与 dbdog-agent 源逐字节一致（GaussDB 那对为已登记的待收敛差异）"
+  pass "每库 SQL 随包镜像与 dbdog-agent 源逐字节一致（三引擎全量，GaussDB 漂移已收敛）"
 else
   printf 'NOTE: 未检出兄弟目录 dbdog-agent，跳过每库 SQL 镜像一致性校验\n' >&2
 fi
