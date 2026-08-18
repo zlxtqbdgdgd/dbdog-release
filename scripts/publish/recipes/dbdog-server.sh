@@ -60,6 +60,9 @@ for rel in "${AGENT_INSTALLER_CONTRACT_FILES[@]}"; do
   cp "$REL_SCRIPTS/$rel" "$STAGE/$rel" || die "staging 安装脚本失败: $rel"
 done
 cp "$REL_SCRIPTS/bootstrap.sh" "$STAGE/bootstrap.sh" || die "staging bootstrap.sh 失败"
+# manifest.tsv 是 agent-install 解析产物版本的发布事实，一行安装的主机没有本仓检出，
+# 必须随通道分发（不进指纹清单：产物下载自身带 sha 校验，manifest 完整性由分发通道承担）。
+cp "$REPO_ROOT/dbdog-release/manifest.tsv" "$STAGE/manifest.tsv" || die "staging manifest.tsv 失败"
 (
   cd "$STAGE"
   : >"$WORK/src/internal/installassets/fingerprints.txt"
@@ -67,7 +70,7 @@ cp "$REL_SCRIPTS/bootstrap.sh" "$STAGE/bootstrap.sh" || die "staging bootstrap.s
     sha256sum "$rel"
   done >>"$WORK/src/internal/installassets/fingerprints.txt"
 ) || die "生成安装脚本指纹清单失败"
-log "已 staging /install/* 分发资产（${#AGENT_INSTALLER_CONTRACT_FILES[@]} 个合约脚本 + bootstrap.sh）"
+log "已 staging /install/* 分发资产（${#AGENT_INSTALLER_CONTRACT_FILES[@]} 个合约脚本 + bootstrap.sh + manifest.tsv）"
 
 # 固定通用 ARMv8 基线，避免构建机 CPU 特性泄漏进 Go 产物。
 export GOARM64=v8.0
