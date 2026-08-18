@@ -30,6 +30,7 @@ if [ "$(id -u)" -ne 0 ]; then
     DBDOG_API_KEY="${DBDOG_API_KEY:-}" \
     DBDOG_INSTALL_MODE="${DBDOG_INSTALL_MODE:-}" \
     DBDOG_ENGINES="${DBDOG_ENGINES:-}" \
+    DBDOG_POSTGRES_SUPER_PASSWORD="${DBDOG_POSTGRES_SUPER_PASSWORD:-}" \
     bash -c "$(curl -fsS "${DBDOG_SERVER_URL%/}/install/bootstrap.sh")"
 fi
 
