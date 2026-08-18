@@ -60,6 +60,10 @@ usage() {
   DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
   DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb）；
+                                         设置后只探测并渲染名单内引擎，名单外实例显式跳过并记日志。
+                                         不设置 = 现状全引擎探测（upgrade.sh 与历史行为零变化）。
+                                         Databases「添加数据库实例」向导按用户所选引擎传入。
   DBDOG_POSTGRES_DBNAME                  PostgreSQL 主连接库，默认 postgres
   DBDOG_POSTGRES_EXCLUDE_PORTS           显式排除的 PG 实例端口（空格/逗号分隔）；停监控是操作者决策，必须点名
   DBDOG_ENV                              默认 prod
@@ -252,6 +256,12 @@ resolve_inputs() {
   prompt_value DBDOG_SERVER_URL "dbdog-server 地址（如 http://10.0.0.8:8080）" 0
   prompt_value DBDOG_API_KEY "dbdog-web 签发的 Agent ingest key" 1
 
+  if [ -n "${DBDOG_ENGINES:-}" ]; then
+    local _eng _ok
+    for _eng in $(printf '%s' "$DBDOG_ENGINES" | tr ',\t' '  '); do
+      case "$_eng" in postgres|opengauss|gaussdb) ;; *) die "DBDOG_ENGINES 含未知引擎: $_eng（合法值 postgres/opengauss/gaussdb）" ;; esac
+    done
+  fi
   DBDOG_SERVER_URL="$(agent_validate_server_url "$DBDOG_SERVER_URL")"
   agent_require_single_line DBDOG_API_KEY "$DBDOG_API_KEY"
   [ -n "$DBDOG_API_KEY" ] || die "DBDOG_API_KEY 不能为空"
@@ -454,6 +464,44 @@ agent_hba_has_required_tcp_md5() { # <HBA 文件>
     }
     END { exit(found ? 0 : 1) }
   ' "$1"
+}
+
+# 引擎白名单（DBDOG_ENGINES）：设置后名单外引擎不探测不渲染——「跳过」是操作者/向导的
+# 显式决策，逐引擎记日志大声声明，不构成静默缺口（对齐 EXCLUDE_PORTS 的军规）。
+# 不设置 = 不过滤，全引擎探测，与历史行为逐字节等价。
+agent_engine_allowed() { # <engine: postgres|opengauss|gaussdb>
+  [ -z "${DBDOG_ENGINES:-}" ] && return 0
+  case ",$(printf '%s' "$DBDOG_ENGINES" | tr ' \t' ',,')," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_apply_engine_allowlist() {
+  [ -z "${DBDOG_ENGINES:-}" ] && return 0
+  local engine
+  for engine in postgres opengauss gaussdb; do
+    agent_engine_allowed "$engine" && continue
+    case "$engine" in
+      postgres)
+        if [ -n "${AGENT_PG_PORTS[*]-}" ]; then
+          log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 PostgreSQL 端口 ${AGENT_PG_PORTS[*]}（不探测不渲染）"
+          AGENT_PG_PORTS=() AGENT_PG_DATA_DIRS=() AGENT_PG_LOG_GLOBS=() AGENT_PG_RENDER_PASSWORDS=()
+        fi ;;
+      opengauss)
+        if [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
+          log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 openGauss 端口 ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（不渲染）"
+          AGENT_OPENGAUSS_RENDER_PORTS=() AGENT_OPENGAUSS_LOG_GLOBS=() AGENT_OPENGAUSS_RENDER_PASSWORDS=()
+        fi ;;
+      gaussdb)
+        if [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
+          log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 GaussDB 端口 ${AGENT_GAUSSDB_RENDER_PORTS[*]}（不渲染）"
+          AGENT_GAUSSDB_RENDER_PORTS=() AGENT_GAUSSDB_RENDER_PASSWORDS=()
+        fi ;;
+    esac
+  done
+  # 白名单内一个引擎都没有在跑 = 硬失败（与「未发现受支持实例」同待遇）。
+  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}${AGENT_OPENGAUSS_RENDER_PORTS[*]-}${AGENT_PG_PORTS[*]-}" ] ||     die "引擎白名单 [${DBDOG_ENGINES}] 内未发现任何运行中的数据库实例"
 }
 
 agent_classify_gauss_engines() {
@@ -1760,6 +1808,7 @@ main() {
     agent_detect_gaussdb
     agent_detect_postgres
     agent_classify_gauss_engines
+    agent_apply_engine_allowlist
     agent_assemble_engine_credentials
     [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
       die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"

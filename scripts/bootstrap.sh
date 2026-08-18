@@ -29,6 +29,7 @@ if [ "$(id -u)" -ne 0 ]; then
     DBDOG_SERVER_URL="${DBDOG_SERVER_URL:-}" \
     DBDOG_API_KEY="${DBDOG_API_KEY:-}" \
     DBDOG_INSTALL_MODE="${DBDOG_INSTALL_MODE:-}" \
+    DBDOG_ENGINES="${DBDOG_ENGINES:-}" \
     bash -c "$(curl -fsS "${DBDOG_SERVER_URL%/}/install/bootstrap.sh")"
 fi
 
@@ -91,6 +92,8 @@ export MANIFEST="$tmp/manifest.tsv"
 # 模式分流：Install Agents 页保持 --host-only；向导 auto 走完整安装（引擎发现+渲染）。
 # 监控密码 env（DBDOG_*_MONITOR_PASSWORD）经进程环境透传，安装器自行收割。
 if [ "${DBDOG_INSTALL_MODE:-host}" = "auto" ]; then
+  # 引擎白名单随 auto 模式透传（向导按用户所选引擎传入；缺省空=全引擎）。
+  export DBDOG_ENGINES="${DBDOG_ENGINES:-}"
   exec bash "$tmp/agent-install.sh"
 fi
 exec bash "$tmp/agent-install.sh" --host-only
