@@ -27,10 +27,13 @@ printf 'install-v1\n' >"$FINGERPRINT_ROOT/agent-install.sh"
 printf 'lib-v1\n' >"$FINGERPRINT_ROOT/agent-lib.sh"
 printf 'sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-perdb.sql"
 printf 'perdb-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-all-databases.sh"
+printf 'gauss-global-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-gaussdb-global.sql"
 printf 'pg-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-all-databases.sh"
 printf 'pg-sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-perdb.sql"
+printf 'pg-global-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-pg-global.sql"
 printf 'og-tool-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-opengauss-all-databases.sh"
 printf 'og-sql-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-opengauss-perdb.sql"
+printf 'og-global-v1\n' >"$FINGERPRINT_ROOT/agent/init-dbdog-user-opengauss-global.sql"
 FINGERPRINT_1="$(agent_installer_contract_fingerprint "$FINGERPRINT_ROOT")" || \
   fail "无法计算安装器合约指纹"
 [ "${#FINGERPRINT_1}" -eq 64 ] || fail "安装器合约指纹不是 SHA-256"
@@ -1249,14 +1252,17 @@ printf '7.81.1-dbdog.1\n' >"$MARKER_RUNTIME/.dbdog-release-version"
 # 路径/文件名一变，页面上的命令就指向不存在的文件（dbdog-web DB_INIT_SCRIPT_DIR）。
 # CLI 是五合一后的单入口：--db 选目标库、--cleanup 显式清理、--yes 免 tty 确认。
 for engine_assets in \
-  'gaussdb:init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:GAUSSDB' \
-  'pg:init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:PG' \
-  'opengauss:init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:OPENGAUSS'; do
-  IFS=: read -r ENGINE PERDB_TOOL_NAME PERDB_SQL_NAME ENGINE_ENV <<<"$engine_assets"
+  'gaussdb:init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:init-dbdog-user-gaussdb-global.sql:GAUSSDB' \
+  'pg:init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:init-dbdog-user-pg-global.sql:PG' \
+  'opengauss:init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:init-dbdog-user-opengauss-global.sql:OPENGAUSS'; do
+  IFS=: read -r ENGINE PERDB_TOOL_NAME PERDB_SQL_NAME GLOBAL_SQL_NAME ENGINE_ENV <<<"$engine_assets"
   PERDB_TOOL="$SCRIPTS_DIR/agent/$PERDB_TOOL_NAME"
   [ -f "$PERDB_TOOL" ] || fail "发布包缺少 $ENGINE 每库 DBM 初始化脚本"
   [ -x "$PERDB_TOOL" ] || fail "$ENGINE 每库 DBM 初始化脚本不可执行"
   [ -f "$SCRIPTS_DIR/agent/$PERDB_SQL_NAME" ] || fail "发布包缺少 $ENGINE 每库对象 SQL"
+  # 全局建号 SQL 必须随包发货：每库脚本的前置门指路、安装器建号链兜底、DBA 手工接入都靠它
+  # （2026-08-19 前它只活在研发仓 dbdog-deploy，现场按文档指引找不到文件，ecs-f82e 实锤）。
+  [ -f "$SCRIPTS_DIR/agent/$GLOBAL_SQL_NAME" ] || fail "发布包缺少 $ENGINE 全局建号 SQL"
   grep -Fq "PERDB_SQL=\${${ENGINE_ENV}_PERDB_SQL:-\$SCRIPT_DIR/$PERDB_SQL_NAME}" "$PERDB_TOOL" || \
     fail "$ENGINE 每库初始化脚本默认没有指向随包同目录的每库 SQL"
   grep -Fq "/opt/dbdog-agent/scripts/$PERDB_TOOL_NAME" "$PERDB_TOOL" || \
@@ -1264,6 +1270,14 @@ for engine_assets in \
   grep -Fq -- '--db' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少指定目标库的 --db 开关"
   grep -Fq -- '--cleanup' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少显式清理开关"
   grep -Fq -- '--yes' "$PERDB_TOOL" || fail "$ENGINE 每库初始化脚本缺少非交互确认开关"
+  # 前置门：角色不存在必须进门就报 PREREQ_MISSING 并给出 global SQL 指路，
+  # 不能等 perdb.sql 深处的 GRANT 才炸（2026-08-19 ecs-f82e 三库连环炸实锤）。
+  grep -Fq 'PREREQ_MISSING' "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本缺少监控角色前置检查"
+  grep -Fq "$GLOBAL_SQL_NAME" "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本的前置门没有指向随包 global SQL"
+  grep -Fq 'SEARCH_PATH_FAILED' "$PERDB_TOOL" || \
+    fail "$ENGINE 每库初始化脚本的 set_search_path 失败会被成功样 echo 洗白"
   # 旧三开关必须真的退役：留着会让控制台旧命令照跑、语义分叉。
   if grep -Fq -e '--all)' -e '--check)' -e '--exclude)' "$PERDB_TOOL"; then
     fail "$ENGINE 每库初始化脚本还残留旧开关 (--all/--check/--exclude)"
@@ -1272,7 +1286,28 @@ for engine_assets in \
     fail "$ENGINE 每库初始化脚本缺少 search_path 的 ALTER ROLE IN DATABASE 步骤"
   grep -Fq "$PERDB_TOOL_NAME:$PERDB_SQL_NAME" "$SCRIPTS_DIR/agent-install.sh" || \
     fail "安装器没有把 $ENGINE 那套列进随包安装清单"
+  grep -Fq "$PERDB_SQL_NAME:$GLOBAL_SQL_NAME" "$SCRIPTS_DIR/agent-install.sh" || \
+    fail "安装器随包清单没有把 $ENGINE 的 global SQL 一起发货"
 done
+# PostgreSQL 建号链：缺号就建（env 密码）、已存在只补授权、绝不改密；建号后 TCP 探活。
+grep -Fq 'agent_prepare_pg_user' "$SCRIPTS_DIR/agent-install.sh" || \
+  fail "安装器缺少 PostgreSQL 建号链"
+grep -Fq 'GRANT pg_monitor TO dbdog' "$SCRIPTS_DIR/agent-install.sh" || \
+  fail "PostgreSQL 建号链没有补 pg_monitor"
+if grep -Eq 'ALTER (USER|ROLE) dbdog[^;]*PASSWORD' "$SCRIPTS_DIR/agent-install.sh"; then
+  fail "PostgreSQL 建号链不得改已有用户密码"
+fi
+awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
+  | grep -Fq 'agent_prepare_pg_user' || \
+  fail "安装主流程没有调用 PostgreSQL 建号链"
+awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
+  | grep -n 'cutover\|agent_prepare_pg_user\|agent_require_probe_credentials' \
+  | awk -F: '$2 ~ /agent_prepare_pg_user/ { print $1; exit }' >"$TEST_ROOT/pg-prepare-order.tmp"
+awk '/^main\(\) \{/,/^\}/' "$SCRIPTS_DIR/agent-install.sh" \
+  | grep -n 'cutover\|agent_require_probe_credentials' \
+  | awk -F: '$2 ~ /agent_require_probe_credentials/ { print $1; exit }' >"$TEST_ROOT/pg-probe-order.tmp"
+[ "$(cat "$TEST_ROOT/pg-prepare-order.tmp")" -lt "$(cat "$TEST_ROOT/pg-probe-order.tmp")" ] || \
+  fail "PostgreSQL 建号链必须在 TCP 凭证验收之前执行"
 # GaussDB/openGauss 的 canonical explain 入口在 public（SECURITY DEFINER 按函数所属 schema
 # 解析未限定表名）；PostgreSQL 在 dbdog schema。验收断言必须各按各的，不许折叠。
 grep -Fq "nspname = 'public' AND p.proname = 'dbdog_explain_statement'" \

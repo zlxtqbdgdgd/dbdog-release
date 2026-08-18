@@ -57,9 +57,10 @@ usage() {
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
   DBDOG_GAUSSDB_DBNAME                   默认 postgres
   DBDOG_GAUSSDB_DEPLOYMENT               centralized 或 distributed
-  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（暂只验不建；升级路径自动按现有 conf 逐实例沿用）
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
-  DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（缺用户时安装器建号用同一密码；
+                                         升级路径自动按现有 conf 逐实例沿用）
   DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb）；
                                          设置后只探测并渲染名单内引擎，名单外实例显式跳过并记日志。
                                          不设置 = 现状全引擎探测（upgrade.sh 与历史行为零变化）。
@@ -486,7 +487,7 @@ agent_apply_engine_allowlist() {
       postgres)
         if [ -n "${AGENT_PG_PORTS[*]-}" ]; then
           log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 PostgreSQL 端口 ${AGENT_PG_PORTS[*]}（不探测不渲染）"
-          AGENT_PG_PORTS=() AGENT_PG_DATA_DIRS=() AGENT_PG_LOG_GLOBS=() AGENT_PG_RENDER_PASSWORDS=()
+          AGENT_PG_PORTS=() AGENT_PG_DATA_DIRS=() AGENT_PG_LOG_GLOBS=() AGENT_PG_RENDER_PASSWORDS=() AGENT_PG_PID_OWNERS=() AGENT_PG_PID_PSQLS=() AGENT_PG_PID_SOCKETS=()
         fi ;;
       opengauss)
         if [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
@@ -569,24 +570,133 @@ agent_assemble_engine_credentials() {
 }
 
 agent_require_probe_credentials() {
-  # openGauss/PostgreSQL 只验不建：凭证必须在启动验收前被 TCP 实测有效，失败即指路
-  # DBA 工具（安装器不创建、不修改这两个引擎的用户与 HBA）。在 cutover 之后执行——
-  # 探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
+  # openGauss 凭证只验不建（建号链语义还没在 og 上真机核实，二期放开）；PostgreSQL
+  # 已改为「缺了就建、建完就验」（agent_prepare_pg_user，2026-08-19），这里的探针
+  # 对 PG 是建号之后的最终验收。凭证必须在启动验收前被 TCP 实测有效。在 cutover 之后
+  # 执行——探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
   local index port rc
   for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
     port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
     rc=0
     agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
       "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]}" "og.$index" || rc=$?
-    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 openGauss 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-opengauss-all-databases.sh 的执行结果与 HBA 后重试，本次安装会回滚"
+    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器暂不创建 openGauss 用户，请 DBA 用 ${DBDOG_INSTALL_GLOBAL_HINT:-init-dbdog-user-opengauss-global.sql} 建号并核对 HBA 后重试，本次安装会回滚"
   done
   for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
     port="${AGENT_PG_PORTS[$index]}"
     rc=0
     agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" \
       "${AGENT_PG_RENDER_PASSWORDS[$index]}" "pg.$index" || rc=$?
-    [ "$rc" -eq 0 ] || die "PostgreSQL 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器不创建/修改 PostgreSQL 用户，请 DBA 核对 $SCRIPT_DIR/agent/init-dbdog-user-pg-all-databases.sh 的执行结果与 pg_hba 后重试，本次安装会回滚"
+    [ "$rc" -eq 0 ] || die "PostgreSQL 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；请核对 HBA 是否放行 dbdog 经 127.0.0.1 密码认证后重试（建号由安装器完成，用户已存在），本次安装会回滚"
   done
+}
+
+agent_pg_admin_exec() { # <实例索引> <命令> [参数...]；以 postgres 进程属主经本地 socket 管理员连接
+  # 管理员连接不碰任何密码：root runuser 转成 PG 进程的 OS 属主，走 socket peer 认证。
+  # psql 直接取自实例自己的 bin（探测时从 postmaster exe 推导），不存在 PATH 漂移。
+  local index="$1" owner psql socket port
+  shift
+  owner="${AGENT_PG_PID_OWNERS[$index]}"
+  psql="${AGENT_PG_PID_PSQLS[$index]}"
+  socket="${AGENT_PG_PID_SOCKETS[$index]:-}"
+  port="${AGENT_PG_PORTS[$index]}"
+  [ -n "$owner" ] || die "无法从 postgres 进程确定运行用户（实例 127.0.0.1:${port}）"
+  [ -x "$psql" ] || die "目标 PostgreSQL 没有可用 psql: $psql（实例 127.0.0.1:${port}）"
+  runuser -u "$owner" -- env -i \
+    HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
+    PGPORT="$port" PGCONNECT_TIMEOUT=8 \
+    ${socket:+PGHOST="$socket"} \
+    PATH="$(dirname "$psql"):/usr/bin:/bin" "$@"
+}
+
+agent_pg_role_exists() { # <实例索引>；输出 1/0
+  local out
+  out="$(agent_pg_admin_exec "$1" "$AGENT_PG_PID_PSQLS[$1]" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
+    -c "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='dbdog') THEN 1 ELSE 0 END;")" || return 1
+  printf '%s\n' "$out" | tr -d '[:space:]'
+}
+
+agent_prepare_pg_user() { # PostgreSQL 建号链：缺了就建（env 密码）、已存在只补授权、绝不改密
+  # 密码一致性是这套链的立身之本：建号与渲染 conf.d 用的是同一个 DBDOG_POSTGRES_MONITOR_PASSWORD，
+  # 手动建号时代「DBA 密码 vs conf 密码对不上」的经典支持成本就此消失。凭证卫生照抄
+  # GaussDB 建号链：密码只进 0600 临时 SQL 文件、经 stdin 喂 psql，不进 argv 不进日志。
+  local index count port pw escaped exists rc sql_file out
+  count="${#AGENT_PG_PORTS[@]}"
+  [ "$count" -gt 0 ] || return 0
+  # 密码是建号链的硬前置：缺了在动任何东西之前 die（密码渲染校验挂在非 host-only 路径，
+  # 但那已经在 cutover 后——这里前移到建号前，避免装一半回滚）。
+  for ((index=0; index<count; index++)); do
+    pw="${AGENT_PG_RENDER_PASSWORDS[$index]:-}"
+    if [ -z "$pw" ]; then
+      die "PostgreSQL 监控密码缺失（实例 127.0.0.1:${AGENT_PG_PORTS[$index]}）：请 export DBDOG_POSTGRES_MONITOR_PASSWORD 后重跑"
+    fi
+  done
+  log "准备 PostgreSQL dbdog 监控账号（缺了就建/已存在只补授权，密码取自安装输入）..."
+  for ((index=0; index<count; index++)); do
+    port="${AGENT_PG_PORTS[$index]}"
+    pw="${AGENT_PG_RENDER_PASSWORDS[$index]}"
+    escaped="$(agent_sql_literal "$pw")" || die "PostgreSQL 监控密码含不支持字符（实例 127.0.0.1:${port}）"
+    exists="$(agent_pg_role_exists "$index")" || \
+      die "无法经本地管理员连接查询 pg_roles（实例 127.0.0.1:${port}）；请核对数据库 OS 用户与 socket 目录"
+    sql_file="$WORK_DIR/prepare-pg-user.$index.sql"
+    case "$exists" in
+      0)
+        printf "CREATE USER dbdog WITH PASSWORD '%s';\nGRANT pg_monitor TO dbdog;\n" "$escaped" >"$sql_file" || return 1
+        ;;
+      1)
+        # 已存在的用户绝不改密（密码可能另有主人）；只幂等补 pg_monitor。
+        # 密码对不对交给随后的 TCP 探针裁决，错了 die 指路而不是重置。
+        printf "GRANT pg_monitor TO dbdog;\n" >"$sql_file" || return 1
+        ;;
+      *) die "无法判断 PostgreSQL 监控用户是否存在（实例 127.0.0.1:${port}）" ;;
+    esac
+    chmod 0600 "$sql_file" || return 1
+    out="$WORK_DIR/prepare-pg-user.$index.out"
+    if ! agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -v ON_ERROR_STOP=1 \
+      -d postgres -f "$sql_file" >"$out" 2>&1; then
+      agent_show_preflight_error "$out" \
+        "无法通过本地管理员连接准备 PostgreSQL 监控用户（实例 127.0.0.1:${port}）"
+    fi
+    rm -f -- "$sql_file"
+    if [ "$exists" = 0 ]; then
+      rc=0
+      agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" "$pw" "pg.create.$index" || rc=$?
+      [ "$rc" -eq 0 ] || die "已创建 PostgreSQL dbdog 用户，但标准 libpq 仍无法经 127.0.0.1 TCP 登录（实例 127.0.0.1:${port}，rc=${rc}）；请核对 pg_hba.conf 是否放行 dbdog 密码认证（安装器不修改 pg_hba.conf），本次安装会回滚"
+    fi
+  done
+}
+
+bootstrap_postgres_monitoring() {
+  # PG 版的安装期每库对象准备：perdb.sql 对实例全部可连库各应用一遍（幂等）。
+  # 与 GaussDB 侧 bootstrap_gaussdb_monitoring 同位；search_path 追加语义由落盘的
+  # 五合一脚本承载（DBA 后续重跑同一入口），安装器这里只做首装的库内对象。
+  local sql="$SCRIPT_DIR/agent/init-dbdog-user-pg-perdb.sql" index count db databases list
+  if [ -z "${AGENT_PG_PORTS[*]-}" ]; then
+    return 0
+  fi
+  [ -f "$sql" ] || die "缺少 PostgreSQL 每库对象 SQL: $sql"
+  count="${#AGENT_PG_PORTS[@]}"
+  log "幂等准备 PostgreSQL 每库 DBM 对象（扩展/schema/explain/列统计入口）..."
+  for ((index=0; index<count; index++)); do
+    agent_prepare_pg_instance_dbs "$index" "$sql"
+  done
+}
+
+agent_prepare_pg_instance_dbs() { # <实例索引> <perdb.sql 路径>
+  local index="$1" sql="$2" port dbs db out
+  port="${AGENT_PG_PORTS[$index]}"
+  dbs="$(agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
+    -c "SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false AND datallowconn ORDER BY datname;")" || \
+    die "无法枚举 PostgreSQL 数据库（实例 127.0.0.1:${port}）"
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    out="$WORK_DIR/pg-perdb.${port}.${db}.out"
+    if ! agent_pg_admin_exec "$index" "$AGENT_PG_PID_PSQLS[$index]" -X -q -v ON_ERROR_STOP=1 \
+      -d "$db" -f "$sql" >"$out" 2>&1; then
+      agent_show_preflight_error "$out" \
+        "应用 PostgreSQL 每库对象 SQL 失败（实例 127.0.0.1:${port} 数据库 ${db}）"
+    fi
+  done <<<"$dbs"
 }
 
 preflight_gaussdb_clients() {
@@ -881,30 +991,37 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
 }
 
 # 安装器只负责「装机当时存在的库」；此后每次 CREATE DATABASE 都要由 DBA 重跑每库初始化。
-# 把批量脚本和它用的 SQL 一起落到 runtime 树下的固定路径，控制台「采集配置」页就能给出
-# 绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts DB_INIT_SCRIPT_DIR），
+# 把批量脚本、每库 SQL 和全局建号 SQL 一起落到 runtime 树下的固定路径，控制台「采集配置」
+# 页就能给出绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts DB_INIT_SCRIPT_DIR），
 # 研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
 #
 # 三引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
 # 会让 PostgreSQL/openGauss 实例的页面指向不存在的文件。多出的两套是惰性文本，无服务加载。
+# global SQL 同步发货：每库脚本的前置门、安装器建号链的兜底指路、DBA 手工接入都要用
+# 它——2026-08-19 前它只活在研发仓 dbdog-deploy/scripts/ 里，现场想按文档指引走都找不到
+# 文件（ecs-f82e 实锤）。
 AGENT_DBM_INIT_ASSETS="\
-init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql
-init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql
-init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql"
+init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:init-dbdog-user-gaussdb-global.sql
+init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:init-dbdog-user-pg-global.sql
+init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:init-dbdog-user-opengauss-global.sql"
 
 install_dbm_init_scripts() {
-  local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent" entry script sql count=0
+  local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent" entry script sql global count=0
   install -d -o root -g root -m 0755 "$target" || die "无法创建每库初始化工具目录: $target"
   while IFS= read -r entry; do
     script="${entry%%:*}"
-    sql="${entry##*:}"
+    global="${entry##*:}"
+    sql="${entry%:*}"; sql="${sql#*:}"
     [ -f "$source/$script" ] || die "缺少每库 DBM 初始化脚本: $source/$script"
     [ -f "$source/$sql" ] || die "缺少每库 DBM 对象 SQL: $source/$sql"
+    [ -f "$source/$global" ] || die "缺少全局建号 SQL: $source/$global"
     # DBA 用数据库 OS 账号（非 root）执行，故给 a+rx / a+r。
     install -o root -g root -m 0755 "$source/$script" "$target/$script" || \
       die "无法安装每库 DBM 初始化脚本: $target/$script"
     install -o root -g root -m 0444 "$source/$sql" "$target/$sql" || \
       die "无法安装每库 DBM 对象 SQL: $target/$sql"
+    install -o root -g root -m 0444 "$source/$global" "$target/$global" || \
+      die "无法安装全局建号 SQL: $target/$global"
     count=$((count + 1))
   done <<<"$AGENT_DBM_INIT_ASSETS"
   [ "$count" -eq 3 ] || die "每库 DBM 初始化工具数量异常: $count"
@@ -1825,8 +1942,10 @@ main() {
   cutover
   if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
     install_dbm_init_scripts
+    agent_prepare_pg_user
     agent_require_probe_credentials
     bootstrap_gaussdb_monitoring
+    bootstrap_postgres_monitoring
   fi
   start_and_verify
 
