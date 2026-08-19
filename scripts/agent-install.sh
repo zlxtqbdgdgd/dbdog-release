@@ -57,7 +57,8 @@ usage() {
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
   DBDOG_GAUSSDB_DBNAME                   默认 postgres
   DBDOG_GAUSSDB_DEPLOYMENT               centralized 或 distributed
-  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（暂只验不建；升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（缺用户时安装器建号用同一密码，
+                                         升级路径自动按现有 conf 逐实例沿用）
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
   DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（缺用户时安装器建号用同一密码；
                                          升级路径自动按现有 conf 逐实例沿用）
@@ -282,6 +283,13 @@ resolve_inputs() {
   case "$DBDOG_API_KEY" in *[!A-Za-z0-9._-]*) die "DBDOG_API_KEY 含不支持的字符" ;; esac
 
   agent_require_single_line DBDOG_OPENGAUSS_MONITOR_PASSWORD "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}"
+  # openGauss 建号链放开后，og 密码同 GaussDB 口径做强度校验（og 服务端密码策略
+  # ≥8 位 ≥3 字符类，f82e 实测 dbdog_1234 两类被拒）——首装时缺密码不再装一半回滚，
+  # 这里直接 die 指路。已有实例走 conf 收割路径时密码非空，不受影响。
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ] && [ -n "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" ]; then
+    agent_validate_gaussdb_password "$DBDOG_OPENGAUSS_MONITOR_PASSWORD" || \
+      die "openGauss 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类（og 服务端密码策略同口径）"
+  fi
   agent_require_single_line DBDOG_POSTGRES_MONITOR_PASSWORD "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}"
   agent_require_single_line DBDOG_GAUSSDB_ENV_FILE "${DBDOG_GAUSSDB_ENV_FILE:-}"
   agent_require_single_line DBDOG_GAUSSDB_PGHOST "${DBDOG_GAUSSDB_PGHOST:-}"
@@ -572,17 +580,17 @@ agent_assemble_engine_credentials() {
 }
 
 agent_require_probe_credentials() {
-  # openGauss 凭证只验不建（建号链语义还没在 og 上真机核实，二期放开）；PostgreSQL
-  # 已改为「缺了就建、建完就验」（agent_prepare_pg_user，2026-08-19），这里的探针
-  # 对 PG 是建号之后的最终验收。凭证必须在启动验收前被 TCP 实测有效。在 cutover 之后
-  # 执行——探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
+  # openGauss 建号链已放开（bootstrap_openGauss_monitoring，2026-08-19 f82e 实证：
+  # type=1 下 CREATE 的号 psycopg/libpq TCP 实连 OK）——这里的探针是建号之后的
+  # 最终验收。凭证必须在启动验收前被 TCP 实测有效。在 cutover 之后执行——探测用的
+  # embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
   local index port rc
   for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
     port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
     rc=0
     agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
       "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]}" "og.$index" || rc=$?
-    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；安装器暂不创建 openGauss 用户，请 DBA 用 ${DBDOG_INSTALL_GLOBAL_HINT:-init-dbdog-user-opengauss-global.sql} 建号并核对 HBA 后重试，本次安装会回滚"
+    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；dbdog 用户已由安装器建号/校验，此处失败通常是 HBA 未放行 dbdog 经 127.0.0.1 密码认证，请核对 pg_hba.conf 后重试，本次安装会回滚"
   done
   for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
     port="${AGENT_PG_PORTS[$index]}"
@@ -740,14 +748,20 @@ agent_prepare_pg_instance_dbs() { # <实例索引> <perdb.sql 路径>
 }
 
 preflight_gaussdb_clients() {
-  local index count gsql ldd_bin out value mode hba exists
+  # GaussDB 与 openGauss 共用 gauss 检测链（gsql 客户端环境同构）。og 自 2026-08-19 起
+  # 走同一套建号链，预检同样前置：gsql 可用性、password_encryption_type=1、dbdog 存在
+  # 时的生效认证。与 GaussDB 的差异：og 的本机 HBA 常见 trust（f82e 实测形态），日常
+  # 采集走标准 libpq 在 trust/md5 下都能完成认证——所以 og 不硬卡「生效认证必须是
+  # MD5」，GaussDB 维持原硬门禁（其兼容合同就是 md5）。
+  local index count gsql ldd_bin out value mode hba exists engine
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
+  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
     return 0
   fi
-  log "预检目标 GaussDB 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
+  log "预检目标 GaussDB/openGauss 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
   for ((index=0; index<count; index++)); do
-    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
+    engine="${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}"
+    case "$engine" in gaussdb | opengauss) ;; *) continue ;; esac
     gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
     ldd_bin="$(agent_find_in_path "${AGENT_GAUSS_PID_PATHS[$index]}" ldd 2>/dev/null || true)"
     [ -n "$ldd_bin" ] || die "GaussDB 客户端环境找不到 ldd（实例索引 ${index}）"
@@ -777,28 +791,35 @@ preflight_gaussdb_clients() {
       | awk 'NF { value=$0 } END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value }')" || \
       agent_show_preflight_error "$WORK_DIR/gsql-password-mode.$index.err" \
         "无法读取 password_encryption_type（实例索引 ${index}）"
-    # 日常采集的已验证兼容合同是标准 libpq 经 127.0.0.1 TCP + MD5 HBA。
-    # mode=1 让新建监控用户同时具有 SHA256 与 MD5 凭证；安装器只读校验。
+    # 日常采集的兼容合同是标准 libpq 经 127.0.0.1 TCP 完成认证。mode=1 让新建监控用户
+    # 同时具有 SHA256 与 MD5 凭证；mode=2（纯 sha256）下建的号标准 libpq 连不上
+    # （f82e og 实测：Invalid username/password / SASL 失败）。安装器只读校验。
     [ "$mode" = 1 ] || die \
-      "GaussDB 前置条件不满足：SHOW password_encryption_type 当前为 ${mode}，必须由 DBA 按数据库规范配置为 1 并确认生效；dbdog 安装器不会修改 postgresql.conf"
-    hba="$(agent_gaussdb_hba_file "$index")" || \
-      die "无法在预检阶段确定 GaussDB HBA 文件（实例索引 ${index}）"
-    agent_hba_has_required_tcp_md5 "$hba" || die \
-      "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 把它放在可能匹配 dbdog 的宽泛规则之前并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+      "${engine} 前置条件不满足：SHOW password_encryption_type 当前为 ${mode}，必须由 DBA 按数据库规范配置为 1（gs_guc set 后重启实例生效）并确认生效；dbdog 安装器不会修改 postgresql.conf"
+    if [ "$engine" = gaussdb ]; then
+      hba="$(agent_gaussdb_hba_file "$index")" || \
+        die "无法在预检阶段确定 GaussDB HBA 文件（实例索引 ${index}）"
+      agent_hba_has_required_tcp_md5 "$hba" || die \
+        "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 把它放在可能匹配 dbdog 的宽泛规则之前并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+    fi
+    # openGauss 不硬卡 HBA md5：其本机 HBA 常见 trust，标准 libpq 在 trust/md5 下都能
+    # 完成认证（f82e 实测 psycopg 直连 OK）。凭证最终由建号后的 TCP 探针实测裁决。
     exists="$(agent_gsql "$index" -c \
       "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
       | awk 'NF { value=$0 } END { print value }')" || \
-      die "无法在预检阶段判断 GaussDB 监控用户是否存在（实例索引 ${index}）"
+      die "无法在预检阶段判断 ${engine} 监控用户是否存在（实例索引 ${index}）"
     case "$exists" in
       0)
         # 不存在的角色可能按服务端全局密码策略收到防枚举用的模拟 challenge，
         # 不能拿它推断新账号创建后的 verifier。CREATE 后会立即做 code=5 + 真实 libpq 验收。
         ;;
       1)
-        agent_active_auth_is_md5 "$index" || die \
-          "GaussDB 当前生效的本机 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序、用户凭证与 reload 状态（实例索引 ${index}）"
+        if [ "$engine" = gaussdb ]; then
+          agent_active_auth_is_md5 "$index" || die \
+            "GaussDB 当前生效的本机 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序、用户凭证与 reload 状态（实例索引 ${index}）"
+        fi
         ;;
-      *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
+      *) die "无法判断 ${engine} 监控用户是否存在（实例索引 ${index}）" ;;
     esac
 
     agent_warn_gaussdb_collection_gucs "$index"
@@ -918,8 +939,11 @@ PY
   return 1
 }
 
-agent_monitor_password_works() { # <gauss 实例索引> <密码>；兼容包装，语义同 agent_tcp_password_probe
-  agent_tcp_password_probe "${AGENT_GAUSS_PID_PORTS[$1]}" "$DBDOG_GAUSSDB_DBNAME" "$2" "gauss.$1"
+agent_monitor_password_works() { # <gauss 系实例索引> <密码>；兼容包装，语义同 agent_tcp_password_probe
+  local db
+  db="$DBDOG_GAUSSDB_DBNAME"
+  [ "${AGENT_GAUSS_PID_ENGINES[$1]:-gaussdb}" = opengauss ] && db="${DBDOG_OPENGAUSS_DBNAME:-postgres}"
+  agent_tcp_password_probe "${AGENT_GAUSS_PID_PORTS[$1]}" "$db" "$2" "gauss.$1"
 }
 
 agent_active_auth_is_md5() { # <进程索引>；读取当前生效的 PostgreSQL v3 认证请求，不提交失败密码
@@ -977,15 +1001,20 @@ PY
   fi
 }
 
-agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭证
-  local password="$1" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
-  local index count exists mode reset=0 password_status
-  escaped="$(agent_sql_literal "$password")" || return 1
+agent_prepare_gaussdb_user() { # <gauss 密码> <og 密码>；创建用户或验证已有用户凭证
+  local password="$1" og_password="$2" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
+  local index count exists mode reset=0 password_status engine this_pw
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || return 1
+  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || return 1
   for ((index=0; index<count; index++)); do
-    # 建号链只属于真 GaussDB；openGauss 实例凭证只验不建（agent_require_probe_credentials）。
-    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
+    engine="${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}"
+    case "$engine" in gaussdb | opengauss) ;; *) continue ;; esac
+    # openGauss 建号链 2026-08-19 放开（f82e 实证 type=1 CREATE 后 psycopg TCP OK），
+    # 与 GaussDB 同一套护栏：缺了就建/已存在只补 MONADMIN 绝不改密/建后 TCP 验活。
+    this_pw="$password"
+    [ "$engine" = opengauss ] && this_pw="$og_password"
+    [ -n "$this_pw" ] || { warn "实例索引 ${index}（${engine}）监控密码缺失：请提供对应引擎的 *_MONITOR_PASSWORD"; return 1; }
+    escaped="$(agent_sql_literal "$this_pw")" || return 1
     exists="$(agent_gsql "$index" -c \
       "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
       | awk 'NF { value=$0 } END { print value }')" || return 1
@@ -998,15 +1027,21 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
         reset=1
         ;;
       1)
-        agent_active_auth_is_md5 "$index" || return 1
+        if [ "$engine" = gaussdb ]; then
+          agent_active_auth_is_md5 "$index" || return 1
+        fi
         password_status=0
-        agent_monitor_password_works "$index" "$password" || password_status=$?
+        agent_monitor_password_works "$index" "$this_pw" || password_status=$?
         case "$password_status" in
           0)
             printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
             ;;
           2)
-            warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier，或 Agent 保存密码不匹配。mode=1 不会转换旧凭证，安装器不会擅自改密"
+            if [ "$engine" = gaussdb ]; then
+              warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier，或 Agent 保存密码不匹配。mode=1 不会转换旧凭证，安装器不会擅自改密"
+            else
+              warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier（type=2 时代建的旧号需 ALTER 重刷），或 Agent 保存密码不匹配。安装器不会擅自改密"
+            fi
             return 1
             ;;
           *)
@@ -1015,14 +1050,16 @@ agent_prepare_gaussdb_user() { # <密码>；创建用户或验证已有用户凭
             ;;
         esac
         ;;
-      *) die "无法判断 GaussDB 监控用户是否存在（实例索引 ${index}）" ;;
+      *) die "无法判断 ${engine} 监控用户是否存在（实例索引 ${index}）" ;;
     esac
     chmod 0600 "$sql" || return 1
     agent_gsql "$index" <"$sql" || return 1
     if [ "$reset" -eq 1 ]; then
-      agent_active_auth_is_md5 "$index" || return 1
-      if ! agent_monitor_password_works "$index" "$password"; then
-        warn "实例索引 ${index} 已设置 dbdog 密码，但标准 libpq 仍无法经 127.0.0.1 TCP + MD5 登录"
+      if [ "$engine" = gaussdb ]; then
+        agent_active_auth_is_md5 "$index" || return 1
+      fi
+      if ! agent_monitor_password_works "$index" "$this_pw"; then
+        warn "实例索引 ${index} 已设置 dbdog 密码，但标准 libpq 仍无法经 127.0.0.1 TCP 登录"
         return 1
       fi
     fi
@@ -1069,21 +1106,25 @@ install_dbm_init_scripts() {
 }
 
 bootstrap_gaussdb_monitoring() {
-  local sql="$SCRIPT_DIR/agent/init-dbdog-user-gaussdb-perdb.sql" index count
-  # 建号链只属于真 GaussDB；主机没有 gauss 实例（纯 openGauss/PostgreSQL）时整段跳过。
-  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
+  local sql="$SCRIPT_DIR/agent/init-dbdog-user-gaussdb-perdb.sql" og_sql index count
+  # GaussDB 与 openGauss 共用建号链;主机没有 gauss 系实例（纯 PostgreSQL）时整段跳过。
+  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
     return 0
   fi
   [ -f "$sql" ] || die "缺少 GaussDB 每库对象 SQL: $sql"
+  og_sql="$SCRIPT_DIR/agent/init-dbdog-user-opengauss-perdb.sql"
+  [ -f "$og_sql" ] || die "缺少 openGauss 每库对象 SQL: $og_sql"
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与每库对象（仅安装阶段）..."
+  log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与每库对象（仅安装阶段，GaussDB/openGauss）..."
   # password_encryption_type 与 HBA 已在预检中只读核对。这里仅创建/校验账号，
   # 并用交付给 integration 的同一凭证经内嵌 psycopg/libpq 做真实 TCP 登录探测。
-  agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
-    die "无法通过目标 GaussDB 的本地管理连接准备监控用户"
+  agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" || \
+    die "无法通过目标 GaussDB/openGauss 的本地管理连接准备监控用户"
   for ((index=0; index<count; index++)); do
-    [ "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" = gaussdb ] || continue
-    agent_gsql "$index" <"$sql" || die "应用 GaussDB 每库对象 SQL 失败（实例索引 ${index}）"
+    case "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" in
+      gaussdb) agent_gsql "$index" <"$sql" || die "应用 GaussDB 每库对象 SQL 失败（实例索引 ${index}）" ;;
+      opengauss) agent_gsql "$index" <"$og_sql" || die "应用 openGauss 每库对象 SQL 失败（实例索引 ${index}）" ;;
+    esac
   done
 }
 

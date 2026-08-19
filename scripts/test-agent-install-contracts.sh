@@ -606,7 +606,7 @@ fi
 [ "$(grep -c 'connection.sendall' <<<"$ACTIVE_AUTH_BODY")" -eq 1 ] || \
   fail "生效认证类型探测在 StartupMessage 后仍可能提交额外认证消息"
 PREPARE_USER_BODY="$(awk '/^agent_prepare_gaussdb_user\(\)/ { scan=1 } /^bootstrap_gaussdb_monitoring\(\)/ { scan=0 } scan { print }' "$INSTALL_SCRIPT")"
-grep -Fq "agent_monitor_password_works \"\$index\" \"\$password\"" <<<"$PREPARE_USER_BODY" || \
+grep -Fq "agent_monitor_password_works \"\$index\" \"\$this_pw\"" <<<"$PREPARE_USER_BODY" || \
   fail "准备 dbdog 用户没有用真实正确密码做驱动登录探测"
 grep -Fq "agent_active_auth_is_md5 \"\$index\"" <<<"$PREPARE_USER_BODY" || \
   fail "准备 dbdog 用户没有核对当前生效 MD5 认证"
@@ -614,7 +614,7 @@ grep -Fq "agent_active_auth_is_md5 \"\$index\"" <<<"$PREPARE_USER_BODY" || \
 PREPARE_ACTIVE_LINE="$(grep -n -m1 'agent_active_auth_is_md5 "\$index"' \
   <<<"$PREPARE_USER_BODY" | cut -d: -f1)"
 # shellcheck disable=SC2016 # 静态匹配被测脚本中的字面量变量引用。
-PREPARE_PASSWORD_LINE="$(grep -n -m1 'agent_monitor_password_works "\$index" "\$password"' \
+PREPARE_PASSWORD_LINE="$(grep -n -m1 'agent_monitor_password_works "\$index" "\$this_pw"' \
   <<<"$PREPARE_USER_BODY" | cut -d: -f1)"
 [ -n "$PREPARE_ACTIVE_LINE" ] && [ -n "$PREPARE_PASSWORD_LINE" ] \
   && [ "$PREPARE_ACTIVE_LINE" -lt "$PREPARE_PASSWORD_LINE" ] || \
@@ -1075,7 +1075,7 @@ run_fake_gauss_action() { # <preflight|active-auth|ensure-user>
         agent_active_auth_is_md5 0
         ;;
       ensure-user)
-        agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
+        agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ""
         ;;
     esac
   ' bash "$INSTALL_SCRIPT" "$PREFLIGHT_ROOT" "$1"
