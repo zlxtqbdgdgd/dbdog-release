@@ -1,0 +1,1320 @@
+#!/usr/bin/env bash
+# dbdogctl —— 内网无 root 进程管理：nohup + pidfile，不依赖 systemd。
+# 用法：dbdogctl start|stop|restart|status [服务名|all]
+#       sudo dbdogctl diagnose dbdog-agent
+# 服务：postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/agent-lib.sh"
+
+# 启动顺序即依赖顺序；stop 时倒序。
+SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
+STARTUP_ATTEMPTS="${DBDOG_STARTUP_ATTEMPTS:-30}"
+STARTUP_INTERVAL="${DBDOG_STARTUP_INTERVAL:-1}"
+STARTUP_STABLE_SUCCESSES="${DBDOG_STARTUP_STABLE_SUCCESSES:-2}"
+
+for startup_count in "$STARTUP_ATTEMPTS" "$STARTUP_STABLE_SUCCESSES"; do
+  case "$startup_count" in
+    '' | 0 | *[!0-9]*) die "启动探测次数必须是正整数: $startup_count" ;;
+  esac
+done
+[ "$STARTUP_STABLE_SUCCESSES" -le "$STARTUP_ATTEMPTS" ] \
+  || die "连续成功次数不能大于启动探测次数"
+
+pid_of() {
+  local svc="$1" f pid=""
+  case "$svc" in
+    postgresql) f="$DATA_DIR/pg/postmaster.pid" ;;
+    *) f="$RUN_DIR/$svc.pid" ;;
+  esac
+  [ -f "$f" ] || return 0
+  IFS= read -r pid <"$f" || true
+  case "$pid" in
+    '' | 0 | *[!0-9]*) return 0 ;;
+  esac
+  printf '%s\n' "$pid"
+}
+process_alive() { # kill -0 对僵尸进程也成功；启动门禁必须把 Z 视为已退出
+  local pid="$1" stat state=""
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/stat" ]; then
+    stat="$(<"/proc/$pid/stat")"
+    stat="${stat##*) }"
+    state="${stat%% *}"
+  elif command -v ps >/dev/null 2>&1; then
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  fi
+  case "$state" in Z*) return 1 ;; esac
+}
+
+is_running() {
+  local pid
+  pid="$(pid_of "$1")"
+  [ -n "$pid" ] && process_alive "$pid"
+}
+
+load_app_env() { # 在调用者作用域加载应用配置；调用者决定是否 set -a
+  local svc="$1" envf="$ETC_DIR/$1.env" shared_env=""
+  [ "$svc" = "ddsql-server" ] && shared_env="$ETC_DIR/dbdog-server.env"
+  if [ -n "$shared_env" ] && [ -f "$shared_env" ]; then
+    source "$shared_env" || return 1
+  fi
+  if [ -f "$envf" ]; then source "$envf" || return 1; fi
+  return 0
+}
+
+expected_process_executable() {
+  case "$1" in
+    dbdog-server) printf '%s\n' "$MODULES_DIR/dbdog-server/current/bin/dbdog-server" ;;
+    ddsql-server) printf '%s\n' "$MODULES_DIR/dbdog-server/current/bin/ddsql-server" ;;
+    dbdog-web | dbdog-mcp) printf '%s\n' "$MODULES_DIR/node/current/bin/node" ;;
+    *) return 1 ;;
+  esac
+}
+
+local_http_probe() {
+  curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+    -o /dev/null "$1"
+}
+
+process_exec_ready() { # Linux 上确认后台 wrapper 已 exec 成真正的服务命令
+  local svc="$1" pid="$2" expected expected_real actual_real magic arg
+  case "$svc" in
+    dbdog-server | ddsql-server | dbdog-web | dbdog-mcp) ;;
+    *) return 0 ;;
+  esac
+
+  # 生产目标是 Linux；macOS 没有 /proc，回归测试由下面的 HTTP probe 握手。
+  [ -e "/proc/$pid/exe" ] || return 0
+  expected="$(expected_process_executable "$svc")" || return 1
+  expected_real="$(readlink -f "$expected" 2>/dev/null)" || return 1
+
+  # 生产包入口是 ELF；同时兼容测试/排障时使用 shebang 脚本作为入口。
+  magic="$(head -c 2 "$expected_real" 2>/dev/null)" || return 1
+  if [ "$magic" = '#!' ]; then
+    while IFS= read -r -d '' arg; do
+      [ "$arg" = "$expected" ] || [ "$arg" = "$expected_real" ] || continue
+      return 0
+    done <"/proc/$pid/cmdline"
+    return 1
+  fi
+
+  actual_real="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+  [ "$actual_real" = "$expected_real" ]
+}
+
+service_probe() { # 进程存活之外的最小就绪检查
+  case "$1" in
+    postgresql)
+      "$MODULES_DIR/postgresql/current/bin/pg_isready" \
+        -h 127.0.0.1 -d postgres >/dev/null 2>&1
+      ;;
+    clickhouse)
+      "$MODULES_DIR/clickhouse/current/bin/clickhouse" client \
+        --host 127.0.0.1 --query "SELECT 1" >/dev/null 2>&1
+      ;;
+    dbdog-server) (
+      load_app_env dbdog-server
+      port="${DBDOG_HTTP_ADDR:-:8080}"; port="${port##*:}"
+      local_http_probe "http://127.0.0.1:$port/healthz"
+      ) >/dev/null 2>&1
+      ;;
+    ddsql-server) (
+      load_app_env ddsql-server
+      port="${DDSQL_ADDR:-127.0.0.1:8770}"; port="${port##*:}"
+      local_http_probe "http://127.0.0.1:$port/healthz"
+      ) >/dev/null 2>&1
+      ;;
+    dbdog-web) (
+      load_app_env dbdog-web
+      local_http_probe "http://127.0.0.1:${PORT:-3000}/login"
+      ) >/dev/null 2>&1
+      ;;
+    dbdog-mcp) (
+      load_app_env dbdog-mcp
+      local_http_probe "http://127.0.0.1:${DBDOG_HTTP_PORT:-8090}/healthz"
+      ) >/dev/null 2>&1
+      ;;
+  esac
+}
+
+wait_started() { # 要求同一 PID 连续存活且探测成功，避免 daemon 父进程的假成功
+  local svc="$1" i pid="" observed_pid="" successes=0
+  for ((i=1; i<=STARTUP_ATTEMPTS; i++)); do
+    pid="$(pid_of "$svc")"
+    if [ -n "$pid" ] && process_alive "$pid"; then
+      if [ "$pid" != "$observed_pid" ]; then
+        observed_pid="$pid"
+        successes=0
+      fi
+      if process_exec_ready "$svc" "$pid" && service_probe "$svc"; then
+        successes=$((successes + 1))
+        [ "$successes" -ge "$STARTUP_STABLE_SUCCESSES" ] && return 0
+      else
+        successes=0
+      fi
+    elif [ -n "$pid" ]; then
+      # 已写入 PID 的 daemon/后台进程已退出，不再把确定失败拖到超时。
+      return 1
+    else
+      observed_pid=""
+      successes=0
+    fi
+    [ "$i" -eq "$STARTUP_ATTEMPTS" ] || sleep "$STARTUP_INTERVAL"
+  done
+  return 1
+}
+
+service_log_path() {
+  case "$1" in
+    postgresql) printf '%s\n' "$LOGS_DIR/postgresql.log" ;;
+    clickhouse) printf '%s\n' "$LOGS_DIR/clickhouse.err.log" ;;
+    *) printf '%s\n' "$LOGS_DIR/$1.log" ;;
+  esac
+}
+
+# 通用应用服务：source 对应 env 文件后 nohup 拉起。
+start_app() { # start_app <服务名> <工作目录> <命令...>
+  local svc="$1" cwd="$2" child_pid; shift 2
+  local envf="$ETC_DIR/$svc.env"
+  [ -f "$envf" ] || warn "$svc: 缺少 ${envf}（将无配置启动）"
+  (
+    set -a
+    load_app_env "$svc"
+    set +a
+    cd "$cwd" || exit 1
+    exec nohup "$@"
+  ) </dev/null >>"$LOGS_DIR/$svc.log" 2>&1 &
+  child_pid="$!"
+  if ! printf '%s\n' "$child_pid" >"$RUN_DIR/$svc.pid"; then
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    return 1
+  fi
+}
+
+start_one() {
+  local svc="$1"
+  if is_running "$svc"; then
+    if wait_started "$svc"; then
+      log "$svc 已在运行且通过启动检查 (pid $(pid_of "$svc"))"
+      return 0
+    fi
+    warn "$svc 进程存在但未通过启动检查；查看 $(service_log_path "$svc")"
+    return 1
+  fi
+  case "$svc" in
+    postgresql)
+      if ! "$MODULES_DIR/postgresql/current/bin/pg_ctl" -D "$DATA_DIR/pg" \
+          -l "$LOGS_DIR/postgresql.log" -w start; then
+        warn "$svc 启动命令失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    clickhouse)
+      rm -f "$RUN_DIR/clickhouse.pid" || {
+        warn "无法清理旧 PID 文件: $RUN_DIR/clickhouse.pid"
+        return 1
+      }
+      if ! "$MODULES_DIR/clickhouse/current/bin/clickhouse" server \
+          --config-file="$ETC_DIR/clickhouse/config.xml" \
+          --pid-file="$RUN_DIR/clickhouse.pid" --daemon; then
+        warn "$svc daemon 启动命令失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    dbdog-server)
+      rm -f "$RUN_DIR/dbdog-server.pid" || return 1
+      if ! start_app dbdog-server "$MODULES_DIR/dbdog-server/current" \
+          "$MODULES_DIR/dbdog-server/current/bin/dbdog-server"; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    ddsql-server)
+      rm -f "$RUN_DIR/ddsql-server.pid" || return 1
+      if ! start_app ddsql-server "$MODULES_DIR/dbdog-server/current" \
+          "$MODULES_DIR/dbdog-server/current/bin/ddsql-server"; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    dbdog-web)
+      rm -f "$RUN_DIR/dbdog-web.pid" || return 1
+      if ! start_app dbdog-web "$MODULES_DIR/dbdog-web/current" \
+          "$MODULES_DIR/node/current/bin/node" server.js; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    dbdog-mcp)
+      rm -f "$RUN_DIR/dbdog-mcp.pid" || return 1
+      if ! start_app dbdog-mcp "$MODULES_DIR/dbdog-mcp/current" \
+          "$MODULES_DIR/node/current/bin/node" index.js; then
+        warn "$svc 后台启动器失败；查看 $(service_log_path "$svc")"
+        return 1
+      fi
+      ;;
+    *) die "未知服务: $svc" ;;
+  esac
+
+  if ! wait_started "$svc"; then
+    warn "$svc 启动命令已返回，但进程未稳定就绪；查看 $(service_log_path "$svc")"
+    if is_running "$svc"; then
+      stop_one "$svc" || warn "$svc 启动失败后的清理也失败，请人工检查"
+    elif [ "$svc" != "postgresql" ]; then
+      rm -f "$RUN_DIR/$svc.pid"
+    fi
+    return 1
+  fi
+  log "$svc 已启动并通过启动检查 (pid $(pid_of "$svc"))"
+}
+
+stop_one() {
+  local svc="$1" i
+  case "$svc" in
+    postgresql)
+      if is_running "$svc"; then
+        if ! "$MODULES_DIR/postgresql/current/bin/pg_ctl" \
+            -D "$DATA_DIR/pg" -m fast -w stop; then
+          warn "$svc 停止失败；查看 $(service_log_path "$svc")"
+          return 1
+        fi
+      fi
+      ;;
+    *)
+      if is_running "$svc"; then
+        kill "$(pid_of "$svc")" 2>/dev/null || true
+        for ((i=1; i<=20; i++)); do is_running "$svc" || break; sleep 0.5; done
+        if is_running "$svc"; then
+          warn "$svc 未响应 TERM，发送 KILL"
+          kill -9 "$(pid_of "$svc")" 2>/dev/null || true
+          sleep 0.1
+        fi
+        if is_running "$svc"; then
+          warn "$svc 停止失败 (pid $(pid_of "$svc"))"
+          return 1
+        fi
+      fi
+      rm -f "$RUN_DIR/$svc.pid"
+      ;;
+  esac
+  log "$svc 已停止"
+}
+
+status_one() {
+  local svc="$1" v m
+  case "$svc" in
+    ddsql-server) m="dbdog-server" ;;
+    *) m="$svc" ;;
+  esac
+  v="$(installed_version "$m")"
+  if is_running "$svc"; then
+    printf '%-14s %-8s pid=%-8s v%s\n' "$svc" "运行中" "$(pid_of "$svc")" "$v"
+  elif service_probe "$svc"; then
+    # 本工具的 pidfile 里没它，但它的就绪探测却通了 ⇒ 这个端口上有别的东西在服务。
+    # 2026-08-24 实测：postgres / clickhouse 由本机既有的旧布局启动，
+    # web/server 连的就是它们，而本工具把两者都报成「已停止」。从本工具视角那是准的，
+    # 但标签把「不归我管、在跑」说成了「没在跑」——一个会说反的状态命令比没有更坏。
+    # 判「外部运行」复用 service_probe（启动门禁用的同一探测），端口来源单一，不另抄一份。
+    printf '%-14s %-8s %-12s v%s\n' "$svc" "外部运行" "非本工具管" "$v"
+  else
+    printf '%-14s %-8s %-12s v%s\n' "$svc" "已停止" "-" "$v"
+  fi
+}
+
+known_service() {
+  case "$1" in
+    postgresql | clickhouse | dbdog-server | ddsql-server | dbdog-web | dbdog-mcp) ;;
+    *) return 1 ;;
+  esac
+}
+
+REQUESTED_SERVICES=()
+select_services() { # 无参数/all → 全部服务，并在执行前验证完整参数集
+  local svc
+  if [ "$#" -eq 0 ]; then
+    REQUESTED_SERVICES=("${SERVICES[@]}")
+  elif [ "$#" -eq 1 ] && [ "$1" = "all" ]; then
+    REQUESTED_SERVICES=("${SERVICES[@]}")
+  else
+    REQUESTED_SERVICES=("$@")
+  fi
+  for svc in "${REQUESTED_SERVICES[@]}"; do
+    [ "$svc" != "all" ] || die "all 不能与其他服务名同时使用"
+    known_service "$svc" || die "未知服务: $svc"
+  done
+}
+
+rollback_started() { # 只撤销本次调用新拉起的服务，不碰调用前就在运行的服务
+  local i
+  [ "$#" -gt 0 ] || return 0
+  warn "启动未全部成功，回滚本次已启动服务: $*"
+  for ((i=$#; i>=1; i--)); do
+    stop_one "${!i}" || warn "回滚失败: ${!i}"
+  done
+}
+
+start_many() {
+  local svc
+  local -a started=()
+  for svc in "$@"; do
+    if is_running "$svc"; then
+      if ! start_one "$svc"; then
+        if [ "${#started[@]}" -gt 0 ]; then rollback_started "${started[@]}"; fi
+        return 1
+      fi
+    elif start_one "$svc"; then
+      started+=("$svc")
+    else
+      if [ "${#started[@]}" -gt 0 ]; then rollback_started "${started[@]}"; fi
+      return 1
+    fi
+  done
+}
+
+stop_many() {
+  local i rc=0
+  for ((i=$#; i>=1; i--)); do
+    stop_one "${!i}" || rc=1
+  done
+  return "$rc"
+}
+
+status_many() {
+  local svc
+  for svc in "$@"; do status_one "$svc"; done
+}
+
+agent_diagnostic_section() {
+  printf '\n===== %s =====\n' "$1"
+}
+
+agent_diagnostic_cleanup() {
+  [ -n "${AGENT_DIAGNOSTIC_TMP_DIR:-}" ] || return 0
+  case "$AGENT_DIAGNOSTIC_TMP_DIR" in
+    "$AGENT_DIAGNOSTIC_TMP_BASE"/dbdog-agent-diagnose.*)
+      rm -rf -- "$AGENT_DIAGNOSTIC_TMP_DIR"
+      ;;
+  esac
+  AGENT_DIAGNOSTIC_TMP_DIR=""
+}
+
+agent_diagnostic_tmp_file() { # <安全前缀>
+  case "$1" in '' | *[!A-Za-z0-9._-]*) return 1 ;; esac
+  mktemp "$AGENT_DIAGNOSTIC_TMP_DIR/$1.XXXXXX"
+}
+
+agent_diagnostic_file_bytes() {
+  wc -c <"$1" | tr -d '[:space:]'
+}
+
+agent_diagnostic_capture_command() { # <output> <timeout seconds> <per-command bytes> <command...>
+  local output="$1" timeout_seconds="$2" requested_limit="$3"
+  local remaining effective size producer_rc consumer_rc
+  local -a pipeline_status=()
+  shift 3
+  AGENT_DIAGNOSTIC_CAPTURE_LIMIT_HIT=0
+  AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC=0
+  : >"$output"
+  remaining=$((AGENT_DIAGNOSTIC_MAX_TOTAL_BYTES_VALUE - AGENT_DIAGNOSTIC_CAPTURED_BYTES))
+  if [ "$remaining" -le 1 ]; then
+    AGENT_DIAGNOSTIC_CAPTURE_LIMIT_HIT=1
+    AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC=0
+    return 65
+  fi
+  effective="$requested_limit"
+  [ "$effective" -lt "$remaining" ] || effective=$((remaining - 1))
+
+  # pipefail 暂时关闭，使 head 的硬字节边界先完成；producer 的真实状态
+  # 随后从 PIPESTATUS 单独解释。文件最多只会落盘 effective+1 字节。
+  set +o pipefail
+  timeout "$timeout_seconds" "$@" 2>&1 \
+    | head -c "$((effective + 1))" >"$output"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -o pipefail
+  producer_rc="${pipeline_status[0]}"
+  consumer_rc="${pipeline_status[1]}"
+  size="$(agent_diagnostic_file_bytes "$output")"
+  AGENT_DIAGNOSTIC_CAPTURED_BYTES=$((AGENT_DIAGNOSTIC_CAPTURED_BYTES + size))
+  AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC="$producer_rc"
+  [ "$consumer_rc" -eq 0 ] || return "$consumer_rc"
+  if [ "$size" -gt "$effective" ]; then
+    AGENT_DIAGNOSTIC_CAPTURE_LIMIT_HIT=1
+    return 65
+  fi
+  return "$producer_rc"
+}
+
+agent_diagnostic_stat_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+agent_diagnostic_stat_uid() {
+  stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
+}
+
+agent_diagnostic_prepare_result_file() {
+  local result="${AGENT_DIAGNOSTIC_RESULT_FILE:-}" directory mode uid dir_mode dir_uid
+  AGENT_DIAGNOSTIC_RESULT_FILE_VALUE=""
+  [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ] || {
+    [ -z "$result" ] || die "AGENT_DIAGNOSTIC_RESULT_FILE 只能与显式增量时间窗一起使用"
+    return 0
+  }
+  [ -n "$result" ] || die "显式增量时间窗必须提供 AGENT_DIAGNOSTIC_RESULT_FILE"
+  case "$result" in
+    /*) ;;
+    *) die "AGENT_DIAGNOSTIC_RESULT_FILE 必须是绝对路径" ;;
+  esac
+  case "$result" in *$'\n'* | *$'\r'*) die "AGENT_DIAGNOSTIC_RESULT_FILE 含非法换行" ;; esac
+  [ -f "$result" ] && [ ! -L "$result" ] && [ ! -s "$result" ] || \
+    die "AGENT_DIAGNOSTIC_RESULT_FILE 必须是调用者预创建的空普通文件，且不能是符号链接"
+  mode="$(agent_diagnostic_stat_mode "$result")" || die "无法读取诊断结果文件权限"
+  uid="$(agent_diagnostic_stat_uid "$result")" || die "无法读取诊断结果文件属主"
+  [ "$mode" = 600 ] || die "AGENT_DIAGNOSTIC_RESULT_FILE 权限必须是 0600"
+  [ "$uid" = "$EUID" ] || die "AGENT_DIAGNOSTIC_RESULT_FILE 必须属于当前用户"
+  directory="$(dirname "$result")"
+  [ -d "$directory" ] && [ ! -L "$directory" ] || die "诊断结果目录不安全"
+  dir_mode="$(agent_diagnostic_stat_mode "$directory")" || die "无法读取诊断结果目录权限"
+  dir_uid="$(agent_diagnostic_stat_uid "$directory")" || die "无法读取诊断结果目录属主"
+  case "$dir_mode" in
+    *[!0-7]* | '') die "诊断结果目录权限无效" ;;
+  esac
+  [ "$dir_uid" = "$EUID" ] || die "诊断结果目录必须属于当前用户"
+  [ $((8#$dir_mode & 8#022)) -eq 0 ] || die "诊断结果目录不能允许 group/other 写入"
+  AGENT_DIAGNOSTIC_RESULT_FILE_VALUE="$result"
+}
+
+agent_diagnostic_write_result_file() { # <healthy true|false>
+  local healthy="$1" result="$AGENT_DIAGNOSTIC_RESULT_FILE_VALUE"
+  local directory base tmp evidence_complete window_complete
+  [ -n "$result" ] || return 0
+  directory="$(dirname "$result")"
+  base="$(basename "$result")"
+  tmp="$(mktemp "$directory/.$base.tmp.XXXXXX")" || return 1
+  chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] && evidence_complete=true || evidence_complete=false
+  [ "$AGENT_DIAGNOSTIC_WINDOW_COMPLETE" -eq 1 ] && window_complete=true || window_complete=false
+  if ! printf '%s\n' \
+      'schema=dbdog-agent-diagnostic-result/v1' \
+      "requested_from_epoch=$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" \
+      "requested_until_epoch=$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE" \
+      "processed_until_epoch=$AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH" \
+      "window_complete=$window_complete" \
+      "evidence_complete=$evidence_complete" \
+      "healthy=$healthy" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$result" || { rm -f -- "$tmp"; return 1; }
+}
+
+agent_diagnostic_print_limited() { # <file> [lines]
+  local file="$1" limit="${2:-240}" total
+  sed -n "1,${limit}p" "$file" | agent_redact_diagnostic_stream
+  total="$(awk 'END { print NR + 0 }' "$file")"
+  if [ "$total" -gt "$limit" ]; then
+    printf '... truncated: displayed=%s total=%s\n' "$limit" "$total"
+  fi
+}
+
+agent_diagnostic_first_command_line() { # <command> [args...]
+  "$@" 2>/dev/null | awk 'NR == 1 { gsub(/[[:cntrl:]]/, " "); print; exit }'
+}
+
+agent_diagnostic_os_release_value() { # <file> <PRETTY_NAME|ID|VERSION_ID>
+  local file="$1" wanted="$2"
+  awk -v wanted="$wanted" '
+    index($0, wanted "=") == 1 {
+      value = substr($0, length(wanted) + 2)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      quote = sprintf("%c", 39)
+      first = substr(value, 1, 1)
+      last = substr(value, length(value), 1)
+      if (length(value) >= 2 && ((first == "\"" && last == "\"") ||
+          (first == quote && last == quote))) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      gsub(/[[:cntrl:]]/, " ", value)
+      print value
+      exit
+    }
+  ' "$file" 2>/dev/null
+}
+
+agent_diagnostic_host_runtime() {
+  local uname_value=unavailable kernel_release=unavailable machine_arch=unavailable
+  local page_size=unavailable online_cpus=unavailable value missing=0
+  local os_release="${AGENT_DIAGNOSTIC_OS_RELEASE_FILE:-/etc/os-release}"
+  local os_pretty_name=unavailable os_id=unavailable os_version_id=unavailable
+
+  agent_diagnostic_section "host runtime"
+  if command -v uname >/dev/null 2>&1; then
+    value="$(agent_diagnostic_first_command_line uname -a || true)"
+    [ -z "$value" ] || uname_value="$value"
+    value="$(agent_diagnostic_first_command_line uname -r || true)"
+    [ -z "$value" ] || kernel_release="$value"
+    value="$(agent_diagnostic_first_command_line uname -m || true)"
+    case "$value" in
+      '' | *[![:alnum:]_.-]*) ;;
+      *) machine_arch="$value" ;;
+    esac
+  fi
+
+  if command -v getconf >/dev/null 2>&1; then
+    value="$(agent_diagnostic_first_command_line getconf PAGESIZE || true)"
+    case "$value" in '' | 0 | *[!0-9]*) ;; *) page_size="$value" ;; esac
+    value="$(agent_diagnostic_first_command_line getconf _NPROCESSORS_ONLN || true)"
+    case "$value" in '' | 0 | *[!0-9]*) ;; *) online_cpus="$value" ;; esac
+  fi
+
+  if [ -f "$os_release" ] && [ -r "$os_release" ]; then
+    value="$(agent_diagnostic_os_release_value "$os_release" PRETTY_NAME || true)"
+    [ -z "$value" ] || os_pretty_name="$value"
+    value="$(agent_diagnostic_os_release_value "$os_release" ID || true)"
+    [ -z "$value" ] || os_id="$value"
+    value="$(agent_diagnostic_os_release_value "$os_release" VERSION_ID || true)"
+    [ -z "$value" ] || os_version_id="$value"
+  fi
+
+  for value in "$uname_value" "$kernel_release" "$machine_arch" "$page_size" \
+    "$online_cpus" "$os_pretty_name" "$os_id" "$os_version_id"; do
+    [ "$value" != unavailable ] || missing=1
+  done
+  {
+    printf 'uname=%s\n' "$uname_value"
+    printf 'kernel_release=%s\n' "$kernel_release"
+    printf 'machine_arch=%s\n' "$machine_arch"
+    printf 'page_size_bytes=%s\n' "$page_size"
+    printf 'online_cpu_count=%s\n' "$online_cpus"
+    printf 'os_pretty_name=%s\n' "$os_pretty_name"
+    printf 'os_id=%s\n' "$os_id"
+    printf 'os_version_id=%s\n' "$os_version_id"
+    if [ "$missing" -eq 0 ]; then
+      printf 'host_runtime_complete=true\n'
+    else
+      printf 'host_runtime_complete=false (best_effort_only=true)\n'
+    fi
+  } | agent_redact_diagnostic_stream
+}
+
+agent_diagnostic_interval_value() { # <safe check config>; 只输出首个数值或 invalid
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      if (line !~ /^min_collection_interval[[:space:]]*:/) next
+      sub(/^min_collection_interval[[:space:]]*:[[:space:]]*/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line ~ /^[0-9]+([.][0-9]+)?$/) print line
+      else print "invalid"
+      exit
+    }
+  ' "$1" 2>/dev/null
+}
+
+agent_diagnostic_collection_intervals() {
+  local check file value missing=0
+  agent_diagnostic_section "collection intervals (safe subset)"
+  for check in cpu system_core process; do
+    file="$AGENT_CONFIG_DIR/conf.d/$check.d/conf.yaml"
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+      value=config_unavailable
+      missing=1
+    else
+      value="$(agent_diagnostic_interval_value "$file" || true)"
+      if [ -z "$value" ]; then
+        value=not_configured
+        missing=1
+      elif [ "$value" = invalid ]; then
+        missing=1
+      fi
+    fi
+    printf '%s.min_collection_interval=%s\n' "$check" "$value"
+  done
+  if [ "$missing" -eq 0 ]; then
+    printf 'collection_interval_summary_complete=true\n'
+  else
+    printf 'collection_interval_summary_complete=false (best_effort_only=true)\n'
+  fi
+}
+
+agent_diagnostic_run_timed() { # <label> <timeout seconds> <command...>
+  local label="$1" limit="$2" start elapsed rc=0 capture_rc tmp focus pattern
+  shift 2
+  tmp="$(agent_diagnostic_tmp_file command)"
+  start="$SECONDS"
+  if agent_diagnostic_capture_command "$tmp" "$limit" \
+      "$AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES_VALUE" "$@"; then
+    rc=0
+  else
+    capture_rc=$?
+    if [ "$capture_rc" -eq 65 ]; then
+      rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC"
+      printf 'capture_limit_exceeded=true collector=%s max_bytes=%s\n' \
+        "${label// /-}" "$AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES_VALUE"
+      AGENT_DIAGNOSTIC_COMPLETE=0
+    else
+      rc="$capture_rc"
+    fi
+  fi
+  elapsed=$((SECONDS - start))
+  agent_diagnostic_section "$label"
+  printf 'exit_code=%s duration_seconds=%s timeout_seconds=%s\n' "$rc" "$elapsed" "$limit"
+  agent_diagnostic_print_limited "$tmp"
+  if [ "$label" = "agent status" ]; then
+    focus="$(agent_diagnostic_tmp_file status-focus)"
+    grep -inE -C 4 \
+      '(^|[^[:alnum:]_])(cpu|system_core|gaussdb)([^[:alnum:]_]|$)|Average Execution|Last Execution|Total Runs|Errors' \
+      "$tmp" >"$focus" || true
+    agent_diagnostic_section "agent status focused execution summary (max 200 lines)"
+    if [ -s "$focus" ]; then
+      agent_diagnostic_print_limited "$focus" 200
+    else
+      printf 'no matching cpu/system_core/gaussdb execution fields\n'
+    fi
+    rm -f -- "$focus"
+  fi
+  pattern="$(agent_known_runtime_error_pattern)"
+  if grep -Eqi "$pattern" "$tmp"; then
+    printf 'known_runtime_error=true\n'
+    if [ "$label" = "agent check gaussdb" ]; then
+      AGENT_DIAGNOSTIC_HEALTH_RC=1
+    else
+      AGENT_DIAGNOSTIC_FINDINGS=1
+    fi
+  fi
+  if [ "$AGENT_DIAGNOSTIC_CAPTURE_LIMIT_HIT" -eq 0 ]; then
+    [ "$rc" -eq 0 ] || AGENT_DIAGNOSTIC_HEALTH_RC=1
+  fi
+  rm -f -- "$tmp"
+}
+
+agent_diagnostic_markers() {
+  local version artifact contract
+  version="$(agent_marker_value "$AGENT_RUNTIME_DIR/.dbdog-release-version" "$AGENT_RUNTIME_DIR")"
+  artifact="$(agent_marker_value "$AGENT_RUNTIME_DIR/.dbdog-artifact-sha256" "$AGENT_RUNTIME_DIR")"
+  contract="$(agent_marker_value \
+    "$AGENT_RUNTIME_DIR/$AGENT_INSTALLER_CONTRACT_MARKER" "$AGENT_RUNTIME_DIR")"
+  agent_diagnostic_section "runtime identity"
+  printf 'runtime=%s\nrelease_version=%s\nartifact_sha256=%s\ninstaller_contract_sha256=%s\n' \
+    "$AGENT_RUNTIME_DIR" "$version" "$artifact" "$contract"
+  case "$version" in '' | '?' | '-') AGENT_DIAGNOSTIC_HEALTH_RC=1 ;; esac
+  case "$artifact" in '' | '?' | '-') AGENT_DIAGNOSTIC_HEALTH_RC=1 ;; esac
+  case "$contract" in '' | '?' | '-') AGENT_DIAGNOSTIC_HEALTH_RC=1 ;; esac
+}
+
+agent_diagnostic_units() { # <phase> <snapshot output>; snapshot: unit<TAB>MainPID<TAB>NRestarts
+  local phase="$1" snapshot="$2" unit tmp rc capture_rc active pid restarts
+  : >"$snapshot"
+  chmod 0600 "$snapshot"
+  agent_diagnostic_section "systemd units ($phase snapshot)"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'systemctl unavailable\n'
+    AGENT_DIAGNOSTIC_HEALTH_RC=1
+    AGENT_DIAGNOSTIC_COMPLETE=0
+    return
+  fi
+  for unit in "${AGENT_SYSTEMD_UNITS[@]}"; do
+    tmp="$(agent_diagnostic_tmp_file systemd)"
+    if agent_diagnostic_capture_command "$tmp" 10 \
+      "$AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES_VALUE" systemctl show "$unit" --no-pager \
+      -p Id -p ActiveState -p SubState -p MainPID -p NRestarts -p Result \
+      -p ExecMainCode -p ExecMainStatus \
+      -p ExecMainStartTimestamp -p ExecMainExitTimestamp; then
+      rc=0
+    else
+      capture_rc=$?
+      [ "$capture_rc" -eq 65 ] && rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC" || rc="$capture_rc"
+      [ "$capture_rc" -ne 65 ] || AGENT_DIAGNOSTIC_COMPLETE=0
+    fi
+    printf -- '--- %s ---\n' "$unit"
+    agent_diagnostic_print_limited "$tmp" 40
+    active="$(awk -F= '$1 == "ActiveState" { print $2; exit }' "$tmp")"
+    pid="$(awk -F= '$1 == "MainPID" { print $2; exit }' "$tmp")"
+    if [ "$rc" -ne 0 ] || [ "$active" != active ]; then
+      AGENT_DIAGNOSTIC_HEALTH_RC=1
+    fi
+    restarts="$(awk -F= '$1 == "NRestarts" { print $2; exit }' "$tmp")"
+    case "$pid" in '' | 0 | *[!0-9]*) AGENT_DIAGNOSTIC_HEALTH_RC=1 ;; esac
+    case "$restarts" in '' | *[!0-9]*) AGENT_DIAGNOSTIC_COMPLETE=0 ;; esac
+    if [ "$rc" -eq 0 ] && [ "$active" = active ]; then
+      case "$pid:$restarts" in
+        *[!0-9:]* | 0:* | :* | *:) ;;
+        *) printf '%s\t%s\t%s\n' "$unit" "$pid" "$restarts" >>"$snapshot" ;;
+      esac
+    else
+      AGENT_DIAGNOSTIC_COMPLETE=0
+    fi
+    rm -f -- "$tmp"
+  done
+}
+
+agent_diagnostic_unit_deltas() { # <start snapshot> <end snapshot>
+  local before="$1" after="$2" unit before_pid before_restarts line
+  local after_pid after_restarts restart_delta
+  agent_diagnostic_section "systemd restart delta during diagnostic"
+  while IFS=$'\t' read -r unit before_pid before_restarts; do
+    line="$(awk -F'\t' -v wanted="$unit" '$1 == wanted { print; exit }' "$after")"
+    if [ -z "$line" ]; then
+      printf '%s snapshot_comparable=false\n' "$unit"
+      AGENT_DIAGNOSTIC_COMPLETE=0
+      continue
+    fi
+    IFS=$'\t' read -r _ after_pid after_restarts <<<"$line"
+    restart_delta=$((after_restarts - before_restarts))
+    printf '%s start_pid=%s end_pid=%s historical_nrestarts=%s end_nrestarts=%s restart_delta=%s\n' \
+      "$unit" "$before_pid" "$after_pid" "$before_restarts" "$after_restarts" "$restart_delta"
+    if [ "$before_pid" != "$after_pid" ] || [ "$restart_delta" -gt 0 ]; then
+      printf '%s restarted_during_diagnostic=true\n' "$unit"
+      AGENT_DIAGNOSTIC_HEALTH_RC=1
+    elif [ "$restart_delta" -lt 0 ]; then
+      printf '%s snapshot_comparable=false (NRestarts counter reset)\n' "$unit"
+      AGENT_DIAGNOSTIC_COMPLETE=0
+      AGENT_DIAGNOSTIC_FINDINGS=1
+    else
+      printf '%s restarted_during_diagnostic=false (historical count is not a current restart)\n' "$unit"
+    fi
+  done <"$before"
+  if [ "$(awk 'END { print NR + 0 }' "$before")" -ne "${#AGENT_SYSTEMD_UNITS[@]}" ]; then
+    printf 'unit snapshot incomplete\n'
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+}
+
+agent_diagnostic_prepare_window() {
+  local since="${AGENT_DIAGNOSTIC_SINCE_EPOCH:-}"
+  local until="${AGENT_DIAGNOSTIC_UNTIL_EPOCH:-}"
+  local max_lines="${AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES:-5000}"
+  local max_journal_bytes="${AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES:-262144}"
+  local max_command_bytes="${AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES:-262144}"
+  local max_total_bytes="${AGENT_DIAGNOSTIC_MAX_TOTAL_BYTES:-8388608}" value
+  AGENT_DIAGNOSTIC_CUSTOM_WINDOW=0
+  AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE=""
+  AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE=""
+  case "$max_lines" in '' | 0 | *[!0-9]*) die "AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES 必须是正整数" ;; esac
+  [ "$max_lines" -le 50000 ] || die "AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES 不能超过 50000"
+  for value in "$max_journal_bytes" "$max_command_bytes" "$max_total_bytes"; do
+    case "$value" in '' | 0 | *[!0-9]*) die "Agent 诊断字节上限必须是正整数" ;; esac
+  done
+  [ "$max_journal_bytes" -le 4194304 ] || die "AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES 不能超过 4194304"
+  [ "$max_command_bytes" -le 4194304 ] || die "AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES 不能超过 4194304"
+  [ "$max_total_bytes" -le 67108864 ] || die "AGENT_DIAGNOSTIC_MAX_TOTAL_BYTES 不能超过 67108864"
+  AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES_VALUE="$max_lines"
+  AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE="$max_journal_bytes"
+  AGENT_DIAGNOSTIC_MAX_COMMAND_BYTES_VALUE="$max_command_bytes"
+  AGENT_DIAGNOSTIC_MAX_TOTAL_BYTES_VALUE="$max_total_bytes"
+  AGENT_DIAGNOSTIC_CAPTURED_BYTES=0
+  AGENT_DIAGNOSTIC_WINDOW_COMPLETE=1
+  AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH=""
+  if [ -z "$since" ] && [ -z "$until" ]; then return 0; fi
+  case "$since:$until" in
+    :* | *: | *[!0-9:]* )
+      die "AGENT_DIAGNOSTIC_SINCE_EPOCH/UNTIL_EPOCH 必须同时是 Unix 秒整数"
+      ;;
+  esac
+  [ "$since" -le "$until" ] || die "Agent 诊断时间窗起点不能晚于终点"
+  AGENT_DIAGNOSTIC_CUSTOM_WINDOW=1
+  AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE="$since"
+  AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE="$until"
+  AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$since"
+}
+
+agent_diagnostic_enforce_line_limit() { # <captured file> <collector label>
+  local file="$1" label="$2" total
+  total="$(awk 'END { print NR + 0 }' "$file")"
+  [ "$total" -le "$AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES_VALUE" ] && return 0
+  AGENT_DIAGNOSTIC_WINDOW_LIMIT_COLLECTOR="$label"
+  AGENT_DIAGNOSTIC_WINDOW_LIMIT_KIND=lines
+  return 1
+}
+
+agent_diagnostic_capture_window_source() { # <source> <candidate until> <output>
+  local source="$1" candidate="$2" output="$3" capture_rc unit
+  local -a command=()
+  case "$source" in
+    agent-journal)
+      command=(journalctl)
+      for unit in "${AGENT_SYSTEMD_UNITS[@]}"; do command+=(-u "$unit"); done
+      command+=(--since "@$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" --until "@$candidate"
+        -n "$((AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES_VALUE + 1))"
+        -o short-iso --no-pager)
+      ;;
+    kernel-journal)
+      command=(journalctl -k --since "@$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
+        --until "@$candidate" -n "$((AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES_VALUE + 1))"
+        -o short-iso --no-pager)
+      ;;
+    coredump-list)
+      command=(coredumpctl list --since "@$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
+        --until "@$candidate" --no-pager)
+      ;;
+    *) return 64 ;;
+  esac
+  if ! command -v "${command[0]}" >/dev/null 2>&1; then
+    AGENT_DIAGNOSTIC_WINDOW_ERROR_COLLECTOR="$source"
+    AGENT_DIAGNOSTIC_WINDOW_ERROR_RC=127
+    return 1
+  fi
+  if agent_diagnostic_capture_command "$output" 20 \
+      "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" "${command[@]}"; then
+    capture_rc=0
+  else
+    capture_rc=$?
+  fi
+  if [ "$capture_rc" -eq 65 ]; then
+    AGENT_DIAGNOSTIC_WINDOW_LIMIT_COLLECTOR="$source"
+    AGENT_DIAGNOSTIC_WINDOW_LIMIT_KIND=bytes
+    return 75
+  fi
+  if [ "$capture_rc" -ne 0 ]; then
+    AGENT_DIAGNOSTIC_WINDOW_ERROR_COLLECTOR="$source"
+    AGENT_DIAGNOSTIC_WINDOW_ERROR_RC="$capture_rc"
+    return 1
+  fi
+  if ! agent_diagnostic_enforce_line_limit "$output" "$source"; then return 75; fi
+  return 0
+}
+
+agent_diagnostic_try_window() { # <candidate until>; 0 safe, 75 bounded overflow, 1 collector failure
+  local candidate="$1" source output rc
+  local attempt_agent="$AGENT_DIAGNOSTIC_TMP_DIR/window-agent.attempt"
+  local attempt_kernel="$AGENT_DIAGNOSTIC_TMP_DIR/window-kernel.attempt"
+  local attempt_core="$AGENT_DIAGNOSTIC_TMP_DIR/window-coredump.attempt"
+  for source in agent-journal kernel-journal coredump-list; do
+    case "$source" in
+      agent-journal) output="$attempt_agent" ;;
+      kernel-journal) output="$attempt_kernel" ;;
+      coredump-list) output="$attempt_core" ;;
+    esac
+    if agent_diagnostic_capture_window_source "$source" "$candidate" "$output"; then
+      :
+    else
+      rc=$?
+      return "$rc"
+    fi
+  done
+  mv -f -- "$attempt_agent" "$AGENT_DIAGNOSTIC_WINDOW_AGENT_FILE"
+  mv -f -- "$attempt_kernel" "$AGENT_DIAGNOSTIC_WINDOW_KERNEL_FILE"
+  mv -f -- "$attempt_core" "$AGENT_DIAGNOSTIC_WINDOW_COREDUMP_FILE"
+}
+
+agent_diagnostic_negotiate_window() {
+  local low high candidate rc first_attempt=1
+  local budget_baseline selected_bytes=0
+  [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ] || return 0
+  AGENT_DIAGNOSTIC_WINDOW_AGENT_FILE="$AGENT_DIAGNOSTIC_TMP_DIR/window-agent.safe"
+  AGENT_DIAGNOSTIC_WINDOW_KERNEL_FILE="$AGENT_DIAGNOSTIC_TMP_DIR/window-kernel.safe"
+  AGENT_DIAGNOSTIC_WINDOW_COREDUMP_FILE="$AGENT_DIAGNOSTIC_TMP_DIR/window-coredump.safe"
+  : >"$AGENT_DIAGNOSTIC_WINDOW_AGENT_FILE"
+  : >"$AGENT_DIAGNOSTIC_WINDOW_KERNEL_FILE"
+  : >"$AGENT_DIAGNOSTIC_WINDOW_COREDUMP_FILE"
+  low="$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
+  high="$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE"
+  budget_baseline="$AGENT_DIAGNOSTIC_CAPTURED_BYTES"
+  if [ "$low" -eq "$high" ]; then
+    AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$high"
+    AGENT_DIAGNOSTIC_WINDOW_COMPLETE=1
+    return 0
+  fi
+  while [ "$low" -lt "$high" ]; do
+    # 候选探测是事务性的：失败或随后被更大候选取代的 attempt 不得永久
+    # 消耗总预算，否则同一个时间前缀会因探测顺序不同而得到不同结论。
+    AGENT_DIAGNOSTIC_CAPTURED_BYTES="$budget_baseline"
+    # 首次直接尝试完整请求；溢出后用单调的前缀二分找到本轮最大安全整秒边界。
+    if [ "$first_attempt" -eq 1 ]; then
+      candidate="$high"
+      first_attempt=0
+    else
+      candidate=$((low + (high - low + 1) / 2))
+    fi
+    if agent_diagnostic_try_window "$candidate"; then
+      low="$candidate"
+      selected_bytes=$((AGENT_DIAGNOSTIC_CAPTURED_BYTES - budget_baseline))
+      [ "$low" -eq "$high" ] && break
+    else
+      rc=$?
+      if [ "$rc" -ne 75 ]; then
+        AGENT_DIAGNOSTIC_COMPLETE=0
+        AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
+        AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
+        AGENT_DIAGNOSTIC_CAPTURED_BYTES="$budget_baseline"
+        return 1
+      fi
+      high=$((candidate - 1))
+    fi
+  done
+  AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$low"
+  if [ "$low" -eq "$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" ]; then
+    AGENT_DIAGNOSTIC_CAPTURED_BYTES="$budget_baseline"
+    AGENT_DIAGNOSTIC_COMPLETE=0
+    AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
+    return 1
+  fi
+  # 只把最终选中的 agent/kernel/coredump 三份安全文件计入总预算；随后
+  # systemd/status/check 从剩余预算继续消费。
+  AGENT_DIAGNOSTIC_CAPTURED_BYTES=$((budget_baseline + selected_bytes))
+  if [ "$low" -eq "$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE" ]; then
+    AGENT_DIAGNOSTIC_WINDOW_COMPLETE=1
+  else
+    AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
+  fi
+  return 0
+}
+
+agent_diagnostic_journal() {
+  local tmp rc=0 capture_rc pattern unit
+  local -a journal_args=()
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    agent_diagnostic_section "incremental agent journal (bounded by scan window; max 200 lines displayed)"
+  else
+    agent_diagnostic_section "recent agent journal (last 30 minutes, max 200 lines)"
+  fi
+  tmp="$(agent_diagnostic_tmp_file journal)"
+  for unit in "${AGENT_SYSTEMD_UNITS[@]}"; do journal_args+=(-u "$unit"); done
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    cp -- "$AGENT_DIAGNOSTIC_WINDOW_AGENT_FILE" "$tmp"
+    [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] || rc=75
+  elif command -v journalctl >/dev/null 2>&1 && \
+    agent_diagnostic_capture_command "$tmp" 20 \
+      "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" journalctl "${journal_args[@]}" \
+      --since '30 minutes ago' -n 200 -o short-iso --no-pager; then
+    :
+  else
+    capture_rc=$?
+    [ "$capture_rc" -eq 65 ] && rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC" || rc="$capture_rc"
+    if [ "$capture_rc" -eq 65 ]; then
+      printf 'capture_limit_exceeded=true collector=agent-journal max_bytes=%s\n' \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+    fi
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+  printf 'exit_code=%s\n' "$rc"
+  agent_diagnostic_print_limited "$tmp" 200
+  pattern="$(agent_known_runtime_error_pattern)"
+  if grep -Eqi "$pattern" "$tmp"; then
+    printf 'known_runtime_error_in_recent_journal=true\n'
+    AGENT_DIAGNOSTIC_FINDINGS=1
+  fi
+  rm -f -- "$tmp"
+}
+
+agent_diagnostic_sysprobe_panics() {
+  local raw focus rc=0 capture_rc pattern
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    agent_diagnostic_section "known system-probe panic summary (bounded by scan window)"
+  else
+    agent_diagnostic_section "known system-probe panic summary (last 24 hours, max 600 lines scanned)"
+  fi
+  raw="$(agent_diagnostic_tmp_file sysprobe-panic)"
+  focus="$(agent_diagnostic_tmp_file sysprobe-panic-focus)"
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    # 增量模式复用已协商并完整捕获的四个 Agent unit journal，避免同一
+    # 时间窗再读一次并产生不同的边界结论。
+    cp -- "$AGENT_DIAGNOSTIC_WINDOW_AGENT_FILE" "$raw"
+    [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] || rc=75
+  elif command -v journalctl >/dev/null 2>&1 && \
+    agent_diagnostic_capture_command "$raw" 20 \
+      "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" journalctl \
+      -u dbdog-agent-sysprobe.service --since '24 hours ago' \
+      -n 600 -o short-iso --no-pager; then
+    :
+  else
+    capture_rc=$?
+    [ "$capture_rc" -eq 65 ] && rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC" || rc="$capture_rc"
+    if [ "$capture_rc" -eq 65 ]; then
+      printf 'capture_limit_exceeded=true collector=system-probe-journal max_bytes=%s\n' \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+    fi
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+  pattern='panic: runtime error: index out of range \[65536\] with length 28672|preventSegmentMajorPageFault'
+  grep -inE -C 6 "$pattern" "$raw" >"$focus" || true
+  printf 'exit_code=%s\n' "$rc"
+  if [ -s "$focus" ]; then
+    printf 'classification=known_system_probe_dentry_64k_page_panic\n'
+    printf 'remediation=upgrade to a dbdog-agent build with the bounds-safe dentry eRPC fix; keep NPM/USM process event streams enabled\n'
+    agent_diagnostic_print_limited "$focus" 160
+    AGENT_DIAGNOSTIC_FINDINGS=1
+  elif [ "$rc" -eq 0 ]; then
+    printf 'no known system-probe dentry page-size panic found\n'
+  else
+    agent_diagnostic_print_limited "$raw" 40
+  fi
+  rm -f -- "$raw" "$focus"
+}
+
+agent_diagnostic_agent_log() {
+  local log_file="$AGENT_LOG_DIR/agent.log" tmp capture_rc pattern
+  agent_diagnostic_section "agent.log tail (max 200 lines; may predate current process)"
+  if [ ! -f "$log_file" ] || [ -L "$log_file" ] || [ ! -r "$log_file" ]; then
+    printf 'agent log unavailable: %s\n' "$log_file"
+    AGENT_DIAGNOSTIC_COMPLETE=0
+    return
+  fi
+  tmp="$(agent_diagnostic_tmp_file agent-log)"
+  if agent_diagnostic_capture_command "$tmp" 20 \
+      "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" tail -n 200 "$log_file"; then
+    :
+  else
+    capture_rc=$?
+    if [ "$capture_rc" -eq 65 ]; then
+      printf 'capture_limit_exceeded=true collector=agent-log max_bytes=%s\n' \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+    fi
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+  agent_diagnostic_print_limited "$tmp" 200
+  pattern="$(agent_known_runtime_error_pattern)"
+  if grep -Eqi "$pattern" "$tmp"; then
+    printf 'known_runtime_error_in_agent_log_tail=true\n'
+    AGENT_DIAGNOSTIC_FINDINGS=1
+  fi
+  rm -f -- "$tmp"
+}
+
+agent_diagnostic_kernel() {
+  local raw matches rc=0 capture_rc
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    agent_diagnostic_section "kernel OOM/segfault summary (bounded by scan window)"
+  else
+    agent_diagnostic_section "kernel OOM/segfault summary (last 30 minutes, max 200 lines scanned)"
+  fi
+  raw="$(agent_diagnostic_tmp_file kernel)"
+  matches="$(agent_diagnostic_tmp_file kernel-matches)"
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    cp -- "$AGENT_DIAGNOSTIC_WINDOW_KERNEL_FILE" "$raw"
+    [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] || rc=75
+  elif command -v journalctl >/dev/null 2>&1 && \
+    agent_diagnostic_capture_command "$raw" 20 \
+      "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" journalctl -k \
+      --since '30 minutes ago' -n 200 -o short-iso --no-pager; then
+    :
+  else
+    capture_rc=$?
+    [ "$capture_rc" -eq 65 ] && rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC" || rc="$capture_rc"
+    if [ "$capture_rc" -eq 65 ]; then
+      printf 'capture_limit_exceeded=true collector=kernel-journal max_bytes=%s\n' \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+    fi
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+  grep -Ei 'oom|out of memory|killed process|segfault|general protection|trap' "$raw" \
+    >"$matches" || true
+  printf 'exit_code=%s\n' "$rc"
+  if [ -s "$matches" ]; then
+    agent_diagnostic_print_limited "$matches" 80
+    if grep -Eqi 'dbdog-agent|system-probe|process-agent|trace-agent|agent\[[0-9]+\]' "$matches" || \
+      grep -Fqi "$AGENT_RUNTIME_DIR" "$matches"; then
+      printf 'agent_related_kernel_findings=true\n'
+      AGENT_DIAGNOSTIC_FINDINGS=1
+    else
+      printf 'agent_related_kernel_findings=false (events above belong to other processes)\n'
+    fi
+  elif [ "$rc" -eq 0 ]; then
+    printf 'no matching kernel events\n'
+  else
+    agent_diagnostic_print_limited "$raw" 40
+  fi
+  rm -f -- "$raw" "$matches"
+}
+
+agent_diagnostic_coredumps() {
+  local tmp rc=0 capture_rc
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    agent_diagnostic_section "incremental coredumps (bounded by scan window; max 100 lines displayed)"
+  else
+    agent_diagnostic_section "recent coredumps (last 30 minutes, max 100 lines)"
+  fi
+  tmp="$(agent_diagnostic_tmp_file coredumps)"
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    cp -- "$AGENT_DIAGNOSTIC_WINDOW_COREDUMP_FILE" "$tmp"
+    [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] || rc=75
+  elif command -v coredumpctl >/dev/null 2>&1; then
+    if agent_diagnostic_capture_command "$tmp" 20 \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE" coredumpctl list \
+        --since '30 minutes ago' --no-pager; then
+      :
+    else
+      capture_rc=$?
+      [ "$capture_rc" -eq 65 ] && rc="$AGENT_DIAGNOSTIC_CAPTURE_COMMAND_RC" || rc="$capture_rc"
+      AGENT_DIAGNOSTIC_COMPLETE=0
+      if [ "$capture_rc" -eq 65 ]; then
+        printf 'capture_limit_exceeded=true collector=coredump-list max_bytes=%s\n' \
+          "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+      fi
+    fi
+  else
+    rc=127
+    printf 'coredumpctl unavailable\n' >"$tmp"
+    AGENT_DIAGNOSTIC_COMPLETE=0
+  fi
+  printf 'exit_code=%s\n' "$rc"
+  if [ "$rc" -eq 0 ] && \
+     { grep -Eqi '^No coredumps found\.?$' "$tmp" || [ ! -s "$tmp" ]; }; then
+    printf 'no coredumps found\n'
+  else
+    agent_diagnostic_print_limited "$tmp" 100
+    if [ "$rc" -ne 0 ]; then
+      AGENT_DIAGNOSTIC_COMPLETE=0
+    elif grep -Eqi 'dbdog-agent|system-probe|process-agent|trace-agent' "$tmp" || \
+      grep -Fqi "$AGENT_RUNTIME_DIR" "$tmp"; then
+      printf 'agent_related_coredump_findings=true\n'
+      AGENT_DIAGNOSTIC_FINDINGS=1
+    else
+      printf 'agent_related_coredump_findings=false (entries above belong to other processes)\n'
+    fi
+  fi
+  rm -f -- "$tmp"
+}
+
+diagnose_dbdog_agent() {
+  local agent="$AGENT_RUNTIME_DIR/bin/agent/agent" start_snapshot end_snapshot
+  local healthy_value=true backlog_value=false
+  umask 077
+  AGENT_DIAGNOSTIC_TMP_BASE="${TMPDIR:-/tmp}"
+  [ "$AGENT_DIAGNOSTIC_TMP_BASE" = / ] || AGENT_DIAGNOSTIC_TMP_BASE="${AGENT_DIAGNOSTIC_TMP_BASE%/}"
+  AGENT_DIAGNOSTIC_TMP_DIR="$(mktemp -d "$AGENT_DIAGNOSTIC_TMP_BASE/dbdog-agent-diagnose.XXXXXX")"
+  chmod 0700 "$AGENT_DIAGNOSTIC_TMP_DIR"
+  trap agent_diagnostic_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  AGENT_DIAGNOSTIC_HEALTH_RC=0
+  AGENT_DIAGNOSTIC_COMPLETE=1
+  AGENT_DIAGNOSTIC_FINDINGS=0
+  AGENT_DIAGNOSTIC_WINDOW_LIMIT_COLLECTOR=""
+  AGENT_DIAGNOSTIC_WINDOW_LIMIT_KIND=""
+  AGENT_DIAGNOSTIC_WINDOW_ERROR_COLLECTOR=""
+  AGENT_DIAGNOSTIC_WINDOW_ERROR_RC=""
+  agent_diagnostic_prepare_window
+  agent_diagnostic_prepare_result_file
+  start_snapshot="$(agent_diagnostic_tmp_file units-start)"
+  end_snapshot="$(agent_diagnostic_tmp_file units-end)"
+  printf 'dbdog-agent diagnostic generated_at=%s\n' "$(date -Ins 2>/dev/null || date)"
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    printf 'scan_from_epoch=%s\nscan_until_epoch=%s\n' \
+      "$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" "$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE"
+    agent_diagnostic_negotiate_window || true
+    printf 'negotiated_processed_until_epoch=%s\n' "$AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH"
+    if [ "$AGENT_DIAGNOSTIC_WINDOW_COMPLETE" -eq 1 ]; then
+      printf 'negotiated_window_complete=true\nnegotiated_backlog_pending=false\n'
+    else
+      backlog_value=true
+      printf 'negotiated_window_complete=false\nnegotiated_backlog_pending=true\n'
+    fi
+    if [ -n "$AGENT_DIAGNOSTIC_WINDOW_LIMIT_COLLECTOR" ]; then
+      printf 'window_limit_exceeded=true collector=%s limit_kind=%s max_lines=%s max_bytes=%s\n' \
+        "$AGENT_DIAGNOSTIC_WINDOW_LIMIT_COLLECTOR" \
+        "$AGENT_DIAGNOSTIC_WINDOW_LIMIT_KIND" \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_LINES_VALUE" \
+        "$AGENT_DIAGNOSTIC_MAX_JOURNAL_BYTES_VALUE"
+    fi
+    if [ -n "$AGENT_DIAGNOSTIC_WINDOW_ERROR_COLLECTOR" ]; then
+      printf 'window_collection_failed=true collector=%s exit_code=%s\n' \
+        "$AGENT_DIAGNOSTIC_WINDOW_ERROR_COLLECTOR" "$AGENT_DIAGNOSTIC_WINDOW_ERROR_RC"
+    fi
+  fi
+  [ "$EUID" -eq 0 ] || warn "建议用 sudo 运行；非 root 可能无法读 journal 或 Agent command API"
+  agent_diagnostic_markers
+  agent_diagnostic_host_runtime
+  agent_diagnostic_collection_intervals
+  agent_diagnostic_units start "$start_snapshot"
+  agent_diagnostic_journal
+  agent_diagnostic_sysprobe_panics
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    agent_diagnostic_section "incremental Agent file logs"
+    printf 'delegated_to=collect-diagnostics.sh (inode/offset bounded scan)\n'
+  else
+    agent_diagnostic_agent_log
+  fi
+  agent_diagnostic_kernel
+  agent_diagnostic_coredumps
+  if [ -x "$agent" ]; then
+    agent_diagnostic_run_timed "agent status" 20 \
+      "$agent" status -c "$AGENT_CONFIG_DIR"
+    agent_diagnostic_run_timed "agent check gaussdb" 90 \
+      "$agent" check gaussdb -c "$AGENT_CONFIG_DIR"
+  else
+    agent_diagnostic_section "agent status/check"
+    printf 'agent executable missing: %s\n' "$agent"
+    AGENT_DIAGNOSTIC_HEALTH_RC=1
+  fi
+  agent_diagnostic_units end "$end_snapshot"
+  agent_diagnostic_unit_deltas "$start_snapshot" "$end_snapshot"
+  rm -f -- "$start_snapshot" "$end_snapshot"
+  [ "$AGENT_DIAGNOSTIC_HEALTH_RC" -eq 0 ] || healthy_value=false
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ] && \
+     [ "$AGENT_DIAGNOSTIC_COMPLETE" -ne 1 ]; then
+    # journal 前缀即使已安全捕获，后续 status/check/systemd/coredump 任一证据失败时，
+    # 整个手工快照事务都不能越过旧水位；机器结果与最终 stdout 使用同一规范状态。
+    AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH="$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE"
+    if [ "$AGENT_DIAGNOSTIC_SINCE_EPOCH_VALUE" -eq \
+         "$AGENT_DIAGNOSTIC_UNTIL_EPOCH_VALUE" ]; then
+      # 空时间窗本身已完整，失败的是其它证据；不得伪造一个永远排不完的 backlog。
+      AGENT_DIAGNOSTIC_WINDOW_COMPLETE=1
+      backlog_value=false
+    else
+      AGENT_DIAGNOSTIC_WINDOW_COMPLETE=0
+      backlog_value=true
+    fi
+  fi
+  if ! agent_diagnostic_write_result_file "$healthy_value"; then
+    AGENT_DIAGNOSTIC_COMPLETE=0
+    printf 'machine_result_write_failed=true\n'
+  fi
+  agent_diagnostic_section "diagnostic result"
+  if [ "$AGENT_DIAGNOSTIC_HEALTH_RC" -eq 0 ]; then
+    printf 'healthy=true\n'
+  else
+    printf 'healthy=false\n'
+  fi
+  if [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ]; then
+    printf 'diagnostic_complete=true\n'
+  else
+    printf 'diagnostic_complete=false\n'
+    printf '诊断证据不完整：检查 sudo 权限以及 journalctl/coredumpctl 可用性；这本身不等于 Agent 不健康。\n'
+  fi
+  if [ "$AGENT_DIAGNOSTIC_CUSTOM_WINDOW" -eq 1 ]; then
+    printf 'window_complete=%s\nbacklog_pending=%s\nprocessed_until_epoch=%s\n' \
+      "$([ "$AGENT_DIAGNOSTIC_WINDOW_COMPLETE" -eq 1 ] && printf true || printf false)" \
+      "$backlog_value" "$AGENT_DIAGNOSTIC_PROCESSED_UNTIL_EPOCH"
+  fi
+  if [ "$AGENT_DIAGNOSTIC_FINDINGS" -eq 1 ]; then
+    printf 'historical_or_recent_evidence_findings=true\n'
+    printf '提示：journal、agent.log、kernel/coredump 线索可能早于当前进程，不能单独证明当前版本仍失败。\n'
+  else
+    printf 'historical_or_recent_evidence_findings=false\n'
+  fi
+  if [ "$AGENT_DIAGNOSTIC_HEALTH_RC" -ne 0 ]; then
+    printf '建议：先保留本输出，根据 unit 退出码/coredump/完整失败 SQL 定位；不要在监控库手工建兼容函数绕过升级。\n'
+    return 1
+  fi
+  [ "$AGENT_DIAGNOSTIC_COMPLETE" -eq 1 ] || return 2
+  return 0
+}
+
+cmd="${1:-status}"; shift || true
+if [ "$cmd" = diagnose ]; then
+  [ "$#" -eq 1 ] && [ "$1" = dbdog-agent ] || \
+    die "用法: sudo dbdogctl diagnose dbdog-agent"
+  diagnose_dbdog_agent
+  exit $?
+fi
+ensure_layout
+select_services "$@"
+case "$cmd" in
+  start) start_many "${REQUESTED_SERVICES[@]}" ;;
+  stop) stop_many "${REQUESTED_SERVICES[@]}" ;;
+  restart)
+    stop_many "${REQUESTED_SERVICES[@]}"
+    start_many "${REQUESTED_SERVICES[@]}"
+    ;;
+  status) status_many "${REQUESTED_SERVICES[@]}" ;;
+  *) die "用法: dbdogctl start|stop|restart|status [服务|all] | sudo dbdogctl diagnose dbdog-agent" ;;
+esac

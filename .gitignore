@@ -1,0 +1,10 @@
+cache/
+scratch/
+*.part
+# 发布流程写入的 mktemp 临时文件（manifest.tsv.matrix.* 等）；正常会被各自的 mv
+# 消费掉，只在中断时残留。
+manifest.tsv.*
+
+.claude/worktrees
+.claude/settings.local.json
+.DS_Store
