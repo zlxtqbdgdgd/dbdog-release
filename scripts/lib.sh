@@ -191,6 +191,16 @@ ensure_apikey_enc_key() { # <dbdog-web.env>；缺失/非法才生成，有效值
   ensure_env_default "$file" DBDOG_APIKEY_ENC_KEY "$generated" "$current"
 }
 
+pending_stack_config() { # 只读探测：还需 configure_ready_to_use_stack 补齐、且版本号看不出来的配置项
+  # 收的是「装的是最新版本、模块身份全对，功能却坏着」的那类漂移——check-upgrade 只比
+  # 版本和产物 SHA，这类项不报出来就没人会去跑升级，最后只能靠人手改 env。
+  local web_env="$ETC_DIR/dbdog-web.env"
+  [ -f "$web_env" ] && [ ! -L "$web_env" ] || return 0
+  if ! apikey_enc_key_ok "$(env_literal_value "$web_env" DBDOG_APIKEY_ENC_KEY)"; then
+    printf '%s\n' 'dbdog-web.env 的 DBDOG_APIKEY_ENC_KEY 缺失或不是 32 字节 base64（控制台「新建 API Key」会直接报错）'
+  fi
+}
+
 choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
   local key="$1" chosen="" value file; shift
   for file in "$@"; do

@@ -111,7 +111,20 @@ while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source
   printf '%-14s %-12s %-12s %s\n' "$m" "$inst" "$version" "$st"
 done < <(manifest_selected_rows "" "$selected_arch")
 
+config_pending=0
+if [ "$(installed_version dbdog-web)" != "-" ]; then
+  while IFS= read -r pending_item; do
+    [ -n "$pending_item" ] || continue
+    config_pending=1
+    printf '%-14s %-12s %-12s %s\n' "dbdog-web" "-" "-" "配置待校准：$pending_item ←"
+  done < <(pending_stack_config)
+fi
+
 echo
+if [ "$config_pending" -eq 1 ] && [ "$updates" -eq 0 ]; then
+  log "模块身份均一致，但存在待校准配置。执行: scripts/upgrade.sh（校准后自动重启受影响服务）"
+  exit 10
+fi
 if [ "$updates" -gt 0 ]; then
   if [ "$agent_updates" -gt 0 ]; then
     log "$updates 个已安装模块需升级或校准产物身份/安装器合约；Agent 执行: sudo scripts/upgrade.sh dbdog-agent"
