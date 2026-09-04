@@ -194,6 +194,7 @@ ensure_apikey_enc_key() { # <dbdog-web.env>；缺失/非法才生成，有效值
 pending_stack_config() { # 只读探测：还需 configure_ready_to_use_stack 补齐、且版本号看不出来的配置项
   # 收的是「装的是最新版本、模块身份全对，功能却坏着」的那类漂移——check-upgrade 只比
   # 版本和产物 SHA，这类项不报出来就没人会去跑升级，最后只能靠人手改 env。
+  # 每一项都是有到期日的脚手架：登记与删除条件见 docs/upgrade-scaffolds.md（家族军规 10）。
   local web_env="$ETC_DIR/dbdog-web.env"
   [ -f "$web_env" ] && [ ! -L "$web_env" ] || return 0
   if ! apikey_enc_key_ok "$(env_literal_value "$web_env" DBDOG_APIKEY_ENC_KEY)"; then
