@@ -168,6 +168,29 @@ generate_secret() {
     'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
 }
 
+generate_apikey_enc_key() { # 32 字节 base64（等价 openssl rand -base64 32）；只给 web 的 api_keys 密文列用
+  "$MODULES_DIR/node/current/bin/node" -e \
+    'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64"))'
+}
+
+apikey_enc_key_ok() { # <值>；能否解成 32 字节（Node Buffer 语义：43 位裸 base64，或 44 位带一个 =）
+  local body="${1%=}"
+  [ "${#body}" -eq 43 ] || return 1
+  case "$body" in *[!A-Za-z0-9+/]*) return 1 ;; esac
+  return 0
+}
+
+ensure_apikey_enc_key() { # <dbdog-web.env>；缺失/非法才生成，有效值永不轮换
+  local file="$1" current generated
+  current="$(env_literal_value "$file" DBDOG_APIKEY_ENC_KEY)"
+  # 已经是合法密钥就原样保留：换 key = 存量 api_keys 密文全部不可解。反过来，解不出
+  # 32 字节的值在 web 侧从来没能加密成功过（创建 key 直接 fail closed），换掉不丢密文。
+  if apikey_enc_key_ok "$current"; then return 0; fi
+  generated="$(generate_apikey_enc_key)" || die "生成 DBDOG_APIKEY_ENC_KEY 失败"
+  apikey_enc_key_ok "$generated" || die "生成的 DBDOG_APIKEY_ENC_KEY 不是 32 字节 base64"
+  ensure_env_default "$file" DBDOG_APIKEY_ENC_KEY "$generated" "$current"
+}
+
 choose_shared_secret() { # choose_shared_secret <KEY> <env 文件>...
   local key="$1" chosen="" value file; shift
   for file in "$@"; do
@@ -253,6 +276,9 @@ configure_ready_to_use_stack() {
   ensure_env_default "$web_env" PUBLIC_APP_URL "$app_url" change-me
   ensure_env_default "$web_env" PUBLIC_INGEST_URL "$ingest_url" change-me
   ensure_env_default "$web_env" PUBLIC_MCP_URL "$mcp_url" change-me
+  # 不配这个 key，控制台「新建 API Key」直接报错（web 侧 fail closed），
+  # 而发布模板里它是空的——所以由安装/升级负责一次性生成。
+  ensure_apikey_enc_key "$web_env"
 
   ensure_env_default "$mcp_env" DBDOG_INTERNAL_TOKEN "$internal_token" change-me
   ensure_env_default "$mcp_env" DBDOG_OAUTH_JWT_SECRET "$oauth_secret" change-me
