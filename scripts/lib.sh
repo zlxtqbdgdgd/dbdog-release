@@ -191,10 +191,77 @@ ensure_apikey_enc_key() { # <dbdog-web.env>；缺失/非法才生成，有效值
   ensure_env_default "$file" DBDOG_APIKEY_ENC_KEY "$generated" "$current"
 }
 
-pending_stack_config() { # 只读探测：还需 configure_ready_to_use_stack 补齐、且版本号看不出来的配置项
+# ---- 租户蓝图（storage v3）推进状态 ----
+#
+# ClickHouse 的租户表**不**由 goose 带上机：dbdog-server 启动时跑 tenancy.Provisioner
+# （Provision default org + MigrateAll），按 migrations/blueprint/ch 的步骤序把每个租户库
+# obs_t_<org> 推到最新，进度记在 ctl 的 public.org_blueprint_state（server recipe 的
+# pre-switch 钩子注释即写明这条分工：「PG ctl 库增量迁移（goose up）。CH 租户表由
+# dbdog-server 启动时 blueprint 自动推进」）。
+#
+# 所以升级脚本这一侧**不实现第二套迁移器**（军规 3），只补它够不着的两件事：
+#   1) 某租户某引擎的某一步失败时，server 只写 last_error + 记一条 Error 日志就照常对外
+#      服务（cmd/dbdog-server/main.go 里 runProvisioner 的错误被降级成日志），于是
+#      「模块版本全对、产物 SHA 全对、读路径 500」——正是版本号看不出来的漂移（军规 10）；
+#   2) 它的重试口就是「再启动一次 server」，所以升级收尾顺手重启一次，不让人上机手工 ALTER。
+blueprint_drift_rows() { # 只读探测：列出蓝图推进失败的租户（一行一条）
+  local psql="$MODULES_DIR/postgresql/current/bin/psql"
+  local server_env="$ETC_DIR/dbdog-server.env" dsn out sql
+  # 探不到就当没漂移：这条探测跑在 check-upgrade 里，宁可漏报也不能因为 PG 没起来、
+  # 模块没装、DSN 是自定义形态就把整条检查搞挂（假警报比不报更快被忽略）。
+  [ -x "$psql" ] || return 0
+  [ -f "$server_env" ] && [ ! -L "$server_env" ] || return 0
+  dsn="$(env_literal_value "$server_env" PG_DSN)"
+  case "$dsn" in postgres://* | postgresql://*) ;; *) return 0 ;; esac
+  # last_error 是 server 写进去的多行文本，压成一行再截断——pending_stack_config 的
+  # 契约是一行一项，换行会把一条漂移拆成几条假项。
+  sql="SET statement_timeout = 5000;
+SELECT format('org %s 的 %s 租户蓝图停在 v%s（server 启动时这一步失败了）：%s',
+              org_id, engine, version,
+              left(regexp_replace(last_error, '[[:space:]]+', ' ', 'g'), 200))
+  FROM public.org_blueprint_state
+ WHERE last_error <> ''
+ ORDER BY org_id, engine"
+  out="$(PGCONNECT_TIMEOUT="${DBDOG_PG_PROBE_TIMEOUT:-3}" \
+    "$psql" "$dsn" -X -Atq -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null)" || return 0
+  printf '%s\n' "$out" | sed '/^[[:space:]]*$/d'
+}
+
+heal_blueprint_drift() { # 升级收尾自愈：重启一次 dbdog-server 让 MigrateAll 重跑失败的蓝图步骤
+  local rows ctl
+  # 一次升级只重启一轮：失败步骤若是 DDL 本身执行不过，重启多少次都一样，
+  # 反复重启只会把服务打得断断续续，且掩盖「需要人看」这个结论。
+  [ "${DBDOG_BLUEPRINT_HEALED:-0}" = 0 ] || return 0
+  rows="$(blueprint_drift_rows)"
+  [ -n "$rows" ] || return 0
+  DBDOG_BLUEPRINT_HEALED=1
+  ctl="${DBDOGCTL:-$RELEASE_DIR/scripts/dbdogctl}"
+  log "租户蓝图有步骤没推进到位，重启 dbdog-server 重试（storage v3 的 MigrateAll 在启动期跑）:"
+  printf '%s\n' "$rows" | while IFS= read -r row; do log "  $row"; done
+  if [ ! -x "$ctl" ]; then
+    warn "找不到 dbdogctl（$ctl），无法重启 dbdog-server 重试租户蓝图"
+    return 0
+  fi
+  if ! "$ctl" restart dbdog-server; then
+    warn "重启 dbdog-server 失败，租户蓝图仍停在失败步骤；查看 $LOGS_DIR/ 下 server 日志"
+    return 0
+  fi
+  rows="$(blueprint_drift_rows)"
+  if [ -z "$rows" ]; then
+    log "租户蓝图已推进到位（org_blueprint_state.last_error 已清空）"
+    return 0
+  fi
+  warn "重启后仍有租户蓝图停在失败步骤——这不是配置漂移，多半是该步 DDL 真的执行不过，需要人看:"
+  printf '%s\n' "$rows" >&2
+  warn "  判据: SELECT org_id, engine, version, last_error FROM public.org_blueprint_state;"
+}
+
+pending_stack_config() { # 只读探测：还需升级脚本补齐、且版本号看不出来的漂移项
   # 收的是「装的是最新版本、模块身份全对，功能却坏着」的那类漂移——check-upgrade 只比
-  # 版本和产物 SHA，这类项不报出来就没人会去跑升级，最后只能靠人手改 env。
-  # 每一项都是有到期日的脚手架：登记与删除条件见 docs/upgrade-scaffolds.md（家族军规 10）。
+  # 版本和产物 SHA，这类项不报出来就没人会去跑升级，最后只能靠人手改 env / 手工 ALTER。
+  # 配置类的每一项都是有到期日的脚手架：登记与删除条件见 docs/upgrade-scaffolds.md
+  # （家族军规 10）；租户蓝图那一项是长期机制，同文件「长期机制」一节说明为什么不删。
+  blueprint_drift_rows
   local web_env="$ETC_DIR/dbdog-web.env"
   [ -f "$web_env" ] && [ ! -L "$web_env" ] || return 0
   if ! apikey_enc_key_ok "$(env_literal_value "$web_env" DBDOG_APIKEY_ENC_KEY)"; then

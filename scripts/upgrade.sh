@@ -546,7 +546,14 @@ else
     for m in "${targets[@]}"; do [ "$m" = dbdog-mcp ] && found=1; done
     [ "$found" -eq 1 ] || targets+=(dbdog-mcp)
   fi
-  [ ${#targets[@]} -gt 0 ] || { log "没有可升级的模块（check-upgrade.sh 可查看详情）"; exit 0; }
+  if [ ${#targets[@]} -eq 0 ]; then
+    # 没有模块要换，不等于这台机没事：租户蓝图（storage v3 的 CH 表）可能停在某一步失败上，
+    # 而那件事版本号看不出来（军规 10）。这条路径要在 exit 前给它一次重试，否则
+    # check-upgrade 报了待校准、人跑了 upgrade.sh、脚本却直接退出，漂移永远好不了。
+    heal_blueprint_drift
+    log "没有可升级的模块（check-upgrade.sh 可查看详情）"
+    exit 0
+  fi
 fi
 
 canonicalize_upgrade_modules "${targets[@]}"
@@ -616,4 +623,7 @@ for m in "${targets[@]}"; do
   warn "  不重启的话，控制台「采集配置」最多要等 6 小时才会重新出现——那是去抖，不是故障"
   break
 done
+# 服务都拉起来之后再看租户蓝图：本次升级若换了 server，MigrateAll 已经随重启跑过一轮，
+# 这里只兜「跑过还是失败」的残留（重启一次重试，仍失败就报出来要人看）。
+heal_blueprint_drift
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"
