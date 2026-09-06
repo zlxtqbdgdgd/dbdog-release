@@ -294,12 +294,15 @@ upgrade_one() {
     mkdir -p "$CACHE_DIR"
     install -m 0644 "$LOCAL_ARTIFACT" "$CACHE_DIR/$artifact"
     log "$m: 快升级产物 ${artifact}（sha ${sha256:0:12}）已预置 cache"
+    # target 按模块查而不按本机架构选行：x86 开发机的 manifest 里没有它的架构行，
+    # 但「这是不是 stack 模块」与架构无关。
+    target="$(manifest_module_target "$m")"
   else
     version="$(manifest_get "$m" 5)"
     artifact="$(manifest_get "$m" 6)"
     sha256="$(manifest_get "$m" 7)"
+    target="$(manifest_get "$m" 3)"
   fi
-  target="$(manifest_get "$m" 3)"
 
   [ "$version" != "-" ] || { warn "$m 尚未发布，跳过"; return 0; }
   [ "$target" = "stack" ] || die "$m 属于 ${target} 目标，不应进入 stack 模块升级器"
@@ -444,6 +447,10 @@ start_target_services() {
     svcs="$(module_services "$m")"
     for s in $svcs; do
       if "$DBDOGCTL" status "$s" | grep -q 运行中; then continue; fi
+      if ! service_initialized "$s"; then
+        log "$s：首装尚未初始化（数据目录/配置未校准），这里不拉起，交给 install.sh 收尾"
+        continue
+      fi
       case " $pending " in *" $s "*) continue ;; esac
       pending="$pending $s"
     done
@@ -606,7 +613,11 @@ if [ "$mcp_was_running" -eq 1 ]; then
 fi
 start_target_services "${targets[@]}"
 if [ "$oauth_upgrade" -eq 1 ]; then
-  "$SCRIPTS_DIR/verify.sh" --oauth
+  if service_initialized dbdog-web && service_initialized dbdog-mcp; then
+    "$SCRIPTS_DIR/verify.sh" --oauth
+  else
+    log "首装尚未校准 web/mcp 配置，OAuth 专项验收留给 install.sh --finish"
+  fi
 fi
 if [ "$remote_config_upgrade" -eq 1 ] \
   && "$DBDOGCTL" status dbdog-server | grep -q '运行中'; then

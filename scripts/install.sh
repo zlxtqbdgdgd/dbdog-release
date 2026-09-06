@@ -14,8 +14,14 @@ APP_MODULES=(dbdog-server dbdog-web dbdog-mcp)
 
 preflight_host() {
   local arch cmd
-  arch="$(uname -m)"
-  [ "$arch" = "aarch64" ] || die "仅支持 aarch64，当前架构: $arch"
+  # 内网全家桶只发 aarch64（manifest 没有 x86_64 行，从桶装在 x86 上会在选行时 fail closed）；
+  # x86_64 放行是给开发机用的——它的模块由 dbdog-build 的快升级按本机架构出包、
+  # 经 upgrade.sh --artifact 落地，首装只借用本脚本的 --init-db-only / --finish 两段。
+  arch="$(host_arch)"
+  case "$arch" in
+    aarch64 | x86_64) ;;
+    *) die "仅支持 aarch64/x86_64，当前架构: $arch" ;;
+  esac
   for cmd in id git curl tar awk grep find install mktemp readlink file ldd env cksum; do
     command -v "$cmd" >/dev/null 2>&1 || die "缺少必需命令: $cmd"
   done
@@ -108,6 +114,16 @@ init_databases() {
     log "初始化 PostgreSQL 数据目录"
     "$pgbin/initdb" -D "$DATA_DIR/pg" -E UTF8 --no-locale
     # [首跑校准] 如需远程访问/改端口，编辑 data/pg/postgresql.conf、pg_hba.conf
+  fi
+  # 本仓的 PG 源码把编译默认 socket 目录钉在 /run/postgresql（发行版风格）。那是 root 才建得了的
+  # 系统目录：内网 dbdog 账户没有 root，开发机上也未必有它——不存在时 postmaster 起来就 FATAL
+  #（could not create lock file "/run/postgresql/.s.PGSQL.5432.lock"）。socket/锁文件放本布局自己的
+  # run/：不要 root、重启不丢。本机客户端（DSN、dbdogctl 探测、本脚本的 psql）全走 127.0.0.1，
+  # socket 只是 postmaster 自己要有个地方放锁文件。幂等：已写过就不再追加。
+  if ! grep -Fqx "unix_socket_directories = '$RUN_DIR'" "$DATA_DIR/pg/postgresql.conf"; then
+    printf '\n# dbdog release 布局：socket/锁文件放本布局的 run/，不依赖系统 /run/postgresql\nunix_socket_directories = %s\n' \
+      "'$RUN_DIR'" >>"$DATA_DIR/pg/postgresql.conf"
+    log "PostgreSQL socket 目录已指向 $RUN_DIR"
   fi
   gen_clickhouse_config
 

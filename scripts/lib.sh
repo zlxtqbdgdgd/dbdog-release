@@ -102,9 +102,17 @@ detect_advertise_host() {
   printf '%s\n' "$host"
 }
 
+# 旧公网验收模板的三联 URL（<host>:25629 / :21753 / :24267/mcp）在x86 开发机 上恰恰是
+# 真值——那三个端口就是它的路由侠隧道。该机在 env 里显式写 DBDOG_PUBLIC_URLS_PINNED=1 声明
+# 「这组地址是我的，别当旧模板迁走」；内网机不写此键，行为与之前一字不差。
+public_urls_pinned() { # <env 文件>
+  [ "$(env_literal_value "$1" DBDOG_PUBLIC_URLS_PINNED)" = 1 ]
+}
+
 migrate_legacy_web_public_urls() { # <dbdog-web.env>；只迁移旧公网验收模板的三联 URL
   local file="$1" app ingest mcp legacy_host advertise_host
   [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  public_urls_pinned "$file" && return 0
   app="$(env_literal_value "$file" PUBLIC_APP_URL)"
   ingest="$(env_literal_value "$file" PUBLIC_INGEST_URL)"
   mcp="$(env_literal_value "$file" PUBLIC_MCP_URL)"
@@ -131,6 +139,7 @@ migrate_legacy_web_public_urls() { # <dbdog-web.env>；只迁移旧公网验收�
 migrate_legacy_mcp_public_urls() { # <dbdog-mcp.env>；只迁移旧公网验收模板的三联 URL
   local file="$1" issuer resource app legacy_host advertise_host
   [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  public_urls_pinned "$file" && return 0
   issuer="$(env_literal_value "$file" DBDOG_OAUTH_ISSUER)"
   resource="$(env_literal_value "$file" DBDOG_PUBLIC_MCP_URL)"
   app="$(env_literal_value "$file" DBDOG_APP_BASE_URL)"
@@ -592,6 +601,16 @@ manifest_get() { # manifest_get <module> <列号> [arch]；精确架构优先，
   fi
 }
 
+manifest_module_target() { # manifest_module_target <module> → 该模块登记的 target（stack|dbhost），与架构无关
+  # kind/target/service 是模块的属性而不是某一架构行的属性（manifest_all_rows 已校验同模块各行
+  # 一致），所以这里不按主机架构选行：--artifact 快升级在 manifest 没有本机架构行的主机上
+  #（x86 开发机）也要能回答「这是不是 stack 模块」。
+  local m="$1" out
+  out="$(manifest_all_rows | awk -F'\t' -v m="$m" '$1 == m { print $3; exit }')"
+  [ -n "$out" ] || { printf 'ERROR: manifest 里没有模块 %s\n' "$m" >&2; return 1; }
+  printf '%s\n' "$out"
+}
+
 manifest_arches() { # manifest_arches <module> → 该模块出现的架构，固定按 aarch64 x86_64 noarch 顺序输出
   local m="$1"
   manifest_all_rows | awk -F'\t' -v m="$m" '
@@ -628,7 +647,9 @@ canonicalize_upgrade_modules() { # canonicalize_upgrade_modules <模块>... → 
         die "模块名不是安全的单层路径名: $candidate"
         ;;
     esac
-    manifest_get "$candidate" 1 >/dev/null
+    # 只验「manifest 认不认识这个模块」，与本机架构无关：x86 开发机的 manifest 没有它的
+    # 架构行，但 --artifact 快升级照样要能装它（架构合不合适由产物名与 ELF 校验把关）。
+    manifest_module_target "$candidate" >/dev/null || die "manifest 里没有模块: $candidate"
     # `${array[@]+...}` 兼容 macOS Bash 3.2 在 set -u 下展开空数组。
     for seen in ${validated[@]+"${validated[@]}"}; do
       [ "$seen" != "$candidate" ] || die "升级模块重复: $candidate"
@@ -789,6 +810,44 @@ module_services() {
     postgresql) echo "postgresql" ;;
     clickhouse) echo "clickhouse" ;;
     *) echo "" ;;
+  esac
+}
+
+env_value_is_placeholder() { # <env 文件> <KEY> [占位片段]：值为空、change-me*、或含占位片段 ⇒ 0
+  local value
+  value="$(env_literal_value "$1" "$2")"
+  case "$value" in "" | change-me*) return 0 ;; esac
+  if [ -n "${3:-}" ]; then
+    case "$value" in *"$3"*) return 0 ;; esac
+  fi
+  return 1
+}
+
+# 首装时 upgrade.sh 会在 install.sh 初始化数据目录 / 校准配置**之前**把基础件与应用件先落地
+#（install.sh 的 1/5、3/5 两步都是逐模块调 upgrade.sh）。这时拉服务必然失败：postgresql 没有
+# 数据目录（pg_ctl: directory … does not exist）、clickhouse 没有 config.xml、server/web 的 DSN
+# 还是模板占位。这些都不是「升级后服务没起来」，而是「还没到该起的时候」——由 install.sh 的
+# init_databases / --finish 负责拉起。已经初始化过的机器（内网正常升级）这里恒为 0，行为不变。
+service_initialized() { # <服务> → 0=可以拉起；1=首装尚未初始化，交给 install.sh 收尾
+  local svc="$1" envf
+  case "$svc" in
+    postgresql) [ -s "$DATA_DIR/pg/PG_VERSION" ] ;;
+    clickhouse) [ -s "$ETC_DIR/clickhouse/config.xml" ] ;;
+    dbdog-server | ddsql-server)
+      envf="$ETC_DIR/dbdog-server.env"
+      [ -f "$envf" ] && ! env_value_is_placeholder "$envf" DBDOG_INTERNAL_TOKEN \
+        && ! env_value_is_placeholder "$envf" PG_DSN user:pass
+      ;;
+    dbdog-web)
+      envf="$ETC_DIR/dbdog-web.env"
+      [ -f "$envf" ] && ! env_value_is_placeholder "$envf" DBDOG_INTERNAL_TOKEN \
+        && ! env_value_is_placeholder "$envf" DATABASE_URL user:pass
+      ;;
+    dbdog-mcp)
+      envf="$ETC_DIR/dbdog-mcp.env"
+      [ -f "$envf" ] && ! env_value_is_placeholder "$envf" DBDOG_INTERNAL_TOKEN
+      ;;
+    *) return 0 ;;
   esac
 }
 
