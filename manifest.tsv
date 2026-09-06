@@ -14,7 +14,7 @@
 #     数据库进程）。**只发 aarch64**，版本与 sha256 均在发布侧固定，不解析 latest。
 dbdog-server	first-party	stack	yes	0.1.24	dbdog-server-0.1.24-aarch64.tar.gz	407978877a102e07e178c254e903a969d7080ed1b95d2307707dd31f7fb9d853	8d77197	aarch64
 dbdog-web	first-party	stack	yes	0.1.26	dbdog-web-0.1.26-aarch64.tar.gz	e18591bc5caee42501756027a563cdb137777d7c45707715b6e91e21940b3e9c	bca4035	aarch64
-dbdog-mcp	first-party	stack	yes	0.1.19	dbdog-mcp-0.1.19-noarch.tar.gz	5b2404c152ae3a2fb771746842fdd47e423ce773b1aac894a1195417d7f80def	6474c1a	noarch
+dbdog-mcp	first-party	stack	yes	0.1.20	dbdog-mcp-0.1.20-noarch.tar.gz	cc316764c64f4808225181500c82265e38104570593b133e6436e9058d7848b8	528e435	noarch
 dbdog-agent	first-party	dbhost	no	7.81.0-dbdog.11	dbdog-agent-7.81.0-dbdog.11-aarch64.tar.gz	869f362a30c6bf4b8c8b012fbd080ecb0889665f24fb72a153e169ff3faf3cce	agent:3e5d718,core:7dd8b12	aarch64
 ddprof	third-party	dbhost	no	-	-	-	-	aarch64
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-	aarch64
