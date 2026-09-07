@@ -71,9 +71,10 @@ Connection environment:
   PG_ADMIN_USER   administrative user passed to psql with -U (optional)
   PG_PERDB_SQL    per-database SQL file override (optional)
 
-Prerequisite: the dbdog login role must already exist (created by agent-install.sh
-without --host-only, or run init-dbdog-user-pg-global.sql once per instance — it is
-installed next to this script). Authentication stays in psql's normal protected
+Prerequisite: the dbdog login role must already exist. agent-install.sh never creates
+it (it only verifies credentials): run init-dbdog-user-pg-global.sql once per instance —
+console "Add database instance" wizard step 1, or by hand; it is installed next to this
+script. Authentication stays in psql's normal protected
 mechanisms (for example an OS database account, PGPASSFILE, or an interactive
 prompt). This script never accepts or prints a password argument.
 EOF
@@ -330,8 +331,8 @@ fi
 
 [[ ${#databases[@]} -gt 0 ]] || { echo "no databases selected" >&2; exit 1; }
 
-# 前置门:监控角色必须先存在。本脚本不建角色(永不碰密码),角色是实例级对象,归
-# agent-install.sh 建号链或 global SQL 管。以前缺角色要等 perdb.sql 跑到第一条 GRANT
+# 前置门:监控角色必须先存在。本脚本不建角色(永不碰密码),角色是实例级对象,归向导
+# 第 1 步的 global SQL 管(安装器只验不建)。以前缺角色要等 perdb.sql 跑到第一条 GRANT
 # 才炸,TOPOFF 分支的 ALTER ROLE 报错还会被误读(2026-08-19);进门一句人话。
 global_hint="$SCRIPT_DIR/init-dbdog-user-pg-global.sql"
 role_exists=$(run_sql "$PG_ADMIN_DB" "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='${MONITOR_ROLE}';")

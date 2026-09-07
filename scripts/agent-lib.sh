@@ -120,17 +120,6 @@ agent_clear_engine_facts() {
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
   AGENT_PG_RENDER_PASSWORDS=()
-  AGENT_PG_PID_OWNERS=()
-  AGENT_PG_PID_PSQLS=()
-  AGENT_PG_PID_SOCKETS=()
-}
-
-agent_generate_gaussdb_password() {
-  local random
-  # 14 随机字节给出 112 bit 熵；固定前缀确保四类字符，整体恰好 32 字符。
-  random="$(od -An -N14 -tx1 /dev/urandom | tr -d '[:space:]')" || return 1
-  [ "${#random}" -eq 28 ] || return 1
-  printf 'Aa1_%s\n' "$random"
 }
 
 agent_validate_gaussdb_password() { # <密码>；符合 GaussDB 默认长度与三类字符约束
@@ -766,7 +755,7 @@ agent_detect_postgres() {
   # 天然被 -D 过滤掉）。端口一律取运行态 postmaster.pid 第 4 行——配置文件可能改过
   # 未 reload。日志 glob 从 log_directory 推导（相对路径落在 data 目录下，PG 默认 log/），
   # 推不出时留空——logs 采集少一路是软缺口，不拦安装。
-  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args uid owner exe psql socket
+  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline data port logdir args
   # 显式排除口子（DBDOG_POSTGRES_EXCLUDE_PORTS，空格/逗号分隔）：停掉某实例的监控是
   # 操作者决策，必须显式点名并大声记录，绝不允许静默缺口。典型场景：与监控无关的
   # 私人 dev 实例（其超管凭证不归监控体系管）。
@@ -775,9 +764,6 @@ agent_detect_postgres() {
   AGENT_PG_PORTS=()
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
-  AGENT_PG_PID_OWNERS=()
-  AGENT_PG_PID_PSQLS=()
-  AGENT_PG_PID_SOCKETS=()
   for pid in "$root"/[0-9]*; do
     pid="${pid##*/}"
     [ -r "$root/$pid/cmdline" ] || continue
@@ -804,31 +790,6 @@ agent_detect_postgres() {
       die "发现多个 PostgreSQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;; esac
     AGENT_PG_PORTS+=("$port")
     AGENT_PG_DATA_DIRS+=("$data")
-    # 建号链事实：进程属主（runuser 目标）、实例自带 psql（exe 同 bin 目录）、socket
-    # 目录（postgresql.conf 的 unix_socket_directories 首个）。拿不到的留空，由
-    # agent_prepare_pg_user 在使用点 die——探测期留软缺口感，错误信息聚在动手前。
-    uid="$(awk '/^Uid:/ { print $2; exit }' "$root/$pid/status" 2>/dev/null || true)"
-    owner="$(agent_owner_name "$uid" 2>/dev/null || true)"
-    AGENT_PG_PID_OWNERS+=("${owner:-}")
-    psql=""
-    if [ -L "$root/$pid/exe" ]; then
-      exe="$(readlink -f "$root/$pid/exe" 2>/dev/null || true)"
-      case "$exe" in */bin/postgres) psql="${exe%/bin/postgres}/bin/psql" ;; esac
-    fi
-    [ -n "$psql" ] && [ -x "$psql" ] || psql=""
-    AGENT_PG_PID_PSQLS+=("$psql")
-    socket="$(awk '
-      /^[[:space:]]*#/ { next }
-      /^[[:space:]]*unix_socket_directories[[:space:]]*=/ {
-        sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, "")
-        gsub(/^'\''|'\''$/, ""); split($0, first, ","); print first[1]; exit
-      }
-    ' "$data/postgresql.conf" 2>/dev/null || true)"
-    # conf 里注释掉该行时（默认 /tmp,实测形态）按 PG 默认兜底——空着会让
-    # 建号链退回 psql 自身默认,和这里殊途同归,但显式记录事实让 die 时的报错可读。
-    [ -n "$socket" ] || socket="/tmp"
-    [ -d "$socket" ] || socket=""
-    AGENT_PG_PID_SOCKETS+=("${socket:-}")
     logdir="$(awk '
       /^[[:space:]]*#/ { next }
       /^[[:space:]]*log_directory[[:space:]]*=/ {
@@ -1035,7 +996,10 @@ agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <en
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || has_gauss=1
   [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || has_og=1
   [ -z "${AGENT_PG_PORTS[*]-}" ] || has_pg=1
+  # 凭证门开着（AGENT_ENGINE_GATING）时允许「探到了引擎但零实例接入」：实例会因没建号/没密码
+  # 被撤出渲染，主机基线照常出；检测层「一个引擎都没在跑」的硬失败仍在安装器主流程里。
   [ "$has_gauss$has_og$has_pg" != 000 ] || [ "${AGENT_HOST_ONLY:-0}" = 1 ] || \
+    [ "${AGENT_ENGINE_GATING:-0}" = 1 ] || \
     die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL 均未发现）"
   if [ "$has_gauss" = 1 ] && [ -z "$password" ]; then
     die "GaussDB 监控密码为空，无法渲染"
@@ -1045,13 +1009,13 @@ agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <en
   if [ "$has_og" = 1 ]; then
     for ((cred_i=0; cred_i<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; cred_i++)); do
       [ -n "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$cred_i]-}" ] || \
-        die "openGauss 实例 127.0.0.1:${AGENT_OPENGAUSS_RENDER_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-opengauss-all-databases.sh，再以 DBDOG_OPENGAUSS_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
+        die "openGauss 实例 127.0.0.1:${AGENT_OPENGAUSS_RENDER_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请在控制台「添加数据库实例」向导第 1 步建号后，以 DBDOG_OPENGAUSS_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
     done
   fi
   if [ "$has_pg" = 1 ]; then
     for ((cred_i=0; cred_i<${#AGENT_PG_PORTS[@]}; cred_i++)); do
       [ -n "${AGENT_PG_RENDER_PASSWORDS[$cred_i]-}" ] || \
-        die "PostgreSQL 实例 127.0.0.1:${AGENT_PG_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请先由 DBA 跑 scripts/agent/init-dbdog-user-pg-all-databases.sh，再以 DBDOG_POSTGRES_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
+        die "PostgreSQL 实例 127.0.0.1:${AGENT_PG_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请在控制台「添加数据库实例」向导第 1 步建号后，以 DBDOG_POSTGRES_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
     done
   fi
   for check in cpu disk file_handle io load memory network system_core uptime; do

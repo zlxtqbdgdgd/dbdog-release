@@ -54,3 +54,14 @@
 | 上机判据 | `psql "$PG_DSN" -Atqc "SELECT org_id, engine, version, last_error FROM public.org_blueprint_state ORDER BY org_id, engine"`——`last_error` 全为空即到位 |
 | 为什么不删 | 只要 CH 租户表还是「启动期推进 + 失败降级成日志」这个形状，这条漂移就永远可能发生。它不是某一版引入的一次性病症，没有「线上最老的机器升过 X 版就可以删」这个终点 |
 | **它探不到什么**（明写，免得被当成全覆盖） | 迁移作者**忘了加蓝图步骤**——`migrations/clickhouse_v2/NNNNN_*.sql` 写了新列却没有对应的 `migrations/blueprint/ch/NNNN_*.sql.tmpl` 时，`org_blueprint_state` 显示的是「已推到最新」（版本齐、`last_error` 空），而新租户的表里根本没有那几列。守这条的是 **dbdog-server 侧** 的 `blueprint_columns_integration_test`（建租户后直查 `system.columns`，断言 events 含 `eventColumns` 引用的每一列）——它要真 CH 才跑，不在本仓能力范围内 |
+
+### L2 · GaussDB 本机 MD5 HBA 受管规则
+
+| 项 | 值 |
+|---|---|
+| 机制归属 | 本仓 `agent-install.sh: agent_ensure_gaussdb_hba_rule`（预检阶段，cutover 之前）；失败退出由 `agent_restore_gaussdb_hba_rules` 还原 |
+| 病症 | GaussDB 默认 HBA 标准 libpq 一条都用不了（`sha256` 是私有握手，`trust` 免密且救不了没建号）；07-28 之前的安装器写的是 `local all dbdog trust` 受管块，07-28～09-06 之间改成只读门禁让 DBA 手加 md5 行（内网 163 实机就卡在这，2026-09-06） |
+| 自愈 | 每次安装/升级把 `host all dbdog 127.0.0.1/32 md5` 以 `# dbdog-release BEGIN/END` 受管块**置顶**写入 `SHOW hba_file` 所指文件并 `pg_reload_conf()`；旧 socket trust 受管块在同一步换成 md5 行；DBA 的行逐字节不碰；改前副本留 `/var/log/dbdog-agent/gs_hba.conf.<port>.before-*` |
+| 上机判据 | `head -3 $(gsql -Atc 'SHOW hba_file;')` 前三行正是受管块；`SELECT 1` 用 dbdog 经 127.0.0.1 TCP 收到 MD5 challenge（安装器的最小握手探针 code=5） |
+| 为什么不删 | 只要采集走标准 libpq、GaussDB 默认不是 md5，这条就是每台 GaussDB 主机的接入基础，没有「线上都升过 X 版」这个终点 |
+

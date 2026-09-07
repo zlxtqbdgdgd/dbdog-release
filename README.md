@@ -156,17 +156,27 @@ URL，迁移已知旧模板地址，重启受影响的运行中服务，并执�
 dbdog-web 的 Agent 接入页签发 ingest API key。dbdog 的私有运行时、配置和服务分别固定在
 `/opt/dbdog-agent`、`/etc/dbdog-agent` 与 `dbdog-agent*`，不会触碰同机其他采集 agent。
 
-GaussDB / openGauss 目标机必须先由 DBA 完成两项前置配置，安装器只读检查、不会替你改配置
-文件，也不会 reload/restart 数据库：
+安装器管「基础」，不管「建号」——分工与 Datadog 一致（DD 的 Agent 从不建库内账号，
+`CREATE USER datadog` 与 explain 函数都由 DBA 按文档自己跑）：
 
-```text
-SHOW password_encryption_type;          -- 必须返回 1
-host all dbdog 127.0.0.1/32 md5         # pg_hba.conf 中必须存在
-```
+| | 安装器做 | DBA 在控制台 Databases →「添加数据库实例」向导里做 |
+|---|---|---|
+| 主机基线 | 四个私有服务、主机/进程/日志 check | — |
+| 认证基础 | **GaussDB：把 `host all dbdog 127.0.0.1/32 md5` 以受管块置顶写进 `gs_hba.conf` 并 reload**（改前副本留 `/var/log/dbdog-agent/gs_hba.conf.<port>.before-*`；本次安装失败自动还原） | — |
+| 监控账号 | 只验证：凭证经 `127.0.0.1` TCP 实测有效的实例才接入采集 | 第 1 步：`init-dbdog-user-<engine>-global.sql` 建 `dbdog`，`init-dbdog-user-<engine>-all-databases.sh` 初始化各库（脚本随包在 `/opt/dbdog-agent/scripts`） |
+| 引擎 conf | 按接入的实例渲染 `conf.d/<engine>.d` | 第 2 步：复制带 `DBDOG_<ENGINE>_MONITOR_PASSWORD` 的安装命令重跑 |
 
-`password_encryption_type=1` 决定新建监控用户时同时保存 SHA256 与 MD5 凭证，HBA 的 `md5`
-才决定这次 TCP 连接采用 MD5 认证，两者缺一不可。HBA 使用首条匹配规则且不会回退，`user=all`
-同样会匹配 `dbdog`，因此精确的 MD5 规则必须放在可能匹配它的宽泛规则之前。
+为什么 GaussDB 要多这一条 HBA：日常采集用包内 psycopg/libpq 经 `127.0.0.1` TCP 密码连接。
+PostgreSQL 默认 HBA（scram）装完就能用；GaussDB 默认的 `sha256` 是私有握手、标准 libpq 不会说，
+`trust` 又免密且救不了没建号的情况（trust 只免密码不免账号）——`md5` 是唯一经交付验证的交集。
+规则置顶是因为 HBA 首条匹配且不回退，`user=all` 的宽泛规则排在前面会把它遮蔽。安装器只动
+受管块（`# dbdog-release BEGIN/END` 标记之间），DBA 的行逐字节不碰，也不改 `postgresql.conf`。
+07-28 之前的安装器写的是 `local all dbdog trust` 受管块，升级时会在同一步换成 md5 行。
+
+还有一条在建号那一刻起作用的前置：`SHOW password_encryption_type` 须为 `1`（新建账号同时存
+SHA256 与 MD5 凭证；`2/3` 下建的号标准 libpq 连不上）。它是重启级参数，安装器只 warn 指路、
+不卡安装；已在 `2/3` 下建过的 `dbdog` 需 DBA 在 `1` 生效后重设密码，再以
+`DBDOG_GAUSSDB_MONITOR_PASSWORD` 重跑。
 
 安装与后续升级是同一条命令：
 
@@ -177,19 +187,17 @@ sudo ./scripts/upgrade.sh dbdog-agent
 ```
 
 首次运行只会在终端提示两个无法安全猜测的外部值：dbdog-server 地址和 Web 签发的 Agent API
-key。监控用户密码由安装器随机生成并写入 root `0600` 配置，升级自动保留，不需要人工知道或
-再次输入。非交互自动化可用 `DBDOG_SERVER_URL`、`DBDOG_API_KEY` 传入；确需接管既有监控密码
-时才设置 `DBDOG_GAUSSDB_MONITOR_PASSWORD`。不要把明文写进仓库、shell history 或命令参数。
+key。监控密码随向导第 2 步的命令以环境变量传入（`DBDOG_GAUSSDB_MONITOR_PASSWORD` /
+`DBDOG_OPENGAUSS_MONITOR_PASSWORD` / `DBDOG_POSTGRES_MONITOR_PASSWORD`），升级路径自动按现有
+conf 逐实例沿用。不要把明文写进仓库、shell history 或命令参数。
 
-安装器会自动发现目标实例的端口、socket、数据与日志路径，创建或复用 `dbdog` 监控用户及兼容
-视图，安装并启用四个私有服务，最后以真实的数据库 check 和全组件 readiness 收口；任一步失败
-都会恢复上一套运行时、配置与 systemd 单元。已幂等创建的监控用户、权限与兼容对象按数据库
-迁移的只前进语义保留，重跑升级会复用，不做破坏性数据库回滚。
+没建号、没给密码或密码不对的实例**本次不接入**：安装器撤掉它的 conf、跳过它的验收、在结尾
+列出原因和下一步，主机基线与 HBA 基础照常装成——除非该实例升级前已在采集（凭证失效会弄断
+在网采集），那种情况下安装回滚。
 
-若旧环境中的 `dbdog` 用户是在 `password_encryption_type=2/3` 下创建的，仅把参数改成 `1`
-不会补出 MD5 凭证。安装器不会擅自替已有账号改密：应由 DBA 在 mode `1` 生效后为该用户设置
-一个新密码，并在同次升级中通过安全环境注入 `DBDOG_GAUSSDB_MONITOR_PASSWORD`；或者删除确认
-可重建的旧监控用户，让安装器重新创建。全新环境不需要这一步。
+安装器会自动发现目标实例的端口、socket、数据与日志路径，安装并启用四个私有服务，最后以真实
+的数据库 check 和全组件 readiness 收口；任一步失败都会恢复上一套运行时、配置与 systemd 单元，
+以及本次改写过的 `gs_hba.conf`。
 
 `check-upgrade.sh --pull` 除了比较版本和产物 SHA，还比较安装器合约指纹；只改安装逻辑而未重
 编二进制时也会提示执行上面同一条升级命令。从不具备该机制的旧版本首次过渡时，必须按上面

@@ -74,10 +74,11 @@ Connection environment:
   GAUSSDB_PERDB_SQL   per-database SQL file override (default:
                       init-dbdog-user-gaussdb-perdb.sql next to this script)
 
-Prerequisite: the dbdog login role must already exist (created by agent-install.sh
-without --host-only — including the password_encryption_type=1 and MD5 HBA preflight —
-or run init-dbdog-user-gaussdb-global.sql once per instance; it is installed next to
-this script). Authentication stays in gsql's normal protected mechanisms (for example
+Prerequisite: the dbdog login role must already exist. agent-install.sh never creates
+it (the installer only writes the local MD5 HBA rule and verifies credentials): run
+init-dbdog-user-gaussdb-global.sql once per instance — console "Add database instance"
+wizard step 1, or by hand; it is installed next to this script. password_encryption_type
+must be 1 before creating the role. Authentication stays in gsql's normal protected mechanisms (for example
 an OS database account or password environment/file). This script never accepts or
 prints a password argument.
 EOF
@@ -330,9 +331,9 @@ fi
 
 [[ ${#databases[@]} -gt 0 ]] || { echo "no databases selected" >&2; exit 1; }
 
-# 前置门:监控角色必须先存在(实例级对象,归安装器建号链或 global SQL 管)。
-# GaussDB 查 pg_user,提示里带上 MONADMIN 语义;HBA/密码加密模式的讲究在
-# 安装器预检里管,这里只管角色在不在。
+# 前置门:监控角色必须先存在(实例级对象,归向导第 1 步的 global SQL 管;安装器只验不建)。
+# GaussDB 查 pg_user,提示里带上 MONADMIN 语义;HBA 由安装器写、密码加密模式由安装器
+# warn 指路,这里只管角色在不在。
 global_hint="$SCRIPT_DIR/init-dbdog-user-gaussdb-global.sql"
 role_exists=$(run_sql "$GAUSSDB_ADMIN_DB" "SELECT 1 FROM pg_catalog.pg_user WHERE usename='${MONITOR_ROLE}';")
 if [[ "$role_exists" != 1 ]]; then

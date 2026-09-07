@@ -3,7 +3,7 @@
 # 用法：
 #   upgrade.sh                 # 升级所有「已安装且版本/产物 SHA 与 manifest 不同」的 stack 模块
 #   upgrade.sh <模块>...       # 升级/安装指定模块（未装的也会装，但不负责初始化配置）
-#   upgrade.sh dbdog-agent     # DB 主机上的 Agent 首装/升级（含配置、数据库准备和验收）
+#   upgrade.sh dbdog-agent     # DB 主机上的 Agent 首装/升级（含配置、GaussDB HBA 基础与验收；不建号）
 #   upgrade.sh dbdog-agent --host-only  # 通用主机模式（仅主机基线，不接数据库引擎）
 # 回滚：把 current 恢复为升级前 readlink 记录的目标后重启；旧身份目录不会自动删除。
 

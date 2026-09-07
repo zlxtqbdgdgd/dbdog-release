@@ -28,6 +28,18 @@ HAD_CONFIG=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
 INSTALLER_CONTRACT_SHA256=""
+# GaussDB 受管 HBA 规则的事务记录（按 gauss 进程索引）：写入后本次安装任何失败退出都按备份
+# 恢复并 reload——写 gs_hba 是替 DBA 做的事，装不成就得把它还原成 DBA 交给我们时的样子。
+AGENT_HBA_TOUCHED_INDEXES=()
+AGENT_HBA_PATHS=()
+AGENT_HBA_BACKUPS=()
+AGENT_HBA_APPLIED=()
+readonly AGENT_HBA_BLOCK_BEGIN='# dbdog-release BEGIN: local Agent monitor'
+readonly AGENT_HBA_BLOCK_END='# dbdog-release END: local Agent monitor'
+readonly AGENT_HBA_RULE='host all dbdog 127.0.0.1/32 md5'
+# 预检记下的 gauss 系角色存在性（按进程索引）与本次未接入的实例（engine|port|原因）。
+AGENT_GAUSS_ROLE_EXISTS=()
+AGENT_SKIPPED_INSTANCES=()
 AGENT_HOST_ARCH=""
 AGENT_HEALTH_TIMEOUT_SECONDS=90
 AGENT_HEALTH_WAIT_ATTEMPTS=0
@@ -43,12 +55,19 @@ usage() {
                九项系统 check + process.d + 日志能力 + 四 systemd 服务）。数据库引擎
                接入事后由本脚本（不带 --host-only）或 upgrade.sh dbdog-agent 交互式补装。
 
+安装器管「基础」，不管「建号」：主机基线、四个服务、GaussDB 的本机 MD5 HBA 规则（受管块
+置顶写进 gs_hba.conf 并 reload，本次安装失败自动还原）由本脚本做；dbdog 监控账号与每库
+对象由 DBA 在控制台「添加数据库实例」向导里建（脚本随包在 /opt/dbdog-agent/scripts）。
+凭证经 127.0.0.1 TCP 实测有效的实例才接入采集；没建号/没给密码/密码不对的实例本次跳过
+并在结尾指路，主机基线照常装成——除非该实例升级前已在采集（那会弄断采集，安装回滚）。
+
 首次安装需要两个外部值；可通过环境变量传入，终端执行时缺失项会安全提示输入：
   DBDOG_SERVER_URL                       dbdog-server origin，例如 http://10.0.0.8:8080
   DBDOG_API_KEY                          dbdog-web 签发的 Agent ingest key
 
 可选覆盖（正常情况下自动发现或使用稳定默认值）：
-  DBDOG_GAUSSDB_MONITOR_PASSWORD         默认首次生成、升级保留
+  DBDOG_GAUSSDB_MONITOR_PASSWORD         GaussDB 监控密码（须与向导第 1 步建号一致；升级路径
+                                         自动按现有 conf 沿用）
   DBDOG_GAUSSDB_PID                      极特殊场景显式指定实例主进程 PID
   DBDOG_GAUSSDB_ENV_FILE                 显式 GaussDB 客户端环境文件（绝对路径）
   DBDOG_GAUSSDB_PGHOST                   仅安装期 gsql 使用的本地 Unix socket 目录
@@ -57,13 +76,11 @@ usage() {
   DBDOG_GAUSSDB_LOG_GLOB                 仅在无法从 GAUSSLOG 发现时使用
   DBDOG_GAUSSDB_DBNAME                   默认 postgres
   DBDOG_GAUSSDB_DEPLOYMENT               centralized 或 distributed
-  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（缺用户时安装器建号用同一密码，
-                                         升级路径自动按现有 conf 逐实例沿用）
+  DBDOG_OPENGAUSS_MONITOR_PASSWORD       openGauss 监控密码（须与向导第 1 步建号一致；升级路径
+                                         自动按现有 conf 逐实例沿用）
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
-  DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（缺用户时安装器建号用同一密码；
-                                         升级路径自动按现有 conf 逐实例沿用）
-  DBDOG_POSTGRES_SUPER_PASSWORD          PostgreSQL 超管密码（仅安装期建号链用：HBA local 行
-                                         非 peer 的主机走 127.0.0.1 TCP 认证;不落盘不进日志）
+  DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（须与向导第 1 步建号一致；升级路径
+                                         自动按现有 conf 逐实例沿用）
   DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb）；
                                          设置后只探测并渲染名单内引擎，名单外实例显式跳过并记日志。
                                          不设置 = 现状全引擎探测（upgrade.sh 与历史行为零变化）。
@@ -160,6 +177,11 @@ rollback_install() {
 on_exit() {
   local rc=$?
   trap - EXIT
+  # 先还 HBA 再回滚服务：回滚会拉起旧 Agent，它得按安装前的认证规则去连库。
+  if [ "$rc" -ne 0 ] && [ "$INSTALL_SUCCEEDED" -eq 0 ] && [ "${#AGENT_HBA_TOUCHED_INDEXES[@]}" -gt 0 ]; then
+    agent_restore_gaussdb_hba_rules || \
+      warn "部分 GaussDB HBA 未能自动恢复；改前副本在 ${AGENT_LOG_DIR}/gs_hba.conf.<port>.before-*，请人工核对"
+  fi
   if [ "$rc" -ne 0 ] && [ "$MUTATION_STARTED" -eq 1 ] && [ "$INSTALL_SUCCEEDED" -eq 0 ]; then
     rollback_install
   fi
@@ -269,14 +291,10 @@ resolve_inputs() {
   DBDOG_SERVER_URL="$(agent_validate_server_url "$DBDOG_SERVER_URL")"
   agent_require_single_line DBDOG_API_KEY "$DBDOG_API_KEY"
   [ -n "$DBDOG_API_KEY" ] || die "DBDOG_API_KEY 不能为空"
-  if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
-    if [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
-      DBDOG_GAUSSDB_MONITOR_PASSWORD="$(agent_generate_gaussdb_password)" || \
-        die "无法生成 GaussDB 监控用户随机密码"
-      log "已生成 GaussDB dbdog 监控用户随机密码（只写入 root 0600 配置）"
-    fi
-    agent_require_single_line DBDOG_GAUSSDB_MONITOR_PASSWORD "$DBDOG_GAUSSDB_MONITOR_PASSWORD"
-    [ -n "$DBDOG_GAUSSDB_MONITOR_PASSWORD" ] || die "GaussDB 监控密码不能为空"
+  # GaussDB 密码与 og/pg 同口径：只验不建、缺了不生成——建号在向导里由 DBA 做，密码随向导
+  # 第 2 步的 env 进来；没密码的实例本次不接入（agent_drop_uncredentialed_instances 指路）。
+  agent_require_single_line DBDOG_GAUSSDB_MONITOR_PASSWORD "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}"
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ] && [ -n "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
     agent_validate_gaussdb_password "$DBDOG_GAUSSDB_MONITOR_PASSWORD" || \
       die "GaussDB 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类"
   fi
@@ -403,11 +421,6 @@ fetch_server_bootstrap() { # 设置 RC_ROOT_JSON
   case "$RC_ROOT_JSON" in *$'\n'* | *$'\r'*) die "Remote Config trust root 含换行" ;; esac
 }
 
-agent_sql_literal() { # SQL 单引号字面量内容（调用方负责外层引号）
-  agent_require_single_line "SQL value" "$1"
-  printf '%s' "$1" | sed "s/'/''/g"
-}
-
 agent_gauss_exec() { # <进程索引> <命令> [参数...]；复用该实例真实客户端环境
   local index="$1" home owner owner_home host port ld path
   shift
@@ -464,17 +477,105 @@ agent_gaussdb_hba_file() { # <进程索引>；输出规范化 HBA 路径
   printf '%s\n' "$hba"
 }
 
-agent_hba_has_required_tcp_md5() { # <HBA 文件>
-  awk '
-    /^[[:space:]]*#/ { next }
-    {
-      kind=tolower($1); database=$2; user=$3; address=$4; method=tolower($5)
-      gsub(/^"|"$/, "", user)
-      if (kind == "host" && database == "all" && user == "dbdog" \
-          && address == "127.0.0.1/32" && method == "md5") found=1
-    }
-    END { exit(found ? 0 : 1) }
+agent_hba_managed_block_is_sane() { # <HBA 文件>；受管块残缺、嵌套或重复 = 状态不明，拒绝改写
+  awk -v begin="$AGENT_HBA_BLOCK_BEGIN" -v end="$AGENT_HBA_BLOCK_END" '
+    BEGIN { inside=0; begins=0; ends=0; bad=0 }
+    $0 == begin { begins++; if (inside) bad=1; inside=1; next }
+    $0 == end { ends++; if (!inside) bad=1; inside=0; next }
+    END { if (inside || begins != ends || begins > 1) bad=1; exit bad }
   ' "$1"
+}
+
+agent_hba_render_desired() { # <HBA 文件>；stdout=受管块置顶 + 原文去掉旧受管块后的其余行（DBA 的行逐字节不动）
+  printf '%s\n%s\n%s\n' "$AGENT_HBA_BLOCK_BEGIN" "$AGENT_HBA_RULE" "$AGENT_HBA_BLOCK_END"
+  awk -v begin="$AGENT_HBA_BLOCK_BEGIN" -v end="$AGENT_HBA_BLOCK_END" '
+    $0 == begin { skip=1; next }
+    $0 == end { skip=0; next }
+    !skip { print }
+  ' "$1"
+}
+
+agent_hba_reload() { # <进程索引>；SELECT pg_reload_conf() 必须返回 t
+  local value
+  value="$(agent_gsql "$1" -c 'SELECT pg_reload_conf();' 2>/dev/null \
+    | awk 'NF { value=$0 } END { print value }' || true)"
+  case "$value" in t | true | 1) return 0 ;; *) return 1 ;; esac
+}
+
+agent_ensure_gaussdb_hba_rule() { # <进程索引>；把受管 MD5 规则置于 HBA 首条并 reload（幂等）
+  # 为什么安装器写而不是让 DBA 写（owner 2026-09-06 拍板）：这条规则是 dbdog 接入 GaussDB 的
+  # 基础设施——PG 的默认 HBA（scram）装完就能用，GaussDB 默认的 sha256（私有握手）/ trust
+  # 标准 libpq 一条都用不了，装完就该是好的。为什么置顶：HBA 首条匹配且不回退，`user=all`
+  # 的宽泛规则排在前面就会把精确规则遮蔽，置顶是唯一不用推理现场顺序也必然正确的位置。
+  # 为什么 md5 不是 trust：trust 免密、且救不了没建号的情况（trust 只免密码不免账号），md5 是
+  # 标准 libpq 与 GaussDB 唯一经交付验证的交集。只动受管块，DBA 的行逐字节不碰；本次安装任何
+  # 失败退出都按备份恢复并 reload（on_exit）。旧安装留下的 `local all dbdog trust` 受管块
+  # 会被同一步换成 md5 行（07-28 之前的安装器写的是 socket trust）。
+  local index="$1" port hba backup applied temp stamp audit
+  port="${AGENT_GAUSS_PID_PORTS[$index]}"
+  hba="$(agent_gaussdb_hba_file "$index")" || \
+    die "无法确定 GaussDB HBA 文件（实例 127.0.0.1:${port}）：SHOW hba_file 与数据目录都拿不到"
+  agent_hba_managed_block_is_sane "$hba" || \
+    die "GaussDB HBA 的 dbdog-release BEGIN/END 受管标记残缺、嵌套或重复，拒绝改写，请人工清理后重跑: $hba"
+  temp="$(mktemp "$(dirname "$hba")/.dbdog-gs-hba.XXXXXX")" || die "无法在 HBA 同目录创建临时文件: $hba"
+  # 先整份拷贝再覆写内容：属主/权限/上下文随 cp -a 继承，不依赖 GNU 专有的 --reference。
+  if ! cp -a -- "$hba" "$temp" || ! agent_hba_render_desired "$hba" >"$temp"; then
+    rm -f -- "$temp"
+    die "生成 GaussDB HBA 受管规则失败: $hba"
+  fi
+  if cmp -s "$hba" "$temp"; then
+    rm -f -- "$temp"
+    log "GaussDB HBA 受管规则已在首条（实例 127.0.0.1:${port}）: ${AGENT_HBA_RULE}"
+    return 0
+  fi
+  stamp="$(date +%Y%m%d%H%M%S)"
+  backup="$WORK_DIR/gs_hba.$index.before"
+  applied="$WORK_DIR/gs_hba.$index.applied"
+  cp -a -- "$hba" "$backup" || { rm -f -- "$temp"; die "无法备份 GaussDB HBA: $hba"; }
+  # 审计副本留在 Agent 日志目录（0600），装成也不删：DBA 要看「dbdog 改前长什么样」有处可查。
+  install -d -m 0755 "$AGENT_LOG_DIR"
+  audit="$AGENT_LOG_DIR/gs_hba.conf.${port}.before-${stamp}"
+  install -m 0600 "$backup" "$audit" || { rm -f -- "$temp"; die "无法写入 HBA 审计副本: $audit"; }
+  cp -a -- "$temp" "$applied"
+  mv -- "$temp" "$hba"
+  AGENT_HBA_TOUCHED_INDEXES+=("$index")
+  AGENT_HBA_PATHS[index]="$hba"
+  AGENT_HBA_BACKUPS[index]="$backup"
+  AGENT_HBA_APPLIED[index]="$applied"
+  command -v restorecon >/dev/null 2>&1 && restorecon "$hba" >/dev/null 2>&1 || true
+  if ! agent_hba_reload "$index"; then
+    cp -a -- "$backup" "$hba"
+    command -v restorecon >/dev/null 2>&1 && restorecon "$hba" >/dev/null 2>&1 || true
+    agent_hba_reload "$index" || true
+    AGENT_HBA_PATHS[index]=""
+    die "GaussDB HBA 写入后 reload 失败（实例 127.0.0.1:${port}），已恢复原文件；请 DBA 核对 pg_reload_conf 权限与实例状态"
+  fi
+  log "GaussDB HBA 已置顶受管规则并 reload（实例 127.0.0.1:${port}）: ${AGENT_HBA_RULE}；改前副本 ${audit}"
+}
+
+agent_restore_gaussdb_hba_rules() { # 失败退出时按备份恢复本次改写过的 HBA 并 reload
+  local index path backup applied failed=0
+  for index in "${AGENT_HBA_TOUCHED_INDEXES[@]}"; do
+    path="${AGENT_HBA_PATHS[$index]:-}"
+    [ -n "$path" ] || continue
+    backup="${AGENT_HBA_BACKUPS[$index]}"
+    applied="${AGENT_HBA_APPLIED[$index]}"
+    if ! cmp -s "$path" "$applied"; then
+      warn "GaussDB HBA 在安装期间被其他操作修改，拒绝覆盖: $path"
+      failed=1
+      continue
+    fi
+    if ! cp -a -- "$backup" "$path"; then failed=1; continue; fi
+    command -v restorecon >/dev/null 2>&1 && restorecon "$path" >/dev/null 2>&1 || true
+    if agent_hba_reload "$index"; then
+      AGENT_HBA_PATHS[index]=""
+      warn "已恢复安装前的 GaussDB HBA 并 reload: $path"
+    else
+      warn "恢复 GaussDB HBA 后 reload 失败: $path"
+      failed=1
+    fi
+  done
+  [ "$failed" -eq 0 ]
 }
 
 # 引擎白名单（DBDOG_ENGINES）：设置后名单外引擎不探测不渲染——「跳过」是操作者/向导的
@@ -497,7 +598,7 @@ agent_apply_engine_allowlist() {
       postgres)
         if [ -n "${AGENT_PG_PORTS[*]-}" ]; then
           log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 PostgreSQL 端口 ${AGENT_PG_PORTS[*]}（不探测不渲染）"
-          AGENT_PG_PORTS=() AGENT_PG_DATA_DIRS=() AGENT_PG_LOG_GLOBS=() AGENT_PG_RENDER_PASSWORDS=() AGENT_PG_PID_OWNERS=() AGENT_PG_PID_PSQLS=() AGENT_PG_PID_SOCKETS=()
+          AGENT_PG_PORTS=() AGENT_PG_DATA_DIRS=() AGENT_PG_LOG_GLOBS=() AGENT_PG_RENDER_PASSWORDS=()
         fi ;;
       opengauss)
         if [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
@@ -518,7 +619,8 @@ agent_apply_engine_allowlist() {
 agent_classify_gauss_engines() {
   # openGauss 的主进程/客户端与 GaussDB 同名同构，检测阶段无法区分；这里按 gsql
   # --version 的自报身份分流（openGauss 的版本串含 "openGauss"）。分类结果决定渲染
-  # 归属与建号策略：GaussDB 走完整建号链，openGauss 凭证只验不建（与 PostgreSQL 同待遇）。
+  # 归属与 HBA 策略：GaussDB 由安装器置顶受管 MD5 规则，openGauss 不动 HBA（本机常见 trust，
+  # 标准 libpq 在 trust/md5 下都能过）；三引擎凭证一律只验不建。
   local index count out version_line
   AGENT_GAUSS_PID_ENGINES=()
   AGENT_GAUSSDB_RENDER_PORTS=()
@@ -579,172 +681,71 @@ agent_assemble_engine_credentials() {
   done
 }
 
-agent_require_probe_credentials() {
-  # openGauss 建号链已放开（bootstrap_openGauss_monitoring，2026-08-19 f82e 实证：
-  # type=1 下 CREATE 的号 psycopg/libpq TCP 实连 OK）——这里的探针是建号之后的
-  # 最终验收。凭证必须在启动验收前被 TCP 实测有效。在 cutover 之后执行——探测用的
-  # embedded psycopg 来自新 runtime，首装时 cutover 前还没有可用 Python。
-  local index port rc
+agent_keep_indexes() { # <保留下标(空格分隔)> <数组名...>；把各平行数组按同一组下标压缩重排（bash 3.2 可用）
+  local keep="$1" name idx
+  local -a tmp
+  shift
+  for name in "$@"; do
+    tmp=()
+    for idx in $keep; do
+      eval 'tmp+=("${'"$name"'[$idx]-}")'
+    done
+    eval "$name"'=(${tmp[@]+"${tmp[@]}"})'
+  done
+}
+
+agent_gauss_pid_index_of_port() { # <端口>；stdout=该端口的 gauss 进程索引，找不到返回 1
+  local index
+  for ((index=0; index<${#AGENT_GAUSS_PID_PORTS[@]}; index++)); do
+    [ "${AGENT_GAUSS_PID_PORTS[$index]}" = "$1" ] || continue
+    printf '%s\n' "$index"
+    return 0
+  done
+  return 1
+}
+
+agent_drop_uncredentialed_instances() {
+  # 没有监控密码的实例本次不接入：建号不归安装器，密码只从向导第 2 步的 env 或升级路径的现有
+  # conf 来。不 die——主机基线与 GaussDB HBA 基础照常装，结尾指路，接库时再来。升级前已在采集
+  # 的实例必然能从现有 conf 收割到密码，不会落到这里。渲染是这些数组的纯函数，压缩数组即撤配置。
+  local index port keep
+  # 数组可能尚未初始化（白名单/host-only 路径），set -u 下先自举成空数组。
+  AGENT_GAUSSDB_RENDER_PORTS=(${AGENT_GAUSSDB_RENDER_PORTS[@]+"${AGENT_GAUSSDB_RENDER_PORTS[@]}"})
+  AGENT_OPENGAUSS_RENDER_PORTS=(${AGENT_OPENGAUSS_RENDER_PORTS[@]+"${AGENT_OPENGAUSS_RENDER_PORTS[@]}"})
+  AGENT_OPENGAUSS_RENDER_PASSWORDS=(${AGENT_OPENGAUSS_RENDER_PASSWORDS[@]+"${AGENT_OPENGAUSS_RENDER_PASSWORDS[@]}"})
+  AGENT_PG_PORTS=(${AGENT_PG_PORTS[@]+"${AGENT_PG_PORTS[@]}"})
+  AGENT_PG_DATA_DIRS=(${AGENT_PG_DATA_DIRS[@]+"${AGENT_PG_DATA_DIRS[@]}"})
+  AGENT_PG_RENDER_PASSWORDS=(${AGENT_PG_RENDER_PASSWORDS[@]+"${AGENT_PG_RENDER_PASSWORDS[@]}"})
+  AGENT_SKIPPED_INSTANCES=(${AGENT_SKIPPED_INSTANCES[@]+"${AGENT_SKIPPED_INSTANCES[@]}"})
+  if [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
+    for port in "${AGENT_GAUSSDB_RENDER_PORTS[@]}"; do
+      warn "gaussdb 127.0.0.1:${port} 本次不接入：未提供监控密码（DBDOG_GAUSSDB_MONITOR_PASSWORD）"
+      AGENT_SKIPPED_INSTANCES+=("gaussdb|${port}|未提供监控密码（DBDOG_GAUSSDB_MONITOR_PASSWORD）")
+    done
+    AGENT_GAUSSDB_RENDER_PORTS=()
+  fi
+  keep=""
   for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
     port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
-    rc=0
-    agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
-      "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]}" "og.$index" || rc=$?
-    [ "$rc" -eq 0 ] || die "openGauss 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；dbdog 用户已由安装器建号/校验，此处失败通常是 HBA 未放行 dbdog 经 127.0.0.1 密码认证，请核对 pg_hba.conf 后重试，本次安装会回滚"
+    if [ -n "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]-}" ]; then
+      keep="$keep $index"
+    else
+      warn "opengauss 127.0.0.1:${port} 本次不接入：未提供监控密码（DBDOG_OPENGAUSS_MONITOR_PASSWORD）"
+      AGENT_SKIPPED_INSTANCES+=("opengauss|${port}|未提供监控密码（DBDOG_OPENGAUSS_MONITOR_PASSWORD）")
+    fi
   done
+  agent_keep_indexes "$keep" AGENT_OPENGAUSS_RENDER_PORTS AGENT_OPENGAUSS_RENDER_PASSWORDS
+  keep=""
   for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
     port="${AGENT_PG_PORTS[$index]}"
-    rc=0
-    agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" \
-      "${AGENT_PG_RENDER_PASSWORDS[$index]}" "pg.$index" || rc=$?
-    [ "$rc" -eq 0 ] || die "PostgreSQL 监控凭证验证失败（127.0.0.1:${port}，rc=${rc}）；请核对 HBA 是否放行 dbdog 经 127.0.0.1 密码认证后重试（建号由安装器完成，用户已存在），本次安装会回滚"
-  done
-}
-
-agent_pg_admin_psql() { # <实例索引> [psql 参数...]；管理员连接跑 psql
-  # 两条认证路径,按可用性自动选:
-  #  ① socket peer(root runuser 转 postgres 进程属主,零密码)——HBA local 行是
-  #    peer/trust 的主机(源码装/多数发行版默认)。
-  #  ② 127.0.0.1 TCP + 超管密码(DBDOG_POSTGRES_SUPER_PASSWORD 经 0600 pgpass
-  #    文件)——HBA local 行是 scram 的主机(实测形态:local all all
-  #    scram-sha-256,peer 根本不会被匹配,socket 兜底也过不去)。未提供超管
-  #    密码且 peer 不可用时 die 指路。
-  # psql 直接取自实例自己的 bin（探测时从 postmaster exe 推导），不存在 PATH 漂移。
-  # psql 路径在函数内解析——调用方若传 "$arr[$idx]"（引号内不展开数组）会得到字面量
-  # "name[0]"，首验实锤；集中在此处取值，调用方只给索引和 psql 参数。
-  local index="$1" owner psql socket port super_pw pw_file auth_out
-  shift
-  owner="${AGENT_PG_PID_OWNERS[$index]}"
-  psql="${AGENT_PG_PID_PSQLS[$index]}"
-  socket="${AGENT_PG_PID_SOCKETS[$index]:-}"
-  port="${AGENT_PG_PORTS[$index]}"
-  super_pw="${DBDOG_POSTGRES_SUPER_PASSWORD:-}"
-  [ -n "$owner" ] || die "无法从 postgres 进程确定运行用户（实例 127.0.0.1:${port}）"
-  [ -x "$psql" ] || die "目标 PostgreSQL 没有可用 psql: ${psql:-<探测期未从 postmaster exe 推导出>}（实例 127.0.0.1:${port}）"
-
-  # 先试 socket peer（零凭证,最优）;失败且有超管密码则走 TCP scram,再失败才 die。
-  auth_out="$WORK_DIR/pg-admin-auth.$index.out"
-  if [ -n "$socket" ] && runuser -u "$owner" -- env -i \
-      HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
-      PGPORT="$port" PGCONNECT_TIMEOUT=8 PGHOST="$socket" \
-      PATH="$(dirname "$psql"):/usr/bin:/bin" \
-      "$psql" -X -q -A -t -d postgres -c 'SELECT 1;' >"$auth_out" 2>&1; then
-    runuser -u "$owner" -- env -i \
-      HOME="/" USER="$owner" LOGNAME="$owner" LC_ALL=C \
-      PGPORT="$port" PGCONNECT_TIMEOUT=8 PGHOST="$socket" \
-      PATH="$(dirname "$psql"):/usr/bin:/bin" "$psql" "$@"
-    return
-  fi
-
-  [ -n "$super_pw" ] || { agent_show_preflight_error "$auth_out" \
-    "无法经本地 socket peer 认证连接 PostgreSQL（实例 127.0.0.1:${port}；HBA local 行可能非 peer）。请 export DBDOG_POSTGRES_SUPER_PASSWORD（PG 超管密码,仅安装期建号用,不落盘）后重跑"; }
-  # 超管密码走 0600 pgpass 文件，不进 argv/环境赋值（凭证卫生与 GaussDB 建号链同口径）。
-  pw_file="$WORK_DIR/pg-super-pw.$index"
-  printf '127.0.0.1:%s:*:postgres:%s\n' "$port" "$super_pw" >"$pw_file" || return 1
-  chmod 0600 "$pw_file" || return 1
-  if ! env -i HOME="/" LC_ALL=C PATH="$(dirname "$psql"):/usr/bin:/bin" \
-      PGHOST=127.0.0.1 PGPORT="$port" PGCONNECT_TIMEOUT=8 \
-      PGPASSFILE="$pw_file" \
-      "$psql" -X -q -A -t -U postgres -d postgres -c 'SELECT 1;' >"$auth_out" 2>&1; then
-    rm -f -- "$pw_file"
-    agent_show_preflight_error "$auth_out" \
-      "PostgreSQL 超管密码无效或 127.0.0.1 TCP 认证失败（实例 127.0.0.1:${port}）；请核对 DBDOG_POSTGRES_SUPER_PASSWORD 与 pg_hba"
-  fi
-  env -i HOME="/" LC_ALL=C PATH="$(dirname "$psql"):/usr/bin:/bin" \
-    PGHOST=127.0.0.1 PGPORT="$port" PGCONNECT_TIMEOUT=8 \
-    PGPASSFILE="$pw_file" \
-    "$psql" -X -U postgres "$@"
-  rm -f -- "$pw_file"
-}
-
-agent_pg_role_exists() { # <实例索引>；输出 1/0
-  local out
-  out="$(agent_pg_admin_psql "$1" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
-    -c "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='dbdog') THEN 1 ELSE 0 END;")" || return 1
-  printf '%s\n' "$out" | tr -d '[:space:]'
-}
-
-agent_prepare_pg_user() { # PostgreSQL 建号链：缺了就建（env 密码）、已存在只补授权、绝不改密
-  # 密码一致性是这套链的立身之本：建号与渲染 conf.d 用的是同一个 DBDOG_POSTGRES_MONITOR_PASSWORD，
-  # 手动建号时代「DBA 密码 vs conf 密码对不上」的经典支持成本就此消失。凭证卫生照抄
-  # GaussDB 建号链：密码只进 0600 临时 SQL 文件、经 stdin 喂 psql，不进 argv 不进日志。
-  local index count port pw escaped exists rc sql_file out
-  count="${#AGENT_PG_PORTS[@]}"
-  [ "$count" -gt 0 ] || return 0
-  # 密码是建号链的硬前置：缺了在动任何东西之前 die（密码渲染校验挂在非 host-only 路径，
-  # 但那已经在 cutover 后——这里前移到建号前，避免装一半回滚）。
-  for ((index=0; index<count; index++)); do
-    pw="${AGENT_PG_RENDER_PASSWORDS[$index]:-}"
-    if [ -z "$pw" ]; then
-      die "PostgreSQL 监控密码缺失（实例 127.0.0.1:${AGENT_PG_PORTS[$index]}）：请 export DBDOG_POSTGRES_MONITOR_PASSWORD 后重跑"
+    if [ -n "${AGENT_PG_RENDER_PASSWORDS[$index]-}" ]; then
+      keep="$keep $index"
+    else
+      warn "postgres 127.0.0.1:${port} 本次不接入：未提供监控密码（DBDOG_POSTGRES_MONITOR_PASSWORD）"
+      AGENT_SKIPPED_INSTANCES+=("postgres|${port}|未提供监控密码（DBDOG_POSTGRES_MONITOR_PASSWORD）")
     fi
   done
-  log "准备 PostgreSQL dbdog 监控账号（缺了就建/已存在只补授权，密码取自安装输入）..."
-  for ((index=0; index<count; index++)); do
-    port="${AGENT_PG_PORTS[$index]}"
-    pw="${AGENT_PG_RENDER_PASSWORDS[$index]}"
-    escaped="$(agent_sql_literal "$pw")" || die "PostgreSQL 监控密码含不支持字符（实例 127.0.0.1:${port}）"
-    exists="$(agent_pg_role_exists "$index")" || \
-      die "无法经本地管理员连接查询 pg_roles（实例 127.0.0.1:${port}）；请核对数据库 OS 用户与 socket 目录"
-    sql_file="$WORK_DIR/prepare-pg-user.$index.sql"
-    case "$exists" in
-      0)
-        printf "CREATE USER dbdog WITH PASSWORD '%s';\nGRANT pg_monitor TO dbdog;\n" "$escaped" >"$sql_file" || return 1
-        ;;
-      1)
-        # 已存在的用户绝不改密（密码可能另有主人）；只幂等补 pg_monitor。
-        # 密码对不对交给随后的 TCP 探针裁决，错了 die 指路而不是重置。
-        printf "GRANT pg_monitor TO dbdog;\n" >"$sql_file" || return 1
-        ;;
-      *) die "无法判断 PostgreSQL 监控用户是否存在（实例 127.0.0.1:${port}）" ;;
-    esac
-    chmod 0600 "$sql_file" || return 1
-    out="$WORK_DIR/prepare-pg-user.$index.out"
-    if ! agent_pg_admin_psql "$index" -X -q -v ON_ERROR_STOP=1 \
-      -d postgres -f "$sql_file" >"$out" 2>&1; then
-      agent_show_preflight_error "$out" \
-        "无法通过本地管理员连接准备 PostgreSQL 监控用户（实例 127.0.0.1:${port}）"
-    fi
-    rm -f -- "$sql_file"
-    if [ "$exists" = 0 ]; then
-      rc=0
-      agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" "$pw" "pg.create.$index" || rc=$?
-      [ "$rc" -eq 0 ] || die "已创建 PostgreSQL dbdog 用户，但标准 libpq 仍无法经 127.0.0.1 TCP 登录（实例 127.0.0.1:${port}，rc=${rc}）；请核对 pg_hba.conf 是否放行 dbdog 密码认证（安装器不修改 pg_hba.conf），本次安装会回滚"
-    fi
-  done
-}
-
-bootstrap_postgres_monitoring() {
-  # PG 版的安装期每库对象准备：perdb.sql 对实例全部可连库各应用一遍（幂等）。
-  # 与 GaussDB 侧 bootstrap_gaussdb_monitoring 同位；search_path 追加语义由落盘的
-  # 五合一脚本承载（DBA 后续重跑同一入口），安装器这里只做首装的库内对象。
-  local sql="$SCRIPT_DIR/agent/init-dbdog-user-pg-perdb.sql" index count db databases list
-  if [ -z "${AGENT_PG_PORTS[*]-}" ]; then
-    return 0
-  fi
-  [ -f "$sql" ] || die "缺少 PostgreSQL 每库对象 SQL: $sql"
-  count="${#AGENT_PG_PORTS[@]}"
-  log "幂等准备 PostgreSQL 每库 DBM 对象（扩展/schema/explain/列统计入口）..."
-  for ((index=0; index<count; index++)); do
-    agent_prepare_pg_instance_dbs "$index" "$sql"
-  done
-}
-
-agent_prepare_pg_instance_dbs() { # <实例索引> <perdb.sql 路径>
-  local index="$1" sql="$2" port dbs db out
-  port="${AGENT_PG_PORTS[$index]}"
-  dbs="$(agent_pg_admin_psql "$index" -X -q -A -t -d postgres -v ON_ERROR_STOP=1 \
-    -c "SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false AND datallowconn ORDER BY datname;")" || \
-    die "无法枚举 PostgreSQL 数据库（实例 127.0.0.1:${port}）"
-  while IFS= read -r db; do
-    [ -n "$db" ] || continue
-    out="$WORK_DIR/pg-perdb.${port}.${db}.out"
-    if ! agent_pg_admin_psql "$index" -X -q -v ON_ERROR_STOP=1 \
-      -d "$db" -f "$sql" >"$out" 2>&1; then
-      agent_show_preflight_error "$out" \
-        "应用 PostgreSQL 每库对象 SQL 失败（实例 127.0.0.1:${port} 数据库 ${db}）"
-    fi
-  done <<<"$dbs"
+  agent_keep_indexes "$keep" AGENT_PG_PORTS AGENT_PG_DATA_DIRS AGENT_PG_RENDER_PASSWORDS
 }
 
 preflight_gaussdb_clients() {
@@ -753,7 +754,7 @@ preflight_gaussdb_clients() {
   # 时的生效认证。与 GaussDB 的差异：og 的本机 HBA 常见 trust（f82e 实测形态），日常
   # 采集走标准 libpq 在 trust/md5 下都能完成认证——所以 og 不硬卡「生效认证必须是
   # MD5」，GaussDB 维持原硬门禁（其兼容合同就是 md5）。
-  local index count gsql ldd_bin out value mode hba exists engine
+  local index count gsql ldd_bin out value mode exists engine port
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
     return 0
@@ -761,7 +762,13 @@ preflight_gaussdb_clients() {
   log "预检目标 GaussDB/openGauss 的 gsql 动态库、版本、本地连接和认证兼容性 ..."
   for ((index=0; index<count; index++)); do
     engine="${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}"
-    case "$engine" in gaussdb | opengauss) ;; *) continue ;; esac
+    port="${AGENT_GAUSS_PID_PORTS[$index]}"
+    # 引擎白名单外的实例连预检都不做——尤其不能替操作者点名跳过的 GaussDB 改 HBA。
+    case "$engine" in
+      gaussdb) case " ${AGENT_GAUSSDB_RENDER_PORTS[*]-} " in *" $port "*) ;; *) continue ;; esac ;;
+      opengauss) case " ${AGENT_OPENGAUSS_RENDER_PORTS[*]-} " in *" $port "*) ;; *) continue ;; esac ;;
+      *) continue ;;
+    esac
     gsql="${AGENT_GAUSS_PID_GSQLS[$index]}"
     ldd_bin="$(agent_find_in_path "${AGENT_GAUSS_PID_PATHS[$index]}" ldd 2>/dev/null || true)"
     [ -n "$ldd_bin" ] || die "GaussDB 客户端环境找不到 ldd（实例索引 ${index}）"
@@ -793,34 +800,30 @@ preflight_gaussdb_clients() {
         "无法读取 password_encryption_type（实例索引 ${index}）"
     # 日常采集的兼容合同是标准 libpq 经 127.0.0.1 TCP 完成认证。mode=1 让新建监控用户
     # 同时具有 SHA256 与 MD5 凭证；mode=2（纯 sha256）下建的号标准 libpq 连不上
-    # （f82e og 实测：Invalid username/password / SASL 失败）。安装器只读校验。
-    [ "$mode" = 1 ] || die \
-      "${engine} 前置条件不满足：SHOW password_encryption_type 当前为 ${mode}，必须由 DBA 按数据库规范配置为 1（gs_guc set 后重启实例生效）并确认生效；dbdog 安装器不会修改 postgresql.conf"
+    # （f82e og 实测：Invalid username/password / SASL 失败）。它只在**建号那一刻**起作用——
+    # 建号已不归安装器（向导里 DBA 建），且它是重启级参数、现场当场改不了——所以只 warn 指路
+    # 不卡安装；已有账号能不能连由 cutover 后的 TCP 探针裁决。安装器不改 postgresql.conf。
+    [ "$mode" = 1 ] || warn \
+      "${engine} 的 SHOW password_encryption_type 当前为 ${mode}（不是 1）：在此模式下新建的 dbdog 用户没有 MD5 凭证，标准 libpq 连不上。请 DBA 在建号前把它改成 1（gs_guc set 后重启实例生效）；已建好且能连的账号不受影响（实例 127.0.0.1:${port}）"
     if [ "$engine" = gaussdb ]; then
-      hba="$(agent_gaussdb_hba_file "$index")" || \
-        die "无法在预检阶段确定 GaussDB HBA 文件（实例索引 ${index}）"
-      agent_hba_has_required_tcp_md5 "$hba" || die \
-        "GaussDB HBA 缺少受支持的本机认证规则：host all dbdog 127.0.0.1/32 md5；请 DBA 把它放在可能匹配 dbdog 的宽泛规则之前并按数据库规范重新加载。dbdog 安装器不会修改 pg_hba.conf: $hba"
+      agent_ensure_gaussdb_hba_rule "$index"
     fi
-    # openGauss 不硬卡 HBA md5：其本机 HBA 常见 trust，标准 libpq 在 trust/md5 下都能
-    # 完成认证（f82e 实测 psycopg 直连 OK）。凭证最终由建号后的 TCP 探针实测裁决。
+    # openGauss 不动 HBA：其本机 HBA 常见 trust，标准 libpq 在 trust/md5 下都能完成认证
+    # （f82e 实测 psycopg 直连 OK）。凭证最终由 cutover 后的 TCP 探针实测裁决。
     exists="$(agent_gsql "$index" -c \
       "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
       | awk 'NF { value=$0 } END { print value }')" || \
       die "无法在预检阶段判断 ${engine} 监控用户是否存在（实例索引 ${index}）"
     case "$exists" in
-      0)
-        # 不存在的角色可能按服务端全局密码策略收到防枚举用的模拟 challenge，
-        # 不能拿它推断新账号创建后的 verifier。CREATE 后会立即做 code=5 + 真实 libpq 验收。
-        ;;
-      1)
-        if [ "$engine" = gaussdb ]; then
-          agent_active_auth_is_md5 "$index" || die \
-            "GaussDB 当前生效的本机 TCP 认证不是 MD5；请 DBA 核对 HBA 顺序、用户凭证与 reload 状态（实例索引 ${index}）"
-        fi
-        ;;
+      0 | 1) AGENT_GAUSS_ROLE_EXISTS[index]="$exists" ;;
       *) die "无法判断 ${engine} 监控用户是否存在（实例索引 ${index}）" ;;
     esac
+    # 受管规则写入并 reload 之后，用最小握手确认首匹配确实是 MD5 code=5。不存在的角色可能收到
+    # 服务端防枚举用的模拟 challenge，只在角色存在时判；这里只留 warn（函数内已带），去留裁决在
+    # cutover 后的凭证门——那里知道该实例是不是升级前就在采集。
+    if [ "$engine" = gaussdb ] && [ "$exists" = 1 ]; then
+      agent_active_auth_is_md5 "$index" || true
+    fi
 
     agent_warn_gaussdb_collection_gucs "$index"
   done
@@ -939,13 +942,6 @@ PY
   return 1
 }
 
-agent_monitor_password_works() { # <gauss 系实例索引> <密码>；兼容包装，语义同 agent_tcp_password_probe
-  local db
-  db="$DBDOG_GAUSSDB_DBNAME"
-  [ "${AGENT_GAUSS_PID_ENGINES[$1]:-gaussdb}" = opengauss ] && db="${DBDOG_OPENGAUSS_DBNAME:-postgres}"
-  agent_tcp_password_probe "${AGENT_GAUSS_PID_PORTS[$1]}" "$db" "$2" "gauss.$1"
-}
-
 agent_active_auth_is_md5() { # <进程索引>；读取当前生效的 PostgreSQL v3 认证请求，不提交失败密码
   local index="$1" python out
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
@@ -1001,82 +997,133 @@ PY
   fi
 }
 
-agent_prepare_gaussdb_user() { # <gauss 密码> <og 密码>；创建用户或验证已有用户凭证
-  local password="$1" og_password="$2" escaped sql="$WORK_DIR/set-gaussdb-password.sql"
-  local index count exists mode reset=0 password_status engine this_pw
-  count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || return 1
-  for ((index=0; index<count; index++)); do
-    engine="${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}"
-    case "$engine" in gaussdb | opengauss) ;; *) continue ;; esac
-    # openGauss 建号链 2026-08-19 放开（f82e 实证 type=1 CREATE 后 psycopg TCP OK），
-    # 与 GaussDB 同一套护栏：缺了就建/已存在只补 MONADMIN 绝不改密/建后 TCP 验活。
-    this_pw="$password"
-    [ "$engine" = opengauss ] && this_pw="$og_password"
-    [ -n "$this_pw" ] || { warn "实例索引 ${index}（${engine}）监控密码缺失：请提供对应引擎的 *_MONITOR_PASSWORD"; return 1; }
-    escaped="$(agent_sql_literal "$this_pw")" || return 1
-    exists="$(agent_gsql "$index" -c \
-      "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_user WHERE usename='dbdog') THEN 1 ELSE 0 END;" \
-      | awk 'NF { value=$0 } END { print value }')" || return 1
-    mode="$(agent_gsql "$index" -c 'SHOW password_encryption_type;' \
-      | awk 'NF { value=$0 } END { print value }')" || return 1
-    case "$exists" in
-      0)
-        [ "$mode" = 1 ] || return 1
-        printf "CREATE USER dbdog WITH MONADMIN PASSWORD '%s';\n" "$escaped" >"$sql" || return 1
-        reset=1
-        ;;
-      1)
-        if [ "$engine" = gaussdb ]; then
-          agent_active_auth_is_md5 "$index" || return 1
-        fi
-        password_status=0
-        agent_monitor_password_works "$index" "$this_pw" || password_status=$?
-        case "$password_status" in
-          0)
-            printf 'ALTER USER dbdog WITH MONADMIN;\n' >"$sql" || return 1
-            ;;
-          2)
-            if [ "$engine" = gaussdb ]; then
-              warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier，或 Agent 保存密码不匹配。mode=1 不会转换旧凭证，安装器不会擅自改密"
-            else
-              warn "实例索引 ${index} 已确认生效 MD5 challenge，但已有 dbdog 用户拒绝保存密码；该用户可能缺少 MD5 verifier（type=2 时代建的旧号需 ALTER 重刷），或 Agent 保存密码不匹配。安装器不会擅自改密"
-            fi
-            return 1
-            ;;
-          *)
-            warn "实例索引 ${index} 无法可靠判定现有 dbdog 密码；拒绝把探测故障当作密码错误并重置"
-            return 1
-            ;;
-        esac
-        ;;
-      *) die "无法判断 ${engine} 监控用户是否存在（实例索引 ${index}）" ;;
-    esac
-    chmod 0600 "$sql" || return 1
-    agent_gsql "$index" <"$sql" || return 1
-    if [ "$reset" -eq 1 ]; then
-      if [ "$engine" = gaussdb ]; then
-        agent_active_auth_is_md5 "$index" || return 1
-      fi
-      if ! agent_monitor_password_works "$index" "$this_pw"; then
-        warn "实例索引 ${index} 已设置 dbdog 密码，但标准 libpq 仍无法经 127.0.0.1 TCP 登录"
-        return 1
-      fi
-    fi
-    reset=0
-  done
+agent_previously_enabled_ports() { # <引擎>；升级前 conf.d 里已在采集的端口（空格分隔），首装为空
+  local file="${OLD_CONFIG:-}/conf.d/$1.d/conf.yaml"
+  [ -n "${OLD_CONFIG:-}" ] && [ -f "$file" ] || return 0
+  agent_harvest_engine_passwords "$file" | cut -f1 | tr '\n' ' '
 }
 
-# 安装器只负责「装机当时存在的库」；此后每次 CREATE DATABASE 都要由 DBA 重跑每库初始化。
-# 把批量脚本、每库 SQL 和全局建号 SQL 一起落到 runtime 树下的固定路径，控制台「采集配置」
-# 页就能给出绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts DB_INIT_SCRIPT_DIR），
-# 研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
+agent_gauss_credential_reason() { # <进程索引> <探针 rc>；把探针结果翻成 DBA 看得懂的原因
+  local index="$1" rc="$2" engine
+  engine="${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}"
+  case "$rc" in
+    2)
+      if [ "${AGENT_GAUSS_ROLE_EXISTS[$index]:-}" = 0 ]; then
+        printf '%s' "dbdog 监控账号尚未创建"
+      elif [ "$engine" = gaussdb ] && ! agent_active_auth_is_md5 "$index" 2>/dev/null; then
+        printf '%s' "127.0.0.1 TCP 首匹配认证不是 MD5（受管规则已置顶并 reload，请 DBA 核对 SHOW hba_file 所指文件与 reload 是否生效）"
+      else
+        printf '%s' "dbdog 密码不匹配，或该账号没有 MD5 凭证（password_encryption_type≠1 时建的号：需在 =1 下重设密码后以 *_MONITOR_PASSWORD 重跑）"
+      fi
+      ;;
+    *) printf '%s' "无法经 127.0.0.1 TCP 完成凭证探测（实例未监听、HBA 未放行或驱动异常，rc=${rc}）" ;;
+  esac
+}
+
+agent_pg_credential_reason() { # <探针 rc>
+  case "$1" in
+    2) printf '%s' "dbdog 账号不存在或密码不匹配（安装器不建号：向导第 1 步建号，第 2 步以 DBDOG_POSTGRES_MONITOR_PASSWORD 重跑）" ;;
+    *) printf '%s' "无法经 127.0.0.1 TCP 完成凭证探测（实例未监听、pg_hba 未放行 dbdog 密码认证或驱动异常，rc=$1）" ;;
+  esac
+}
+
+agent_gate_instance() { # <引擎> <端口> <探针 rc> <原因>；0=接入，1=本次跳过；升级前已在采集的失效 → die
+  local engine="$1" port="$2" rc="$3" reason="$4" prev
+  if [ "$rc" -eq 0 ]; then
+    log "${engine} 127.0.0.1:${port} 监控凭证验证通过，接入采集"
+    return 0
+  fi
+  prev="$(agent_previously_enabled_ports "$engine")"
+  case " $prev " in
+    *" $port "*)
+      die "${engine} 实例 127.0.0.1:${port} 升级前已在采集，但现在监控凭证验证失败：${reason}。为不弄断在网采集，本次升级回滚；修好后重跑同一命令" ;;
+  esac
+  warn "${engine} 127.0.0.1:${port} 本次不接入：${reason}"
+  AGENT_SKIPPED_INSTANCES+=("${engine}|${port}|${reason}")
+  return 1
+}
+
+agent_rerender_confd() {
+  # 凭证门压缩了实例数组之后按同一渲染函数重出 conf.d：渲染是数组的纯函数，不另写"撤配置"逻辑。
+  local stage
+  stage="$(mktemp -d "$AGENT_CONFIG_DIR/.conf.d-regate.XXXXXX")" || die "无法创建 conf.d 重渲染目录"
+  chmod 0700 "$stage"
+  agent_render_checks "$stage" "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" \
+    "$DBDOG_GAUSSDB_USER" "$DBDOG_GAUSSDB_DBNAME" "$DBDOG_ENV"
+  find "$stage" -type d -exec chmod 0700 {} +
+  find "$stage" -type f -exec chmod 0600 {} +
+  rm -rf -- "$AGENT_CONFIG_DIR/conf.d"
+  mv -- "$stage" "$AGENT_CONFIG_DIR/conf.d"
+}
+
+agent_gate_engine_credentials() {
+  # 建号不归安装器（owner 2026-09-06）：dbdog 账号与每库对象由 DBA 在控制台「添加数据库实例」
+  # 向导里建（global SQL + all-databases.sh 已随包落到 /opt/dbdog-agent/scripts）。这里只裁决
+  # 「这个实例现在能不能接入」：dbdog 凭证经 127.0.0.1 TCP 实测有效 → 留在 conf 进验收；无效 →
+  # 本次不接入（撤出 conf.d、验收跳过、结尾指路），主机基线与 HBA 基础照常装成。唯一例外：升级前
+  # 已在采集的实例凭证失效 = 我们会弄断正在跑的采集 → die 回滚（与旧行为同）。
+  # 在 cutover 之后执行：探测用的 embedded psycopg 来自新 runtime，首装时 cutover 前没有 Python。
+  local index pid_index port rc keep changed=0
+  # 数组可能尚未初始化（白名单/host-only 路径），set -u 下先自举成空数组。
+  AGENT_GAUSSDB_RENDER_PORTS=(${AGENT_GAUSSDB_RENDER_PORTS[@]+"${AGENT_GAUSSDB_RENDER_PORTS[@]}"})
+  AGENT_OPENGAUSS_RENDER_PORTS=(${AGENT_OPENGAUSS_RENDER_PORTS[@]+"${AGENT_OPENGAUSS_RENDER_PORTS[@]}"})
+  AGENT_OPENGAUSS_RENDER_PASSWORDS=(${AGENT_OPENGAUSS_RENDER_PASSWORDS[@]+"${AGENT_OPENGAUSS_RENDER_PASSWORDS[@]}"})
+  AGENT_PG_PORTS=(${AGENT_PG_PORTS[@]+"${AGENT_PG_PORTS[@]}"})
+  AGENT_PG_DATA_DIRS=(${AGENT_PG_DATA_DIRS[@]+"${AGENT_PG_DATA_DIRS[@]}"})
+  AGENT_PG_RENDER_PASSWORDS=(${AGENT_PG_RENDER_PASSWORDS[@]+"${AGENT_PG_RENDER_PASSWORDS[@]}"})
+  AGENT_SKIPPED_INSTANCES=(${AGENT_SKIPPED_INSTANCES[@]+"${AGENT_SKIPPED_INSTANCES[@]}"})
+  keep=""
+  for ((index=0; index<${#AGENT_GAUSSDB_RENDER_PORTS[@]}; index++)); do
+    port="${AGENT_GAUSSDB_RENDER_PORTS[$index]}"
+    pid_index="$(agent_gauss_pid_index_of_port "$port")" || die "GaussDB 端口 ${port} 找不到对应进程事实"
+    rc=0
+    agent_tcp_password_probe "$port" "$DBDOG_GAUSSDB_DBNAME" "$DBDOG_GAUSSDB_MONITOR_PASSWORD" "gauss.$pid_index" || rc=$?
+    if agent_gate_instance gaussdb "$port" "$rc" "$(agent_gauss_credential_reason "$pid_index" "$rc")"; then
+      keep="$keep $index"
+    else
+      changed=1
+    fi
+  done
+  agent_keep_indexes "$keep" AGENT_GAUSSDB_RENDER_PORTS
+  keep=""
+  for ((index=0; index<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; index++)); do
+    port="${AGENT_OPENGAUSS_RENDER_PORTS[$index]}"
+    pid_index="$(agent_gauss_pid_index_of_port "$port")" || die "openGauss 端口 ${port} 找不到对应进程事实"
+    rc=0
+    agent_tcp_password_probe "$port" "${DBDOG_OPENGAUSS_DBNAME:-postgres}" \
+      "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$index]}" "og.$pid_index" || rc=$?
+    if agent_gate_instance opengauss "$port" "$rc" "$(agent_gauss_credential_reason "$pid_index" "$rc")"; then
+      keep="$keep $index"
+    else
+      changed=1
+    fi
+  done
+  agent_keep_indexes "$keep" AGENT_OPENGAUSS_RENDER_PORTS AGENT_OPENGAUSS_RENDER_PASSWORDS
+  keep=""
+  for ((index=0; index<${#AGENT_PG_PORTS[@]}; index++)); do
+    port="${AGENT_PG_PORTS[$index]}"
+    rc=0
+    agent_tcp_password_probe "$port" "${DBDOG_POSTGRES_DBNAME:-postgres}" \
+      "${AGENT_PG_RENDER_PASSWORDS[$index]}" "pg.$index" || rc=$?
+    if agent_gate_instance postgres "$port" "$rc" "$(agent_pg_credential_reason "$rc")"; then
+      keep="$keep $index"
+    else
+      changed=1
+    fi
+  done
+  agent_keep_indexes "$keep" AGENT_PG_PORTS AGENT_PG_DATA_DIRS AGENT_PG_RENDER_PASSWORDS
+  [ "$changed" -eq 0 ] || agent_rerender_confd
+}
+
+# 库内对象不归安装器：首次接入（建号 + 各库对象）与此后每次 CREATE DATABASE 都由 DBA 用这套
+# 脚本做。把批量脚本、每库 SQL 和全局建号 SQL 一起落到 runtime 树下的固定路径，控制台「添加数据库
+# 实例」向导与「采集配置」页就能给出绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts
+# DB_INIT_SCRIPT_DIR），研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
 #
 # 三引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
 # 会让 PostgreSQL/openGauss 实例的页面指向不存在的文件。多出的两套是惰性文本，无服务加载。
-# global SQL 同步发货：每库脚本的前置门、安装器建号链的兜底指路、DBA 手工接入都要用
-# 它——2026-08-19 前它只活在研发仓 dbdog-deploy/scripts/ 里，现场想按文档指引走都找不到
-# 文件（实锤）。
+# global SQL 同步发货：向导第 1 步建号、每库脚本的前置门、DBA 手工接入都要用它——2026-08-19
+# 前它只活在研发仓 dbdog-deploy/scripts/ 里，现场想按文档指引走都找不到文件（实锤）。
 AGENT_DBM_INIT_ASSETS="\
 init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:init-dbdog-user-gaussdb-global.sql
 init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:init-dbdog-user-pg-global.sql
@@ -1103,29 +1150,6 @@ install_dbm_init_scripts() {
   done <<<"$AGENT_DBM_INIT_ASSETS"
   [ "$count" -eq 3 ] || die "每库 DBM 初始化工具数量异常: $count"
   log "每库 DBM 初始化工具已就位: $target（新增库后用数据库 OS 账号跑对应引擎脚本；已配置库重跑会先确认是否清理）"
-}
-
-bootstrap_gaussdb_monitoring() {
-  local sql="$SCRIPT_DIR/agent/init-dbdog-user-gaussdb-perdb.sql" og_sql index count
-  # GaussDB 与 openGauss 共用建号链;主机没有 gauss 系实例（纯 PostgreSQL）时整段跳过。
-  if [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
-    return 0
-  fi
-  [ -f "$sql" ] || die "缺少 GaussDB 每库对象 SQL: $sql"
-  og_sql="$SCRIPT_DIR/agent/init-dbdog-user-opengauss-perdb.sql"
-  [ -f "$og_sql" ] || die "缺少 openGauss 每库对象 SQL: $og_sql"
-  count="${#AGENT_GAUSS_PID_PORTS[@]}"
-  log "使用目标机 GAUSSHOME/gsql 幂等准备 dbdog 监控账号与每库对象（仅安装阶段，GaussDB/openGauss）..."
-  # password_encryption_type 与 HBA 已在预检中只读核对。这里仅创建/校验账号，
-  # 并用交付给 integration 的同一凭证经内嵌 psycopg/libpq 做真实 TCP 登录探测。
-  agent_prepare_gaussdb_user "$DBDOG_GAUSSDB_MONITOR_PASSWORD" "${DBDOG_OPENGAUSS_MONITOR_PASSWORD:-}" || \
-    die "无法通过目标 GaussDB/openGauss 的本地管理连接准备监控用户"
-  for ((index=0; index<count; index++)); do
-    case "${AGENT_GAUSS_PID_ENGINES[$index]:-gaussdb}" in
-      gaussdb) agent_gsql "$index" <"$sql" || die "应用 GaussDB 每库对象 SQL 失败（实例索引 ${index}）" ;;
-      opengauss) agent_gsql "$index" <"$og_sql" || die "应用 openGauss 每库对象 SQL 失败（实例索引 ${index}）" ;;
-    esac
-  done
 }
 
 validate_archive_members() { # <tarball>
@@ -2017,14 +2041,17 @@ main() {
   fi
   fetch_server_bootstrap
   preflight_gaussdb_clients
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
+    # 凭证门开着：实例可以因为没建号/没密码被撤出渲染，渲染层允许「探到了引擎但零实例接入」
+    # （检测层「一个引擎都没在跑」的硬失败仍在上面）。
+    AGENT_ENGINE_GATING=1
+    agent_drop_uncredentialed_instances
+  fi
   render_install_state
   cutover
   if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
     install_dbm_init_scripts
-    agent_prepare_pg_user
-    agent_require_probe_credentials
-    bootstrap_gaussdb_monitoring
-    bootstrap_postgres_monitoring
+    agent_gate_engine_credentials
   fi
   start_and_verify
 
@@ -2045,9 +2072,20 @@ main() {
   [ -z "${AGENT_PG_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}PostgreSQL"
   if [ "${AGENT_HOST_ONLY:-0}" = 1 ]; then
     log "已启用：主机基线（九项系统 check、process.d、日志、Live Processes、NPM/USM、APM/OpenLineage、Remote Config）"
-    log "数据库引擎接入（DBM）是第二步：在本机 dbdog-release 仓执行 sudo ./scripts/upgrade.sh dbdog-agent 交互选择实例"
-  else
+    log "数据库引擎接入（DBM）是第二步：控制台 Databases →「添加数据库实例」向导"
+  elif [ -n "$enabled_engines" ]; then
     log "已启用：${enabled_engines} DBM（含 database_autodiscovery）、日志、主机指标、Live Processes、NPM/USM、APM/OpenLineage、Remote Config"
+  else
+    log "已启用：主机基线（本次没有接入任何数据库实例，见下方原因）"
+  fi
+  if [ "${#AGENT_SKIPPED_INSTANCES[@]}" -gt 0 ]; then
+    local skipped skipped_engine skipped_port skipped_reason
+    warn "本次未接入的数据库实例（主机基线已装好，接库时再来）："
+    for skipped in "${AGENT_SKIPPED_INSTANCES[@]}"; do
+      IFS='|' read -r skipped_engine skipped_port skipped_reason <<<"$skipped"
+      warn "  ${skipped_engine} 127.0.0.1:${skipped_port} —— ${skipped_reason}"
+    done
+    warn "接入步骤：控制台 Databases →「添加数据库实例」向导。第 1 步由 DBA 建 dbdog 账号并初始化各库（脚本在 ${AGENT_RUNTIME_DIR}/scripts），第 2 步复制带 *_MONITOR_PASSWORD 的安装命令重跑本安装器"
   fi
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"

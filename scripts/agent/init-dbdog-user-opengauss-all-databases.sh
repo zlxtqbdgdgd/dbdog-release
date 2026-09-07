@@ -73,9 +73,10 @@ Connection environment:
   OPENGAUSS_ADMIN_USER  administrative user passed to gsql with -U (optional)
   OPENGAUSS_PERDB_SQL   per-database SQL file override (optional)
 
-Prerequisite: the dbdog login role must already exist (created by agent-install.sh
-without --host-only, or run init-dbdog-user-opengauss-global.sql once per instance —
-it is installed next to this script). Authentication stays in gsql's normal protected
+Prerequisite: the dbdog login role must already exist. agent-install.sh never creates
+it (it only verifies credentials): run init-dbdog-user-opengauss-global.sql once per
+instance — console "Add database instance" wizard step 1, or by hand; it is installed
+next to this script. Authentication stays in gsql's normal protected
 mechanisms (for example an OS database account or password environment/file). This
 script never accepts or prints a password argument.
 EOF
@@ -328,7 +329,7 @@ fi
 
 [[ ${#databases[@]} -gt 0 ]] || { echo "no databases selected" >&2; exit 1; }
 
-# 前置门:监控角色必须先存在(实例级对象,归安装器建号链或 global SQL 管)。
+# 前置门:监控角色必须先存在(实例级对象,归向导第 1 步的 global SQL 管;安装器只验不建)。
 # openGauss 查 pg_user(og7 的 pg_roles 对非超管隐藏性更强,pg_user 是脚本
 # 既有口径);缺角色时给一句人话和现成命令,不再等 perdb.sql 深处才炸。
 global_hint="$SCRIPT_DIR/init-dbdog-user-opengauss-global.sql"
