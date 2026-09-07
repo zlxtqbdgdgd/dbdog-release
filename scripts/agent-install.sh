@@ -2003,12 +2003,35 @@ main() {
     die "无法计算 dbdog-agent 安装器合约指纹"
 
   local version artifact sha256 package old_gauss
-  version="$(manifest_get dbdog-agent 5)"
-  artifact="$(manifest_get dbdog-agent 6)"
-  sha256="$(manifest_get dbdog-agent 7)"
-  [ "$version" != - ] || die "dbdog-agent 尚未发布"
-  log "dbdog-agent 目标版本: $version"
-  package="$(download_artifact "$artifact" "$sha256")"
+  if [ -n "${DBDOG_AGENT_LOCAL_ARTIFACT:-}" ]; then
+    # 快升级（开发态）：包由 fast-upgrade.sh 用**与正式发布同一份 recipe** 现出，
+    # 不经 GitHub。从这里往下与慢升级**完全同一段代码**——staging、门禁、cutover、
+    # 验收、回滚一个不少。这正是「绝不搞两套部署」的落点：快慢只差包的来源。
+    package="$DBDOG_AGENT_LOCAL_ARTIFACT"
+    [ -f "$package" ] && [ ! -L "$package" ] || die "本地产物不是实际文件: $package"
+    version="${DBDOG_AGENT_LOCAL_VERSION:-}"
+    [ -n "$version" ] || die "使用本地产物时必须给出 DBDOG_AGENT_LOCAL_VERSION"
+    # lib.sh 只有 sha256_verify（比对），没有「算出来」的函数；这里沿用它的同一套兜底
+    # （mac 无 sha256sum 用 shasum），别新引入一种算法来源。
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256="$(sha256sum "$package" | awk '{print $1}')"
+    else
+      sha256="$(shasum -a 256 "$package" | awk '{print $1}')"
+    fi
+    [ "${#sha256}" -eq 64 ] || die "无法计算本地产物 SHA-256: $package"
+    if [ -n "${DBDOG_AGENT_LOCAL_ARTIFACT_SHA256:-}" ]; then
+      [ "$sha256" = "$DBDOG_AGENT_LOCAL_ARTIFACT_SHA256" ] || \
+        die "本地产物 SHA-256 与调用方声明的不一致（实际 ${sha256}，声明 ${DBDOG_AGENT_LOCAL_ARTIFACT_SHA256}）"
+    fi
+    log "dbdog-agent 本地产物: ${version}（sha256 ${sha256}）"
+  else
+    version="$(manifest_get dbdog-agent 5)"
+    artifact="$(manifest_get dbdog-agent 6)"
+    sha256="$(manifest_get dbdog-agent 7)"
+    [ "$version" != - ] || die "dbdog-agent 尚未发布"
+    log "dbdog-agent 目标版本: $version"
+    package="$(download_artifact "$artifact" "$sha256")"
+  fi
   if [ "${DBDOG_AGENT_PREFLIGHT_ONLY:-}" = "1" ]; then
     agent_preflight_artifact_only "$package" "$version"
     INSTALL_SUCCEEDED=1

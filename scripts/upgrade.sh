@@ -474,7 +474,14 @@ if [ "${1:-}" = "--artifact" ]; then
   shift 2
   [ "$#" -eq 1 ] || die "--artifact 一次只装一个模块"
   [ -f "$LOCAL_ARTIFACT" ] || die "产物不存在: $LOCAL_ARTIFACT"
-  [ "$1" != dbdog-agent ] || die "dbdog-agent 只走组件级安装路径，不接受 --artifact"
+  # dbdog-agent 现在也接受 --artifact（2026-09-07 起）：快升级用与正式发布**同一份
+  # recipe** 现出包，再从这里进入**同一段**首装/升级实现。原来拒绝它，导致 x86 开发态
+  # 只能走 dbdog-agent/dbdog-deploy/scripts/x86-local/ 那套**独立的**部署脚本——
+  # 装出来的机器与慢升级不保证一致，跟「绝不搞两套部署」直接冲突。
+  if [ "$1" = dbdog-agent ]; then
+    [ -n "${DBDOG_AGENT_LOCAL_VERSION:-}" ] || \
+      die "dbdog-agent 走 --artifact 时必须给出 DBDOG_AGENT_LOCAL_VERSION（形如 <manifest版本>-dev.g<短sha>）"
+  fi
 fi
 
 # Agent 位于 DB 主机且拥有独立的 root/config/systemd 事务。统一入口在参数校验后
@@ -483,6 +490,9 @@ for requested in "$@"; do
   if [ "$requested" = dbdog-agent ]; then
     [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = "--host-only" ]; } || \
       die "dbdog-agent 位于 DB 主机，不能与 stack 模块混合升级；仅支持附加 --host-only"
+    if [ -n "$LOCAL_ARTIFACT" ]; then
+      export DBDOG_AGENT_LOCAL_ARTIFACT="$LOCAL_ARTIFACT"
+    fi
     exec "$SCRIPTS_DIR/agent-install.sh" ${2:+--host-only}
   fi
 done
