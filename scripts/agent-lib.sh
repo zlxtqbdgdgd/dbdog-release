@@ -829,6 +829,13 @@ database_monitoring:
     dd_url: $(agent_yaml_quote "$server")
 
 confd_path: $(agent_yaml_quote "$AGENT_CONFIG_DIR/conf.d")
+# 必须显式钉住：不设的话 Agent 会落回**上游编译进二进制的默认值**
+# /etc/datadog-agent/checks.d。在同机并排装着官方 datadog-agent 的主机上（如
+# host109-vm201），那个目录是真实存在的，我们的 Agent 会去加载别人的自定义 check。
+# 二进制里那批 /etc/datadog-agent 常量改不掉（是 Go 源码里的字面量，不是构建参数），
+# 所以只能在配置里逐个覆盖——confd_path / run_path / log_file 已经这么做了，
+# additional_checksd 之前漏了。
+additional_checksd: $(agent_yaml_quote "$AGENT_CONFIG_DIR/checks.d")
 run_path: $(agent_yaml_quote "$AGENT_RUN_DIR")
 log_file: $(agent_yaml_quote "$AGENT_LOG_DIR/agent.log")
 log_level: info

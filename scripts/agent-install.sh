@@ -1437,6 +1437,10 @@ render_install_state() {
   CONFIG_STAGE="$(mktemp -d /etc/.dbdog-agent-stage.XXXXXX)"
   UNIT_STAGE="$(mktemp -d /etc/systemd/system/.dbdog-agent-units.XXXXXX)"
   install -d -m 0700 "$CONFIG_STAGE/conf.d"
+  # datadog.yaml 里 additional_checksd 指向它；目录不存在时 Agent 每轮都会抱怨路径缺失。
+  # 之所以必须有这个目录（而不是干脆不设 additional_checksd）：不设就会落回上游编译进
+  # 二进制的 /etc/datadog-agent/checks.d，在并排装着官方 Agent 的主机上会读到别人的 check。
+  install -d -m 0700 "$CONFIG_STAGE/checks.d"
   agent_render_datadog_yaml "$CONFIG_STAGE/datadog.yaml" "$DBDOG_SERVER_URL" \
     "$DBDOG_API_KEY" "$DBDOG_AGENT_HOSTNAME" "$RC_ROOT_JSON"
   agent_render_system_probe_yaml "$CONFIG_STAGE/system-probe.yaml"
