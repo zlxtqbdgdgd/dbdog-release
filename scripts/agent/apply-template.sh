@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 套采集模板（定制层）：apply-template.sh <gaussdb|opengauss|postgres> [--check]
+# 套采集模板（定制层）：apply-template.sh <gaussdb|opengauss|postgres|mysql> [--check]
 # 安装/升级只渲染现场事实与最小配置；采集开关在模板里，装完（以及每次升级后）跑本脚本合并。
 # 幂等：重复执行结果一致。--check 只比对不写盘，有差异退出 1。
 # 模板随 agent 产物落在 $AGENT_RUNTIME_DIR/templates/dbdog/db/；可用 DBDOG_TEMPLATES_DIR 覆盖。

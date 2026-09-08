@@ -1339,28 +1339,16 @@ EOF
     for ((cred_i=0; cred_i<${#AGENT_MYSQL_PORTS[@]}; cred_i++)); do
       port="${AGENT_MYSQL_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
-  - dbm: true
-    database_identifier:
-      # 分隔符用 '-' 不用 ':'，同 postgres.d 的军规 5 登记。
-      template: '\$resolved_hostname-\$port'
-    service: mysql
+  - service: mysql
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "${AGENT_MYSQL_RENDER_PASSWORDS[$cred_i]}")
-    # explain 采集走 dbdog 命名（军规 5，对齐出货模板 dbdog-deploy/conf/conf.d/mysql.d）：
-    # 裸名 explain_statement 不覆盖——check 第一解析策略在语句所在库找裸名过程（由
-    # init-dbdog-user-mysql-perdb.sql 逐库建）；只覆盖三个全限定项。
-    # 军规 8：mysql check 没有 PG 族的 relations/database_autodiscovery/
-    # collect_column_statistics/ignore_databases/dbname 键；dbm: true 下四个采集开关默认即开，
-    # 模板不复述（避免部署漂移）。
-    query_samples:
-      fully_qualified_explain_procedure: dbdog.explain_statement
-      events_statements_enable_procedure: dbdog.enable_events_statements_consumers
-      events_statements_temp_table_name: dbdog.temp_events
-    # schema 资产（实例详情 Schemas 面）：check 默认 false，产品要，显式开。
-    collect_schemas:
-      enabled: true
+    # dbm / database_identifier / query_samples 三个品牌覆盖 / collect_schemas 及日志规则是定制层，
+    # 不在安装器渲染：由 apply-template.sh 从 templates/dbdog/db/mysql.yaml 合并。
+    # 军规 8：mysql check 没有 PG 族的 relations/database_autodiscovery/collect_column_statistics/
+    # ignore_databases/dbname 键；开 DBM 后四个采集开关（query_metrics/query_samples/query_activity/
+    # index_metrics）默认即开，模板不复述（避免部署漂移）。
     tags:
       - $(agent_yaml_quote "env:$env_name")
       # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
@@ -1377,11 +1365,6 @@ EOF
     service: mysql
     tags:
       - $(agent_yaml_quote "env:$env_name")
-    # multi_line 聚合：MySQL 错误日志行首带时间戳（YYYY-MM-DDTHH:MM:SS 或空格分隔两种形）。
-    log_processing_rules:
-      - type: multi_line
-        name: new_log_start_with_timestamp
-        pattern: '\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
 EOF
     done
   fi
