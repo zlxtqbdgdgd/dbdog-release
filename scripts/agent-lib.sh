@@ -147,6 +147,14 @@ agent_require_single_line() { # <字段名> <值>
   esac
 }
 
+agent_python_or_empty() { # 输出可用的 python3 解释器路径；无则输出空（jq 兜底由调用方处理）
+  command -v python3 2>/dev/null && return 0
+  # RHEL8 最小装机没有 /usr/bin/python3，只有 /usr/libexec/platform-python(3.6)——
+  # 3.6 足够跑安装器内嵌的 JSON 解析（json/pathlib/f-string），vm204 实锤（2026-09-08）。
+  [ -x /usr/libexec/platform-python ] && printf '%s\n' /usr/libexec/platform-python
+  return 0
+}
+
 agent_yaml_quote() { # 任意单行字符串 -> YAML 单引号标量
   agent_require_single_line "YAML value" "$1"
   printf "'"

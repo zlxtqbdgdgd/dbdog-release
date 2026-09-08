@@ -352,9 +352,10 @@ curl_tls_args() { # 设置 CURL_TLS_ARGS
 }
 
 compact_json_file() { # <输入文件>
-  local input="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$input" <<'PY'
+  local input="$1" py
+  py="$(agent_python_or_empty)"
+  if [ -n "$py" ]; then
+    "$py" - "$input" <<'PY'
 import json
 import pathlib
 import sys
@@ -372,9 +373,10 @@ PY
 }
 
 compact_tuf_root_file() { # <输入文件>；只接受 Agent 可直接信任的 TUF root metadata
-  local input="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$input" <<'PY'
+  local input="$1" py
+  py="$(agent_python_or_empty)"
+  if [ -n "$py" ]; then
+    "$py" - "$input" <<'PY'
 import json
 import pathlib
 import sys
@@ -1325,12 +1327,7 @@ agent_version_manifest_json_value() { # <version-manifest.json>；输出唯一 b
   local input="$1" parser env_bin
   env_bin="$(command -v env 2>/dev/null || true)"
   [ -n "$env_bin" ] || return 1
-  # RHEL8 最小装机没有 /usr/bin/python3，只有 /usr/libexec/platform-python(3.6)——
-  # 3.6 足够跑下面的解析（json/pathlib/f-string），vm204 实锤（2026-09-08）。
-  parser="$(command -v python3 2>/dev/null || true)"
-  if [ -z "$parser" ] && [ -x /usr/libexec/platform-python ]; then
-    parser=/usr/libexec/platform-python
-  fi
+  parser="$(agent_python_or_empty)"
   if [ -n "$parser" ]; then
     "$env_bin" -i PATH=/usr/bin:/bin LANG=C LC_ALL=C "$parser" - "$input" <<'PY'
 import json
