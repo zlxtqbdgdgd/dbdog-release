@@ -82,10 +82,34 @@ fi
 
 # manifest.tsv（agent-install 解析产物版本的发布事实）不在指纹清单里，单独拉取；
 # 完整性由产物下载自身的 sha 校验兜底。
+#
+# 优先取产物桶那份：菜单与产物同一个货架、同一次发布写入，永远不会比产物旧，而且
+# 本机为了下 agent 产物本来就必须能连产物桶，不新增任何出网前置。server 内嵌的那份
+# 是 server 构建期快照，只当产物桶不可达时兜底——它会比产物旧：2026-09-07 x86_64
+# 首发后，线上 server 0.1.24 的快照里 x86_64 那行仍是未发布，x86 主机一行安装当场
+# 撞 "dbdog-agent 尚未发布"，而包好好地躺在桶里。所以走到兜底一定要出声。
+BUCKET_URL="${BUCKET_URL:-https://github.com/zlxtqbdgdgd/dbdog-release/releases/download/artifacts}"
+
+fetch_manifest() { # <url> <来源说明>；下载并做形态校验，两者任一不过都算这个来源失败
+  curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp/manifest.tsv" "$1" || return 1
+  # 形态校验：截断的下载、错误页、被中间设备替换的响应都会在这里现形，不会以
+  # "尚未发布" 这种指向完全错误的报错甩给装机的人。
+  awk -F'\t' '$1 == "dbdog-agent" { found = 1 } END { exit !found }' "$tmp/manifest.tsv" || {
+    printf 'bootstrap: %s 的 manifest.tsv 内容不合法（没有 dbdog-agent 行）\n' "$2" >&2
+    return 1
+  }
+  return 0
+}
+
 printf '下载: manifest.tsv\n'
-curl -fsS --connect-timeout 10 --max-time 60 \
-  -o "$tmp/manifest.tsv" "${DBDOG_SERVER_URL}/install/scripts/manifest.tsv" || \
-  die "下载失败: manifest.tsv"
+if fetch_manifest "${BUCKET_URL%/}/manifest.tsv" "产物桶"; then
+  printf '  manifest 来源: 产物桶（与 agent 产物同一次发布写入）\n'
+elif fetch_manifest "${DBDOG_SERVER_URL}/install/scripts/manifest.tsv" "server 内嵌快照"; then
+  printf '  manifest 来源: server 内嵌快照\n'
+  printf 'bootstrap: 警告——产物桶 manifest.tsv 取不到，已回退到 server 内嵌快照。该快照定格在 server 构建之时，可能不含最新发布的版本或架构；若下面报某模块"尚未发布"，先核对产物桶再判断。\n' >&2
+else
+  die "下载失败: manifest.tsv（产物桶与 server 两处都取不到或内容不合法）"
+fi
 
 export DBDOG_SERVER_URL DBDOG_API_KEY
 export MANIFEST="$tmp/manifest.tsv"
