@@ -81,12 +81,15 @@ usage() {
   DBDOG_OPENGAUSS_DBNAME                 openGauss 主连接库，默认 postgres
   DBDOG_POSTGRES_MONITOR_PASSWORD        PostgreSQL 监控密码（须与向导第 1 步建号一致；升级路径
                                          自动按现有 conf 逐实例沿用）
-  DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb）；
+  DBDOG_MYSQL_MONITOR_PASSWORD           MySQL 监控密码（须与向导第 1 步建号一致；升级路径自动按
+                                         现有 conf 逐实例沿用；仅支持 MySQL，mariadbd 不探测）
+  DBDOG_ENGINES                          引擎白名单（逗号/空格分隔：postgres / opengauss / gaussdb / mysql）；
                                          设置后只探测并渲染名单内引擎，名单外实例显式跳过并记日志。
                                          不设置 = 现状全引擎探测（upgrade.sh 与历史行为零变化）。
                                          Databases「添加数据库实例」向导按用户所选引擎传入。
   DBDOG_POSTGRES_DBNAME                  PostgreSQL 主连接库，默认 postgres
   DBDOG_POSTGRES_EXCLUDE_PORTS           显式排除的 PG 实例端口（空格/逗号分隔）；停监控是操作者决策，必须点名
+  DBDOG_MYSQL_EXCLUDE_PORTS              显式排除的 MySQL 实例端口（空格/逗号分隔）；同 PG 口径
   DBDOG_ENV                              默认 prod
   DBDOG_AGENT_HOSTNAME                   默认 hostname -s
   DBDOG_AGENT_HEALTH_TIMEOUT             全组件 readiness 截止时间，默认 90 秒（30–600）
@@ -278,6 +281,11 @@ resolve_inputs() {
     old="$(agent_existing_gauss_scalar "$AGENT_CONFIG_DIR/conf.d/postgres.d/conf.yaml" password 2>/dev/null || true)"
     [ -z "$old" ] || DBDOG_POSTGRES_MONITOR_PASSWORD="$old"
   fi
+  # MySQL 凭证同 og/pg 口径：只验不建，升级路径从现有 conf 收割（mysql.d 实例块同形）。
+  if [ -z "${DBDOG_MYSQL_MONITOR_PASSWORD:-}" ]; then
+    old="$(agent_existing_gauss_scalar "$AGENT_CONFIG_DIR/conf.d/mysql.d/conf.yaml" password 2>/dev/null || true)"
+    [ -z "$old" ] || DBDOG_MYSQL_MONITOR_PASSWORD="$old"
+  fi
 
   prompt_value DBDOG_SERVER_URL "dbdog-server 地址（如 http://10.0.0.8:8080）" 0
   prompt_value DBDOG_API_KEY "dbdog-web 签发的 Agent ingest key" 1
@@ -285,7 +293,7 @@ resolve_inputs() {
   if [ -n "${DBDOG_ENGINES:-}" ]; then
     local _eng _ok
     for _eng in $(printf '%s' "$DBDOG_ENGINES" | tr ',\t' '  '); do
-      case "$_eng" in postgres|opengauss|gaussdb) ;; *) die "DBDOG_ENGINES 含未知引擎: $_eng（合法值 postgres/opengauss/gaussdb）" ;; esac
+      case "$_eng" in postgres|opengauss|gaussdb|mysql) ;; *) die "DBDOG_ENGINES 含未知引擎: $_eng（合法值 postgres/opengauss/gaussdb/mysql）" ;; esac
     done
   fi
   DBDOG_SERVER_URL="$(agent_validate_server_url "$DBDOG_SERVER_URL")"
@@ -309,6 +317,13 @@ resolve_inputs() {
       die "openGauss 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类（og 服务端密码策略同口径）"
   fi
   agent_require_single_line DBDOG_POSTGRES_MONITOR_PASSWORD "${DBDOG_POSTGRES_MONITOR_PASSWORD:-}"
+  # MySQL 密码强度按服务端 validate_password 常见策略（≥3 字符类）预检——弱密码在服务端
+  # 也会被 ERROR 1819 拒，提前 die 好过装一半回滚；未启用组件的实例多检无害。
+  agent_require_single_line DBDOG_MYSQL_MONITOR_PASSWORD "${DBDOG_MYSQL_MONITOR_PASSWORD:-}"
+  if [ "${AGENT_HOST_ONLY:-0}" != 1 ] && [ -n "${DBDOG_MYSQL_MONITOR_PASSWORD:-}" ]; then
+    agent_validate_gaussdb_password "$DBDOG_MYSQL_MONITOR_PASSWORD" || \
+      die "MySQL 监控密码必须为 8-32 个无空白可打印字符，并至少包含大小写字母、数字、特殊字符中的三类（validate_password 常见策略同口径）"
+  fi
   agent_require_single_line DBDOG_GAUSSDB_ENV_FILE "${DBDOG_GAUSSDB_ENV_FILE:-}"
   agent_require_single_line DBDOG_GAUSSDB_PGHOST "${DBDOG_GAUSSDB_PGHOST:-}"
   agent_require_single_line DBDOG_GAUSSDB_LD_LIBRARY_PATH \
@@ -592,7 +607,7 @@ agent_engine_allowed() { # <engine: postgres|opengauss|gaussdb>
 agent_apply_engine_allowlist() {
   [ -z "${DBDOG_ENGINES:-}" ] && return 0
   local engine
-  for engine in postgres opengauss gaussdb; do
+  for engine in postgres opengauss gaussdb mysql; do
     agent_engine_allowed "$engine" && continue
     case "$engine" in
       postgres)
@@ -610,10 +625,15 @@ agent_apply_engine_allowlist() {
           log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 GaussDB 端口 ${AGENT_GAUSSDB_RENDER_PORTS[*]}（不渲染）"
           AGENT_GAUSSDB_RENDER_PORTS=() AGENT_GAUSSDB_RENDER_PASSWORDS=()
         fi ;;
+      mysql)
+        if [ -n "${AGENT_MYSQL_PORTS[*]-}" ]; then
+          log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 MySQL 端口 ${AGENT_MYSQL_PORTS[*]}（不探测不渲染）"
+          AGENT_MYSQL_PORTS=() AGENT_MYSQL_LOG_GLOBS=() AGENT_MYSQL_RENDER_PASSWORDS=()
+        fi ;;
     esac
   done
   # 白名单内一个引擎都没有在跑 = 硬失败（与「未发现受支持实例」同待遇）。
-  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}${AGENT_OPENGAUSS_RENDER_PORTS[*]-}${AGENT_PG_PORTS[*]-}" ] ||     die "引擎白名单 [${DBDOG_ENGINES}] 内未发现任何运行中的数据库实例"
+  [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}${AGENT_OPENGAUSS_RENDER_PORTS[*]-}${AGENT_PG_PORTS[*]-}${AGENT_MYSQL_PORTS[*]-}" ] ||     die "引擎白名单 [${DBDOG_ENGINES}] 内未发现任何运行中的数据库实例"
 }
 
 agent_classify_gauss_engines() {
@@ -649,9 +669,9 @@ agent_classify_gauss_engines() {
   if [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] && [ -z "${AGENT_GAUSS_LOG_GLOBS[*]-}" ]; then
     die "存在 GaussDB 实例但无法发现 GAUSSLOG；请只在首次安装时显式设置 DBDOG_GAUSSDB_LOG_GLOB"
   fi
-  # 三引擎共用 127.0.0.1 TCP 命名空间：跨引擎端口也必须唯一，否则渲染前 fail closed。
+  # 四引擎共用 127.0.0.1 TCP 命名空间：跨引擎端口也必须唯一，否则渲染前 fail closed。
   local port seen=" "
-  for port in ${AGENT_GAUSS_PORTS[@]+"${AGENT_GAUSS_PORTS[@]}"} ${AGENT_PG_PORTS[@]+"${AGENT_PG_PORTS[@]}"}; do
+  for port in ${AGENT_GAUSS_PORTS[@]+"${AGENT_GAUSS_PORTS[@]}"} ${AGENT_PG_PORTS[@]+"${AGENT_PG_PORTS[@]}"} ${AGENT_MYSQL_PORTS[@]+"${AGENT_MYSQL_PORTS[@]}"}; do
     case "$seen" in *" $port "*) \
       die "跨引擎端口冲突：127.0.0.1:${port} 被多个实例占用，TCP 监控无法唯一区分" ;; esac
     seen="$seen$port "
@@ -678,6 +698,15 @@ agent_assemble_engine_credentials() {
     pw="$(printf '%s\n' "$pairs" | awk -F'\t' -v p="$port" '$1==p{print $2; exit}')"
     [ -n "$pw" ] || pw="${DBDOG_POSTGRES_MONITOR_PASSWORD:-}"
     AGENT_PG_RENDER_PASSWORDS+=("$pw")
+  done
+  # mysql.d 实例块与 pg 同形（同缩进 port:/password:），收割器零改动复用。
+  AGENT_MYSQL_RENDER_PASSWORDS=()
+  pairs="$(agent_harvest_engine_passwords "$AGENT_CONFIG_DIR/conf.d/mysql.d/conf.yaml")"
+  for ((index=0; index<${#AGENT_MYSQL_PORTS[@]}; index++)); do
+    port="${AGENT_MYSQL_PORTS[$index]}"
+    pw="$(printf '%s\n' "$pairs" | awk -F'\t' -v p="$port" '$1==p{print $2; exit}')"
+    [ -n "$pw" ] || pw="${DBDOG_MYSQL_MONITOR_PASSWORD:-}"
+    AGENT_MYSQL_RENDER_PASSWORDS+=("$pw")
   done
 }
 
@@ -746,6 +775,19 @@ agent_drop_uncredentialed_instances() {
     fi
   done
   agent_keep_indexes "$keep" AGENT_PG_PORTS AGENT_PG_DATA_DIRS AGENT_PG_RENDER_PASSWORDS
+  AGENT_MYSQL_PORTS=(${AGENT_MYSQL_PORTS[@]+"${AGENT_MYSQL_PORTS[@]}"})
+  AGENT_MYSQL_RENDER_PASSWORDS=(${AGENT_MYSQL_RENDER_PASSWORDS[@]+"${AGENT_MYSQL_RENDER_PASSWORDS[@]}"})
+  keep=""
+  for ((index=0; index<${#AGENT_MYSQL_PORTS[@]}; index++)); do
+    port="${AGENT_MYSQL_PORTS[$index]}"
+    if [ -n "${AGENT_MYSQL_RENDER_PASSWORDS[$index]-}" ]; then
+      keep="$keep $index"
+    else
+      warn "mysql 127.0.0.1:${port} 本次不接入：未提供监控密码（DBDOG_MYSQL_MONITOR_PASSWORD）"
+      AGENT_SKIPPED_INSTANCES+=("mysql|${port}|未提供监控密码（DBDOG_MYSQL_MONITOR_PASSWORD）")
+    fi
+  done
+  agent_keep_indexes "$keep" AGENT_MYSQL_PORTS AGENT_MYSQL_RENDER_PASSWORDS
 }
 
 preflight_gaussdb_clients() {
@@ -942,6 +984,78 @@ PY
   return 1
 }
 
+agent_mysql_tcp_password_probe() { # <端口> <密码> <输出标签>；经 127.0.0.1 TCP 验证；0=有效，2=明确拒绝，1=基础设施失败
+  # 与 agent_tcp_password_probe 同语义的 MySQL 版：pymysql（随 mysql integration 出货）
+  # 走经典协议握手。caching_sha2_password 的全量认证在不加密 TCP 上需 RSA 交换——依赖
+  # embedded python 的 cryptography（omnibus 随包）；缺失/不可用时这里按「基础设施失败」
+  # 分流指路，绝不误判成密码错误。MySQL 侧「明确拒绝」= ER 1045 Access denied（对齐
+  # PG 的 28P01）。
+  local probe_port="$1" password="$2" probe_tag="$3"
+  local python password_file out attempt rc success=0 rejected=0
+  local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
+  python="${DBDOG_AGENT_PYTHON:-$AGENT_RUNTIME_DIR/embedded/bin/python3}"
+  [ -x "$python" ] && [ -x "$timeout_bin" ] || return 1
+  password_file="$WORK_DIR/mysql-monitor-password.$probe_tag"
+  printf '%s' "$password" >"$password_file" || return 1
+  chmod 0600 "$password_file" || return 1
+  out="$WORK_DIR/mysql-monitor-auth.$probe_tag.out"
+  for ((attempt=1; attempt<=5; attempt++)); do
+    : >"$out"
+    rc=0
+    "$timeout_bin" --kill-after=2 10 /usr/bin/env -i \
+      PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+      "$python" -I - "$password_file" "$probe_port" >"$out" 2>&1 <<'PY' || rc=$?
+import pathlib
+import sys
+
+import pymysql
+
+password = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+try:
+    connection = pymysql.connect(
+        host="127.0.0.1",
+        port=int(sys.argv[2]),
+        user="dbdog",
+        password=password,
+        connect_timeout=5,
+        read_timeout=5,
+        write_timeout=5,
+    )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            if cursor.fetchone() != (1,):
+                raise RuntimeError("unexpected SELECT 1 result")
+    finally:
+        connection.close()
+except pymysql.err.OperationalError as error:
+    code = error.args[0] if error.args else None
+    if code in (1045, 1698):  # Access denied / password field empty
+        raise SystemExit(42)
+    print(f"mysql authentication probe failed: errno={code}", file=sys.stderr)
+    raise SystemExit(43)
+except Exception as error:
+    print(f"mysql authentication probe infrastructure failed: {type(error).__name__}", file=sys.stderr)
+    raise SystemExit(44)
+PY
+    case "$rc" in
+      0)
+        success=1
+        break
+        ;;
+      42)
+        rejected=1
+        break
+        ;;
+    esac
+    sleep 1
+  done
+  rm -f -- "$password_file" || return 1
+  [ "$success" -eq 1 ] && return 0
+  [ "$rejected" -eq 1 ] && return 2
+  return 1
+}
+
 agent_active_auth_is_md5() { # <进程索引>；读取当前生效的 PostgreSQL v3 认证请求，不提交失败密码
   local index="$1" python out
   local timeout_bin="${DBDOG_TIMEOUT_BIN:-/usr/bin/timeout}"
@@ -1024,6 +1138,13 @@ agent_pg_credential_reason() { # <探针 rc>
   case "$1" in
     2) printf '%s' "dbdog 账号不存在或密码不匹配（安装器不建号：向导第 1 步建号，第 2 步以 DBDOG_POSTGRES_MONITOR_PASSWORD 重跑）" ;;
     *) printf '%s' "无法经 127.0.0.1 TCP 完成凭证探测（实例未监听、pg_hba 未放行 dbdog 密码认证或驱动异常，rc=$1）" ;;
+  esac
+}
+
+agent_mysql_credential_reason() { # <探针 rc>
+  case "$1" in
+    2) printf '%s' "dbdog 账号不存在或密码不匹配（安装器不建号：向导第 1 步建号，第 2 步以 DBDOG_MYSQL_MONITOR_PASSWORD 重跑）" ;;
+    *) printf '%s' "无法经 127.0.0.1 TCP 完成凭证探测（实例未监听、账号 host 不含 127.0.0.1、caching_sha2 依赖的 cryptography 缺失或驱动异常，rc=$1）" ;;
   esac
 }
 
@@ -1112,6 +1233,20 @@ agent_gate_engine_credentials() {
     fi
   done
   agent_keep_indexes "$keep" AGENT_PG_PORTS AGENT_PG_DATA_DIRS AGENT_PG_RENDER_PASSWORDS
+  AGENT_MYSQL_PORTS=(${AGENT_MYSQL_PORTS[@]+"${AGENT_MYSQL_PORTS[@]}"})
+  AGENT_MYSQL_RENDER_PASSWORDS=(${AGENT_MYSQL_RENDER_PASSWORDS[@]+"${AGENT_MYSQL_RENDER_PASSWORDS[@]}"})
+  keep=""
+  for ((index=0; index<${#AGENT_MYSQL_PORTS[@]}; index++)); do
+    port="${AGENT_MYSQL_PORTS[$index]}"
+    rc=0
+    agent_mysql_tcp_password_probe "$port" "${AGENT_MYSQL_RENDER_PASSWORDS[$index]}" "mysql.$index" || rc=$?
+    if agent_gate_instance mysql "$port" "$rc" "$(agent_mysql_credential_reason "$rc")"; then
+      keep="$keep $index"
+    else
+      changed=1
+    fi
+  done
+  agent_keep_indexes "$keep" AGENT_MYSQL_PORTS AGENT_MYSQL_RENDER_PASSWORDS
   [ "$changed" -eq 0 ] || agent_rerender_confd
 }
 
@@ -1120,14 +1255,15 @@ agent_gate_engine_credentials() {
 # 实例」向导与「采集配置」页就能给出绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts
 # DB_INIT_SCRIPT_DIR），研发不必再去研发仓找 .sh。cutover 会整树替换 runtime，所以每次安装都要重新落一遍。
 #
-# 三引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
-# 会让 PostgreSQL/openGauss 实例的页面指向不存在的文件。多出的两套是惰性文本，无服务加载。
+# 四引擎全装：主机装的是哪种引擎由现场决定，而控制台按实例 dbms 给命令；只发 GaussDB 那套
+# 会让 PostgreSQL/openGauss/MySQL 实例的页面指向不存在的文件。多出的几套是惰性文本，无服务加载。
 # global SQL 同步发货：向导第 1 步建号、每库脚本的前置门、DBA 手工接入都要用它——2026-08-19
 # 前它只活在研发仓 dbdog-deploy/scripts/ 里，现场想按文档指引走都找不到文件（实锤）。
 AGENT_DBM_INIT_ASSETS="\
 init-dbdog-user-gaussdb-all-databases.sh:init-dbdog-user-gaussdb-perdb.sql:init-dbdog-user-gaussdb-global.sql
 init-dbdog-user-pg-all-databases.sh:init-dbdog-user-pg-perdb.sql:init-dbdog-user-pg-global.sql
-init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:init-dbdog-user-opengauss-global.sql"
+init-dbdog-user-opengauss-all-databases.sh:init-dbdog-user-opengauss-perdb.sql:init-dbdog-user-opengauss-global.sql
+init-dbdog-user-mysql-all-databases.sh:init-dbdog-user-mysql-perdb.sql:init-dbdog-user-mysql-global.sql"
 
 install_dbm_init_scripts() {
   local target="$AGENT_RUNTIME_DIR/scripts" source="$SCRIPT_DIR/agent" entry script sql global count=0
@@ -1148,7 +1284,7 @@ install_dbm_init_scripts() {
       die "无法安装全局建号 SQL: $target/$global"
     count=$((count + 1))
   done <<<"$AGENT_DBM_INIT_ASSETS"
-  [ "$count" -eq 3 ] || die "每库 DBM 初始化工具数量异常: $count"
+  [ "$count" -eq 4 ] || die "每库 DBM 初始化工具数量异常: $count"
   log "每库 DBM 初始化工具已就位: $target（新增库后用数据库 OS 账号跑对应引擎脚本；已配置库重跑会先确认是否清理）"
 }
 
@@ -1951,11 +2087,12 @@ start_and_verify() {
   : >"$check_out"
   chmod 0600 "$check_out"
   local engine
-  for engine in gaussdb opengauss postgres; do
+  for engine in gaussdb opengauss postgres mysql; do
     case "$engine" in
       gaussdb) [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || continue ;;
       opengauss) [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || continue ;;
       postgres) [ -n "${AGENT_PG_PORTS[*]-}" ] || continue ;;
+      mysql) [ -n "${AGENT_MYSQL_PORTS[*]-}" ] || continue ;;
     esac
     printf '\n===== agent check %s =====\n' "$engine" >>"$check_out"
     timeout 180 "$AGENT_RUNTIME_DIR/bin/agent/agent" check "$engine" \
@@ -2054,17 +2191,20 @@ main() {
     AGENT_GAUSS_ALLOW_NONE=1
     agent_detect_gaussdb
     agent_detect_postgres
+    agent_detect_mysql
     agent_classify_gauss_engines
     agent_apply_engine_allowlist
     agent_assemble_engine_credentials
-    [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || \
-      die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL）"
+    [ -n "${AGENT_GAUSS_PORTS[*]-}" ] || [ -n "${AGENT_PG_PORTS[*]-}" ] || [ -n "${AGENT_MYSQL_PORTS[*]-}" ] || \
+      die "未发现任何受支持的运行中数据库实例（GaussDB/openGauss/PostgreSQL/MySQL）"
     [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || \
       log "发现 GaussDB 端口: ${AGENT_GAUSSDB_RENDER_PORTS[*]}（日志: ${AGENT_GAUSS_LOG_GLOBS[*]-}）"
     [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || \
       log "发现 openGauss 端口: ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（日志: ${AGENT_OPENGAUSS_LOG_GLOBS[*]-}）"
     [ -z "${AGENT_PG_PORTS[*]-}" ] || \
       log "发现 PostgreSQL 端口: ${AGENT_PG_PORTS[*]}（日志: ${AGENT_PG_LOG_GLOBS[*]-}）"
+    [ -z "${AGENT_MYSQL_PORTS[*]-}" ] || \
+      log "发现 MySQL 端口: ${AGENT_MYSQL_PORTS[*]}（日志: ${AGENT_MYSQL_LOG_GLOBS[*]-}）"
   fi
   fetch_server_bootstrap
   preflight_gaussdb_clients
@@ -2097,6 +2237,7 @@ main() {
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || enabled_engines="GaussDB"
   [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}openGauss"
   [ -z "${AGENT_PG_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}PostgreSQL"
+  [ -z "${AGENT_MYSQL_PORTS[*]-}" ] || enabled_engines="${enabled_engines:+$enabled_engines/}MySQL"
   if [ "${AGENT_HOST_ONLY:-0}" = 1 ]; then
     log "已启用：主机基线（九项系统 check、process.d、日志、Live Processes、NPM/USM、APM/OpenLineage、Remote Config）"
     log "数据库引擎接入（DBM）是第二步：控制台 Databases →「添加数据库实例」向导"
