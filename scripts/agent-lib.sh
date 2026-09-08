@@ -31,6 +31,9 @@ AGENT_INSTALLER_CONTRACT_FILES=(
   agent/init-dbdog-user-opengauss-all-databases.sh
   agent/init-dbdog-user-opengauss-perdb.sql
   agent/init-dbdog-user-opengauss-global.sql
+  agent/init-dbdog-user-mysql-all-databases.sh
+  agent/init-dbdog-user-mysql-perdb.sql
+  agent/init-dbdog-user-mysql-global.sql
 )
 
 # 诊断输出可能来自 journal 或 Agent CLI，两者都不是我们能完全约束的
@@ -120,6 +123,9 @@ agent_clear_engine_facts() {
   AGENT_PG_DATA_DIRS=()
   AGENT_PG_LOG_GLOBS=()
   AGENT_PG_RENDER_PASSWORDS=()
+  AGENT_MYSQL_PORTS=()
+  AGENT_MYSQL_LOG_GLOBS=()
+  AGENT_MYSQL_RENDER_PASSWORDS=()
 }
 
 agent_validate_gaussdb_password() { # <密码>；符合 GaussDB 默认长度与三类字符约束
@@ -139,6 +145,14 @@ agent_require_single_line() { # <字段名> <值>
   case "$value" in
     *$'\n'* | *$'\r'*) die "$name 不能包含换行" ;;
   esac
+}
+
+agent_python_or_empty() { # 输出可用的 python3 解释器路径；无则输出空（jq 兜底由调用方处理）
+  command -v python3 2>/dev/null && return 0
+  # RHEL8 最小装机没有 /usr/bin/python3，只有 /usr/libexec/platform-python(3.6)——
+  # 3.6 足够跑安装器内嵌的 JSON 解析（json/pathlib/f-string），vm204 实锤（2026-09-08）。
+  [ -x /usr/libexec/platform-python ] && printf '%s\n' /usr/libexec/platform-python
+  return 0
 }
 
 agent_yaml_quote() { # 任意单行字符串 -> YAML 单引号标量
@@ -803,6 +817,89 @@ agent_detect_postgres() {
   done
 }
 
+agent_detect_mysql() {
+  # MySQL 实例事实探测（只读）。主进程判据：comm=mysqld、argv[0] 以 /mysqld 结尾、
+  # PPid=1——mysqld_safe 包装进程的 comm 是 mysqld_safe，天然出局；mariadbd 是另一个
+  # 二进制名，同样不命中（v1 明确只支持 MySQL，军规 8：引擎身份不可折叠，不猜兼容）。
+  # mysqld 没有 postmaster.pid 等价物，端口两路推导并交叉验证：
+  #   ① argv --port=（或 -P）有则首选；
+  #   ② 主路：/proc/<pid>/fd 持有的 socket inode ∩ /proc/net/tcp{,6} 的 LISTEN(st=0A)
+  #      条目——多候选时剔除 mysqlx X 协议口（默认 33060，采集走经典协议）；
+  #   交叉后仍无法唯一 → fail-closed die（与 PG 系共享端口 die 同语义，绝不猜）。
+  # 日志 glob 从 argv --log-error= 推导（绝对路径的 .err/.log 文件），推不出留空——
+  # logs 采集少一路是软缺口，不拦安装（与 PG logdir 推不出的口径一致）。
+  local root="${DBDOG_PROC_ROOT:-/proc}" pid cmdline comm ppid port arg logpath hex_local st ino
+  # 显式排除口子（DBDOG_MYSQL_EXCLUDE_PORTS，空格/逗号分隔）：与 PG 同款——停监控是
+  # 操作者决策，必须点名并大声记录。
+  local excluded=",${DBDOG_MYSQL_EXCLUDE_PORTS:-},"
+  excluded="$(printf '%s' "$excluded" | tr ' 	' ',,')"
+  AGENT_MYSQL_PORTS=()
+  AGENT_MYSQL_LOG_GLOBS=()
+  for pid in "$root"/[0-9]*; do
+    pid="${pid##*/}"
+    [ -r "$root/$pid/cmdline" ] || continue
+    cmdline="$(tr '\0' '\n' <"$root/$pid/cmdline" 2>/dev/null || true)"
+    [ -n "$cmdline" ] || continue
+    case "$(printf '%s\n' "$cmdline" | head -1)" in
+      */mysqld | mysqld) ;;
+      *) continue ;;
+    esac
+    comm="$(tr -d '[:space:]' <"$root/$pid/comm" 2>/dev/null || true)"
+    [ "$comm" = mysqld ] || continue
+    ppid="$(awk '/^PPid:/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$root/$pid/status" 2>/dev/null || true)"
+    [ "$ppid" = 1 ] || continue
+    # ① argv 显式端口。
+    port="$(printf '%s\n' "$cmdline" | awk -F= '$1=="--port"{gsub(/[[:space:]]/,"",$2);print $2;exit}')"
+    [ -n "$port" ] || port="$(printf '%s\n' "$cmdline" | awk 'prev=="-P"{gsub(/[[:space:]]/,"");print;exit}{prev=$0}')"
+    # ② socket inode ∩ LISTEN 交叉验证。
+    if [ -z "$port" ]; then
+      local -a inodes=() cand=() seen_cand=()
+      while IFS= read -r ino; do
+        [ -n "$ino" ] || continue
+        inodes+=("$ino")
+      done < <(ls -l "$root/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9][0-9]*\)\].*/\1/p' | sort -u)
+      [ "${#inodes[@]}" -gt 0 ] || die "发现 mysqld（PID $pid）但拿不到任何 socket fd，无法确定端口"
+      for arg in /proc/net/tcp /proc/net/tcp6; do
+        # 列序（vm204 实测核对）：1=sl序号 2=local 3=rem 4=st 5=tx:rx 6=tr:when
+        # 7=retransmt 8=uid 9=timeout 10=inode。首版把 st 对到了 tx:rx（永不等于 0A，
+        # 候选恒空）——E2E 实锤后按真实列序钉死。
+        while read -r _ hex_local _rem st _tq _tr _rt _uid _to ino _rest; do
+          [ "$st" = 0A ] || continue
+          for arg2 in "${inodes[@]}"; do
+            [ "$ino" = "$arg2" ] || continue
+            local dec=$((16#${hex_local##*:}))
+            local found=""
+            for arg3 in "${cand[@]-}"; do [ "$arg3" = "$dec" ] && found=1; done
+            [ -n "$found" ] || cand+=("$dec")
+            break
+          done
+        done <"$arg" 2>/dev/null || true
+      done
+      # mysqlx X 协议口（默认 33060）与经典口并存时剔除之；仅剩唯一候选才采信。
+      if [ "${#cand[@]}" -gt 1 ]; then
+        local -a keep=()
+        for arg2 in "${cand[@]}"; do [ "$arg2" = 33060 ] || keep+=("$arg2"); done
+        [ "${#keep[@]}" -gt 0 ] && cand=("${keep[@]}")
+      fi
+      [ "${#cand[@]}" -eq 1 ] || die "mysqld（PID $pid）监听端口无法唯一确定（候选：${cand[*]-无}）；请用 DBDOG_MYSQL_EXCLUDE_PORTS 思路核对，或给实例显式 --port 后重跑"
+      port="${cand[0]}"
+    fi
+    agent_valid_port "$port" || die "无法从 mysqld PID $pid 确定有效监听端口"
+    case "$excluded" in *",$port,"*)
+      warn "按 DBDOG_MYSQL_EXCLUDE_PORTS 显式排除 MySQL 实例 127.0.0.1:${port}——不监控它是操作者决策，不是静默缺口"
+      continue ;;
+    esac
+    case " ${AGENT_MYSQL_PORTS[*]-} " in *" $port "*)
+      die "发现多个 MySQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;;
+    esac
+    AGENT_MYSQL_PORTS+=("$port")
+    logpath="$(printf '%s\n' "$cmdline" | awk -F= '$1=="--log-error"{print $2;exit}')"
+    case "$logpath" in
+      /**.err | /**.log) agent_add_unique AGENT_MYSQL_LOG_GLOBS "$logpath" ;;
+    esac
+  done
+}
+
 agent_render_datadog_yaml() { # <文件> <server_url> <api_key> <hostname> <rc_root_json>
   local out="$1" server="$2" api_key="$3" hostname="$4" rc_root="$5" hostport no_ssl
   hostport="$(agent_server_hostport "$server")"
@@ -999,19 +1096,20 @@ EOF
 agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
   local confd="$1" password="$2" username="$3" dbname="$4" env_name="$5"
   local check dir port glob
-  local has_gauss=0 has_og=0 has_pg=0
+  local has_gauss=0 has_og=0 has_pg=0 has_mysql=0
   [ -z "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ] || has_gauss=1
   [ -z "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ] || has_og=1
   [ -z "${AGENT_PG_PORTS[*]-}" ] || has_pg=1
+  [ -z "${AGENT_MYSQL_PORTS[*]-}" ] || has_mysql=1
   # 凭证门开着（AGENT_ENGINE_GATING）时允许「探到了引擎但零实例接入」：实例会因没建号/没密码
   # 被撤出渲染，主机基线照常出；检测层「一个引擎都没在跑」的硬失败仍在安装器主流程里。
-  [ "$has_gauss$has_og$has_pg" != 000 ] || [ "${AGENT_HOST_ONLY:-0}" = 1 ] || \
+  [ "$has_gauss$has_og$has_pg$has_mysql" != 0000 ] || [ "${AGENT_HOST_ONLY:-0}" = 1 ] || \
     [ "${AGENT_ENGINE_GATING:-0}" = 1 ] || \
-    die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL 均未发现）"
+    die "没有可渲染的数据库实例（GaussDB/openGauss/PostgreSQL/MySQL 均未发现）"
   if [ "$has_gauss" = 1 ] && [ -z "$password" ]; then
     die "GaussDB 监控密码为空，无法渲染"
   fi
-  # og/pg 凭证按实例走（同引擎多实例密码可各不相同）：渲染前每个端口都必须有密码。
+  # og/pg/mysql 凭证按实例走（同引擎多实例密码可各不相同）：渲染前每个端口都必须有密码。
   local cred_i
   if [ "$has_og" = 1 ]; then
     for ((cred_i=0; cred_i<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; cred_i++)); do
@@ -1023,6 +1121,12 @@ agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <en
     for ((cred_i=0; cred_i<${#AGENT_PG_PORTS[@]}; cred_i++)); do
       [ -n "${AGENT_PG_RENDER_PASSWORDS[$cred_i]-}" ] || \
         die "PostgreSQL 实例 127.0.0.1:${AGENT_PG_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请在控制台「添加数据库实例」向导第 1 步建号后，以 DBDOG_POSTGRES_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
+    done
+  fi
+  if [ "$has_mysql" = 1 ]; then
+    for ((cred_i=0; cred_i<${#AGENT_MYSQL_PORTS[@]}; cred_i++)); do
+      [ -n "${AGENT_MYSQL_RENDER_PASSWORDS[$cred_i]-}" ] || \
+        die "MySQL 实例 127.0.0.1:${AGENT_MYSQL_PORTS[$cred_i]} 没有监控密码；凭证只验不建，请在控制台「添加数据库实例」向导第 1 步建号后，以 DBDOG_MYSQL_MONITOR_PASSWORD 提供（升级路径自动按现有 conf 逐实例沿用）"
     done
   fi
   for check in cpu disk file_handle io load memory network system_core uptime; do
@@ -1067,6 +1171,17 @@ EOF
     collect_children: true
     tags:
       - service:postgres
+EOF
+  fi
+  if [ "$has_mysql" = 1 ]; then
+    cat >>"$dir/conf.yaml" <<EOF
+  - name: mysql
+    min_collection_interval: 15
+    search_string: ['mysqld']
+    exact_match: false
+    collect_children: true
+    tags:
+      - service:mysql
 EOF
   fi
 
@@ -1321,6 +1436,65 @@ EOF
       - type: exclude_at_match
         name: exclude_query_completions
         pattern: 'LOG:\\s+(?:[0-9A-Z]{5}:\\s+)?duration: [0-9.]+ ms\\s+plan:'
+EOF
+    done
+  fi
+
+  if [ "$has_mysql" = 1 ]; then
+    dir="$confd/mysql.d"
+    install -d -m 0755 "$dir"
+    cat >"$dir/conf.yaml" <<EOF
+# Generated from target-host facts; rerun agent-install.sh after moving/reconfiguring MySQL.
+init_config:
+
+instances:
+EOF
+    for ((cred_i=0; cred_i<${#AGENT_MYSQL_PORTS[@]}; cred_i++)); do
+      port="${AGENT_MYSQL_PORTS[$cred_i]}"
+      cat >>"$dir/conf.yaml" <<EOF
+  - dbm: true
+    database_identifier:
+      # 分隔符用 '-' 不用 ':'，同 postgres.d 的军规 5 登记。
+      template: '\$resolved_hostname-\$port'
+    service: mysql
+    host: 127.0.0.1
+    port: $port
+    username: $(agent_yaml_quote "$username")
+    password: $(agent_yaml_quote "${AGENT_MYSQL_RENDER_PASSWORDS[$cred_i]}")
+    # explain 采集走 dbdog 命名（军规 5，对齐出货模板 dbdog-deploy/conf/conf.d/mysql.d）：
+    # 裸名 explain_statement 不覆盖——check 第一解析策略在语句所在库找裸名过程（由
+    # init-dbdog-user-mysql-perdb.sql 逐库建）；只覆盖三个全限定项。
+    # 军规 8：mysql check 没有 PG 族的 relations/database_autodiscovery/
+    # collect_column_statistics/ignore_databases/dbname 键；dbm: true 下四个采集开关默认即开，
+    # 模板不复述（避免部署漂移）。
+    query_samples:
+      fully_qualified_explain_procedure: dbdog.explain_statement
+      events_statements_enable_procedure: dbdog.enable_events_statements_consumers
+      events_statements_temp_table_name: dbdog.temp_events
+    # schema 资产（实例详情 Schemas 面）：check 默认 false，产品要，显式开。
+    collect_schemas:
+      enabled: true
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
+      - do_connection_host:127.0.0.1
+      - do_connection_port:$port
+EOF
+    done
+    printf '\nlogs:\n' >>"$dir/conf.yaml"
+    for glob in ${AGENT_MYSQL_LOG_GLOBS[@]+"${AGENT_MYSQL_LOG_GLOBS[@]}"}; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - type: file
+    path: $(agent_yaml_quote "$glob")
+    source: mysql
+    service: mysql
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+    # multi_line 聚合：MySQL 错误日志行首带时间戳（YYYY-MM-DDTHH:MM:SS 或空格分隔两种形）。
+    log_processing_rules:
+      - type: multi_line
+        name: new_log_start_with_timestamp
+        pattern: '\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
 EOF
     done
   fi
