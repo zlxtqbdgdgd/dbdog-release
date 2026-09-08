@@ -1320,7 +1320,7 @@ EOF
       # 那批执行的唯一记录就是日志行，排掉即净丢数据。
       - type: exclude_at_match
         name: exclude_query_completions
-        pattern: 'LOG:\\s+duration: [0-9.]+ ms\\s+plan:'
+        pattern: 'LOG:\\s+(?:[0-9A-Z]{5}:\\s+)?duration: [0-9.]+ ms\\s+plan:'
 EOF
     done
   fi
