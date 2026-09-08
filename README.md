@@ -7,12 +7,12 @@ GitHub Release [`artifacts`](../../releases/tag/artifacts) 里，文件名自带
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-09-07 20:29（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-09-07 23:09（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |
 | --- | --- | --- | --- | --- | --- |
 | dbdog-server | first-party | 全家桶机 | 0.1.25 | dbdog-server-0.1.25-aarch64.tar.gz | aarch64 |
-| dbdog-web | first-party | 全家桶机 | 0.1.26 | dbdog-web-0.1.26-aarch64.tar.gz | aarch64 |
+| dbdog-web | first-party | 全家桶机 | 0.1.27 | dbdog-web-0.1.27-aarch64.tar.gz | aarch64 |
 | dbdog-mcp | first-party | 全家桶机 | 0.1.20 | dbdog-mcp-0.1.20-noarch.tar.gz | noarch |
 | dbdog-agent | first-party | DB 主机 | 7.81.0-dbdog.13 | dbdog-agent-7.81.0-dbdog.13-aarch64.tar.gz | aarch64 |
 | ddprof | third-party | DB 主机 | - | - | aarch64 |
