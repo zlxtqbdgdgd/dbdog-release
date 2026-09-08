@@ -893,9 +893,26 @@ agent_detect_mysql() {
       die "发现多个 MySQL 实例共享监听端口 ${port}；127.0.0.1 TCP 监控无法唯一区分" ;;
     esac
     AGENT_MYSQL_PORTS+=("$port")
+    # 日志路径两路推导：argv --log-error= 优先；没有则读 --defaults-file= 指向的 my.cnf
+    # 里的 log-error（vm204 形态：源码装，日志路径只在配置文件——首版只看 argv 漏采，
+    # E2E 实锤）。只收绝对路径的 .err/.log；推不出留空——软缺口不拦安装（同 PG 口径）。
     logpath="$(printf '%s\n' "$cmdline" | awk -F= '$1=="--log-error"{print $2;exit}')"
+    if [ -z "$logpath" ]; then
+      local defaults_file
+      defaults_file="$(printf '%s\n' "$cmdline" | awk -F= '$1=="--defaults-file" || $1=="--defaults-extra-file"{print $2;exit}')"
+      if [ -n "$defaults_file" ] && [ -r "$defaults_file" ]; then
+        # log-error / log_error 两拼法；容忍等号两侧空白与行尾注释；[mysqld] 段内有效。
+        logpath="$(awk '
+          /^\[/ { in_mysqld = (tolower($0) ~ /^\[mysqld/) }
+          in_mysqld && /^[[:space:]]*log[-_]error[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*[#;].*$/, "")
+            gsub(/^"|"$/, ""); print; exit
+          }
+        ' "$defaults_file" 2>/dev/null || true)"
+      fi
+    fi
     case "$logpath" in
-      /**.err | /**.log) agent_add_unique AGENT_MYSQL_LOG_GLOBS "$logpath" ;;
+      /**.err | /**.log) [ ! -f "$logpath" ] || agent_add_unique AGENT_MYSQL_LOG_GLOBS "$logpath" ;;
     esac
   done
 }
