@@ -48,21 +48,6 @@ $function$;
 REVOKE ALL ON FUNCTION public.dbdog_explain_statement(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.dbdog_explain_statement(text) TO dbdog;
 
--- 旧配置兼容入口；实现只委托给 public 中的 canonical 函数，避免保留两份 explain 逻辑。
-CREATE OR REPLACE FUNCTION dbdog.explain_statement(l_query text, OUT explain json)
- RETURNS SETOF json
- LANGUAGE plpgsql
- STRICT SECURITY DEFINER
-AS $function$
-BEGIN
-  RETURN QUERY SELECT plan.explain
-  FROM public.dbdog_explain_statement(l_query) AS plan;
-END;
-$function$;
-
-REVOKE ALL ON FUNCTION dbdog.explain_statement(text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION dbdog.explain_statement(text) TO dbdog;
-
 -- 列统计采集入口(SECURITY DEFINER:pg_stats 按 has_column_privilege 过滤行,
 -- dbdog 无业务表 SELECT 权限会读到空集,故借函数属主身份读取)。
 -- 与 explain 入口不同,本函数不必放 public:函数体内所有对象都写了全名,

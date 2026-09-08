@@ -1104,10 +1104,11 @@ runtime_security_config:
 EOF
 }
 
-# 渲染语义的权威是 dbdog-agent/dbdog-deploy/conf/conf.d 的三引擎模板（84a58e3 对齐）：
-# 显式项只留 dbm/database_identifier/service/连接五元组/ignore_databases/relations/
-# database_autodiscovery/query_samples.explain_function/collect_column_statistics/
-# collect_activity_metrics/tags，其余采集开关一律用 check 默认值（避免部署漂移）。
+# 安装器只渲染现场事实，采集参数一律取 check 默认值（与上游对齐）：service/连接五元组/tags/logs 路径。
+# 我们真正用的值（dbm/database_identifier/explain_function/ignore_databases/relations/database_autodiscovery/
+# collect_column_statistics/collect_activity_metrics/statement_history/query_completions/log_processing_rules）
+# 全部是定制层，真身在 dbdog-agent/dbdog-deploy/templates/dbdog/db/<引擎>.yaml，装完由 agent/apply-template.sh 合并。
+# 不套模板的机器 dbm=false：只有主机与基础库指标，整个 DBM 面不跑。
 # 引擎在位由检测结果决定：GaussDB 走完整建号链，openGauss/PostgreSQL 凭证只验不建
 #（监控用户由 DBA 按 scripts/agent/init-dbdog-user-*-all-databases.sh 预先准备）。
 agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
@@ -1213,56 +1214,15 @@ instances:
 EOF
     for port in "${AGENT_GAUSSDB_RENDER_PORTS[@]}"; do
       cat >>"$dir/conf.yaml" <<EOF
-  - dbm: true
-    database_identifier:
-      # 分隔符用 '-' 不用 ':'（2026-08-06）：':' 是 DD 查询语法的 key/value 分隔符，标识里带它会让
-      # 「按实例过滤」必须整体加引号——round-19 实证：裸写 database_instance:<host>:<port> 的调用
-      # 104 次、98% 报错，而 skill 教的 service:<engine> 写法 80 次仅 4% 报错。区分同机多实例效果不变。
-      # 有意偏离 conf.yaml.example 的 \$env-\$resolved_hostname:\$port 形制，已登记。
-      # **首次安装即为横线形**；老机器的冒号形由 upgrade 路径一次性迁移（见 agent_migrate_identifier_separator）。
-      template: '\$resolved_hostname-\$port'
-    service: gaussdb
+  - service: gaussdb
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "$password")
     # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
     dbname: $(agent_yaml_quote "$dbname")
-    ignore_databases:
-      - template0
-      - template1
-      - templatea
-      - templatem
-    relations:
-      - relation_regex: .*
-    query_samples:
-      # canonical explain 入口在 public：GaussDB 的 SECURITY DEFINER 动态 SQL 按函数所属
-      # schema 解析未限定表名，入口只在 dbdog schema 时解释不了 public 下的业务 SQL。
-      explain_function: public.dbdog_explain_statement
-    # 库自动发现：逐库采集非模板库的表级指标（relations/schema/column_stats）。
-    # 默认关，这里显式开启；以 postgres 为 global_view_db，排除 GaussDB 模板库。
-    database_autodiscovery:
-      enabled: true
-      global_view_db: postgres
-      include:
-        - .*
-      exclude:
-        - template0
-        - template1
-        - templatea
-        - templatem
-    # 列统计(pg_stats 投影)。检查项的出厂默认指向 datadog.column_statistics()；dbdog 命名下必须显式
-    # 指向，否则报 schema "datadog" does not exist（2026-08-05 x86-gaussdb-73 实证）。
-    collect_column_statistics:
-      enabled: true
-      function_name: dbdog.column_statistics()
-    # activity 直发指标(active_queries/transactions.open 等；出厂默认 false)，显式开启。
-    collect_activity_metrics: true
-    # 完成态(已结束语句)采集。check 默认 false，这里显式开启：它是 dbm_type:query_completion
-    # 这条流的唯一来源，关着的话流是空的，而空集在诊断语境下会被读成"这台库没有慢 SQL"。
-    # 来源是 dbe_perf.statement_history 系统表，不读服务器日志，故与下面 logs stanza 不重叠。
-    statement_history:
-      enabled: true
+    # dbm / database_identifier / explain_function 及全部采集开关是定制层，不在安装器渲染：
+    # 由 apply-template.sh 从 templates/dbdog/db/gaussdb.yaml 合并。
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - $(agent_yaml_quote "gaussdb_deployment:$AGENT_GAUSS_DEPLOYMENT")
@@ -1281,10 +1241,6 @@ EOF
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - dbm_source:gaussdb_logs
-    log_processing_rules:
-      - type: multi_line
-        name: new_log_start_with_date
-        pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
 EOF
     done
   fi
@@ -1301,48 +1257,15 @@ EOF
     for ((cred_i=0; cred_i<${#AGENT_OPENGAUSS_RENDER_PORTS[@]}; cred_i++)); do
       port="${AGENT_OPENGAUSS_RENDER_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
-  - dbm: true
-    database_identifier:
-      # 与 gaussdb.d / postgres.d 同形，不再带 'opengauss-' 前缀（2026-09-07 owner 定）：那是借
-      # gaussdb 检查项采集的年代防混淆用的，独立集成后 service 已区分引擎；带前缀只会让 DBM 面
-      # 与 profiling 面（ddprof -T database_instance）对不上号。分隔符用 '-' 不用 ':'，军规 5 登记。
-      template: '\$resolved_hostname-\$port'
-    service: opengauss
+  - service: opengauss
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "${AGENT_OPENGAUSS_RENDER_PASSWORDS[$cred_i]}")
     # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
     dbname: $(agent_yaml_quote "${DBDOG_OPENGAUSS_DBNAME:-postgres}")
-    ignore_databases:
-      - template0
-      - template1
-      - templatea
-      - templatem
-    relations:
-      - relation_regex: .*
-    query_samples:
-      # openGauss 与 GaussDB 同规则：SECURITY DEFINER 动态 SQL 按函数所属 schema
-      # 解析未限定表名，canonical explain 入口在 public。
-      explain_function: public.dbdog_explain_statement
-    database_autodiscovery:
-      enabled: true
-      global_view_db: postgres
-      include:
-        - .*
-      exclude:
-        - template0
-        - template1
-        - templatea
-        - templatem
-    collect_column_statistics:
-      enabled: true
-      function_name: dbdog.column_statistics()
-    collect_activity_metrics: true
-    # 完成态(已结束语句)采集，同 gaussdb.d：check 默认 false，显式开启。读
-    # dbe_perf.statement_history 系统表，与下面 logs stanza 采的服务器日志不是同一份数据。
-    statement_history:
-      enabled: true
+    # dbm / database_identifier / explain_function 及全部采集开关是定制层，不在安装器渲染：
+    # 由 apply-template.sh 从 templates/dbdog/db/opengauss.yaml 合并。
     tags:
       - $(agent_yaml_quote "env:$env_name")
 EOF
@@ -1357,10 +1280,6 @@ EOF
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - dbm_source:opengauss_logs
-    log_processing_rules:
-      - type: multi_line
-        name: new_log_start_with_date
-        pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
 EOF
     done
   fi
@@ -1377,50 +1296,16 @@ EOF
     for ((cred_i=0; cred_i<${#AGENT_PG_PORTS[@]}; cred_i++)); do
       port="${AGENT_PG_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
-  - dbm: true
-    database_identifier:
-      # 分隔符用 '-' 不用 ':'，同 gaussdb.d 的军规 5 登记。
-      template: '\$resolved_hostname-\$port'
-    service: postgres
+  - service: postgres
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "${AGENT_PG_RENDER_PASSWORDS[$cred_i]}")
-    # explain 函数走 dbdog 命名(2026-07-24 hard-cut；检查项出厂默认是 datadog.explain_statement)
-    query_samples:
-      explain_function: dbdog.explain_statement
     # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。
     dbname: $(agent_yaml_quote "${DBDOG_POSTGRES_DBNAME:-postgres}")
-    # 主连接库即 postgres，不能再 ignore 它；template 等默认库不入库。
-    ignore_databases:
-      - template0
-      - template1
-      - rdsadmin
-      - azure_maintenance
-      - cloudsqladmin
-      - alloydbadmin
-      - alloydbmetadata
-    relations:
-      - relation_regex: .*
-    database_autodiscovery:
-      enabled: true
-      global_view_db: postgres
-      include:
-        - .*
-      exclude:
-        - template0
-        - template1
-    collect_column_statistics:
-      enabled: true
-      function_name: dbdog.column_statistics()
-    collect_activity_metrics: true
-    # 完成态(已结束语句)采集。check 默认 false，这里显式开启。
-    # PG 没有服务端执行历史，来源只能是服务器日志：auto_explain(log_format=json) 为每条超过
-    # auto_explain.log_min_duration 的执行写一条 plan 记录，本 job 直接 tail 该文件。
-    # **必须与下面 logs stanza 的 exclude_at_match 同生共死**——两者读同一个文件，少了排除规则
-    # 同一条慢 SQL 会既进 log 流又进 completion 流。
-    query_completions:
-      enabled: true
+    # dbm / database_identifier / explain_function 及全部采集开关是定制层，不在安装器渲染：
+    # 由 apply-template.sh 从 templates/dbdog/db/postgres.yaml 合并。
+    # query_completions 与 logs 的 exclude_at_match 同生共死，二者都在模板里，一起套一起撤。
     tags:
       - $(agent_yaml_quote "env:$env_name")
       # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
@@ -1438,21 +1323,6 @@ EOF
     tags:
       - $(agent_yaml_quote "env:$env_name")
       - dbm_source:postgres_logs
-    log_processing_rules:
-      - type: multi_line
-        name: new_log_start_with_date
-        pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
-      # 上面 query_completions 把每条 auto_explain 记录报成 query_completion 事件，而它读的就是
-      # 这个文件，所以不排掉的话同一条慢 SQL 会投递两次。pattern 与采集器的
-      # LOG_PIPELINE_EXCLUDE_PATTERN 一字不差(dbdog-agent-core postgres/query_completions.py，
-      # 那边有测试钉住二者)。
-      # 注意本段不能出现反引号：这是 unquoted heredoc，反引号会被当命令替换执行掉。
-      # 只排 auto_explain 写的 plan 记录：log_min_duration_statement 另写的
-      # "duration: N ms  statement:" / "execute" 行永远不是 completion 来源(两条记录配不上对)，
-      # 那批执行的唯一记录就是日志行，排掉即净丢数据。
-      - type: exclude_at_match
-        name: exclude_query_completions
-        pattern: 'LOG:\\s+(?:[0-9A-Z]{5}:\\s+)?duration: [0-9.]+ ms\\s+plan:'
 EOF
     done
   fi
@@ -1469,28 +1339,16 @@ EOF
     for ((cred_i=0; cred_i<${#AGENT_MYSQL_PORTS[@]}; cred_i++)); do
       port="${AGENT_MYSQL_PORTS[$cred_i]}"
       cat >>"$dir/conf.yaml" <<EOF
-  - dbm: true
-    database_identifier:
-      # 分隔符用 '-' 不用 ':'，同 postgres.d 的军规 5 登记。
-      template: '\$resolved_hostname-\$port'
-    service: mysql
+  - service: mysql
     host: 127.0.0.1
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "${AGENT_MYSQL_RENDER_PASSWORDS[$cred_i]}")
-    # explain 采集走 dbdog 命名（军规 5，对齐出货模板 dbdog-deploy/conf/conf.d/mysql.d）：
-    # 裸名 explain_statement 不覆盖——check 第一解析策略在语句所在库找裸名过程（由
-    # init-dbdog-user-mysql-perdb.sql 逐库建）；只覆盖三个全限定项。
-    # 军规 8：mysql check 没有 PG 族的 relations/database_autodiscovery/
-    # collect_column_statistics/ignore_databases/dbname 键；dbm: true 下四个采集开关默认即开，
-    # 模板不复述（避免部署漂移）。
-    query_samples:
-      fully_qualified_explain_procedure: dbdog.explain_statement
-      events_statements_enable_procedure: dbdog.enable_events_statements_consumers
-      events_statements_temp_table_name: dbdog.temp_events
-    # schema 资产（实例详情 Schemas 面）：check 默认 false，产品要，显式开。
-    collect_schemas:
-      enabled: true
+    # dbm / database_identifier / query_samples 三个品牌覆盖 / collect_schemas 及日志规则是定制层，
+    # 不在安装器渲染：由 apply-template.sh 从 templates/dbdog/db/mysql.yaml 合并。
+    # 军规 8：mysql check 没有 PG 族的 relations/database_autodiscovery/collect_column_statistics/
+    # ignore_databases/dbname 键；开 DBM 后四个采集开关（query_metrics/query_samples/query_activity/
+    # index_metrics）默认即开，模板不复述（避免部署漂移）。
     tags:
       - $(agent_yaml_quote "env:$env_name")
       # dbdog 控制面用这两个内部 tag 把 schema 资产映射回本 check 的真实连接目标。
@@ -1507,11 +1365,6 @@ EOF
     service: mysql
     tags:
       - $(agent_yaml_quote "env:$env_name")
-    # multi_line 聚合：MySQL 错误日志行首带时间戳（YYYY-MM-DDTHH:MM:SS 或空格分隔两种形）。
-    log_processing_rules:
-      - type: multi_line
-        name: new_log_start_with_timestamp
-        pattern: '\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
 EOF
     done
   fi
