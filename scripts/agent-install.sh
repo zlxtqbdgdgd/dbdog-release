@@ -1325,7 +1325,13 @@ agent_version_manifest_json_value() { # <version-manifest.json>；输出唯一 b
   local input="$1" parser env_bin
   env_bin="$(command -v env 2>/dev/null || true)"
   [ -n "$env_bin" ] || return 1
-  if parser="$(command -v python3 2>/dev/null)"; then
+  # RHEL8 最小装机没有 /usr/bin/python3，只有 /usr/libexec/platform-python(3.6)——
+  # 3.6 足够跑下面的解析（json/pathlib/f-string），vm204 实锤（2026-09-08）。
+  parser="$(command -v python3 2>/dev/null || true)"
+  if [ -z "$parser" ] && [ -x /usr/libexec/platform-python ]; then
+    parser=/usr/libexec/platform-python
+  fi
+  if [ -n "$parser" ]; then
     "$env_bin" -i PATH=/usr/bin:/bin LANG=C LC_ALL=C "$parser" - "$input" <<'PY'
 import json
 import pathlib
