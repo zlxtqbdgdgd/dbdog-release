@@ -852,7 +852,10 @@ agent_detect_mysql() {
       done < <(ls -l "$root/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9][0-9]*\)\].*/\1/p' | sort -u)
       [ "${#inodes[@]}" -gt 0 ] || die "发现 mysqld（PID $pid）但拿不到任何 socket fd，无法确定端口"
       for arg in /proc/net/tcp /proc/net/tcp6; do
-        while read -r _ sl hex_local rest st _ _ _ ino _; do
+        # 列序（vm204 实测核对）：1=sl序号 2=local 3=rem 4=st 5=tx:rx 6=tr:when
+        # 7=retransmt 8=uid 9=timeout 10=inode。首版把 st 对到了 tx:rx（永不等于 0A，
+        # 候选恒空）——E2E 实锤后按真实列序钉死。
+        while read -r _ hex_local _rem st _tq _tr _rt _uid _to ino _rest; do
           [ "$st" = 0A ] || continue
           for arg2 in "${inodes[@]}"; do
             [ "$ino" = "$arg2" ] || continue
