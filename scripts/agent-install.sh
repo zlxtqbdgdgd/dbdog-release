@@ -834,9 +834,8 @@ preflight_gaussdb_clients() {
 readonly AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX='%m %n %u %d %h %p %S %x %a '
 readonly AGENT_GAUSSDB_MIN_TRACK_ACTIVITY_QUERY_SIZE=4096
 
-# agent_gsql 已带 -A -t（无对齐、纯元组），输出没有前导填充。log_line_prefix 的结尾空格是
-# %a 与 query_id 的分隔符、属于取值的一部分，所以这里只去掉行尾 CR，绝不 trim 空格——
-# 把它 trim 掉会让任何正确配置都被判成不符。命令替换只吃掉换行，空格得以保留。
+# agent_gsql 已带 -A -t（无对齐、纯元组），输出没有前导填充。这里只去掉行尾 CR，原样返回；
+# 需要忽略空白的调用方自己处理。
 agent_show_guc_raw() { # <进程索引> <GUC 名>；读不到时输出空串而不是失败
   local index=$1 name=$2
   agent_gsql "$index" -c "SHOW ${name};" 2>/dev/null | head -n 1 | tr -d '\r'
@@ -849,15 +848,22 @@ agent_show_guc() { # <进程索引> <GUC 名>；去首尾空白，供数值类 G
 }
 
 agent_warn_gaussdb_collection_gucs() { # <进程索引>
-  local index=$1 prefix size
+  local index=$1 prefix size prefix_cmp expected_cmp
 
   # log_line_prefix 决定 gs_log 能否被 dbdog-server 的 GaussDB grok 切开。前缀不符时整条失配、
   # 落 fallback：没有 attribute、没有 db.date、时间戳退化成采集时间、级别一律 info，ERROR/FATAL
   # 在日志检索里根本看不见——而 Agent 侧看起来一切正常，很难从现象反推到这里。
+  # 比对忽略结尾空白：规范写法末尾带一个空格（%a 与 query_id 之间因此是两个空格），但服务端
+  # gaussdb grok 在这两段之间用的是 \s+，一个空格同样切开——2026-09-08 host109-vm202 无结尾空格，
+  # 24h 内 99% 的行切出全部字段、ERROR/WARNING 级别正确。按精确串比对会把它误报成「整条解析失败」。
   prefix="$(agent_show_guc_raw "$index" log_line_prefix)"
   if [ -z "$prefix" ]; then
     warn "无法读取 log_line_prefix（实例索引 ${index}）；gs_log 能否被正确解析未经确认"
-  elif [ "$prefix" != "$AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX" ]; then
+  else
+    prefix_cmp="${prefix%"${prefix##*[![:space:]]}"}"
+    expected_cmp="${AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX%"${AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX##*[![:space:]]}"}"
+  fi
+  if [ -n "$prefix" ] && [ "$prefix_cmp" != "$expected_cmp" ]; then
     warn "GaussDB log_line_prefix 与 dbdog 解析契约不一致（实例索引 ${index}）：当前 '${prefix}'，期望 '${AGENT_GAUSSDB_EXPECTED_LOG_LINE_PREFIX}'。指标与 DBM 采集不受影响，但 gs_log 会整条解析失败：日志检索里拿不到数据库/用户/级别等字段，ERROR/FATAL 也不会被识别。请 DBA 按数据库规范修改 postgresql.conf 并重新加载；dbdog 安装器不修改它。"
   fi
 

@@ -1171,9 +1171,10 @@ EOF
       cat >>"$dir/conf.yaml" <<EOF
   - dbm: true
     database_identifier:
-      # opengauss- 前缀区分独立集成实例身份（与历史 gaussdb wire 模式实例不混淆）；
-      # 分隔符用 '-' 不用 ':'，同 gaussdb.d 的军规 5 登记。
-      template: 'opengauss-\$resolved_hostname-\$port'
+      # 与 gaussdb.d / postgres.d 同形，不再带 'opengauss-' 前缀（2026-09-07 owner 定）：那是借
+      # gaussdb 检查项采集的年代防混淆用的，独立集成后 service 已区分引擎；带前缀只会让 DBM 面
+      # 与 profiling 面（ddprof -T database_instance）对不上号。分隔符用 '-' 不用 ':'，军规 5 登记。
+      template: '\$resolved_hostname-\$port'
     service: opengauss
     host: 127.0.0.1
     port: $port
