@@ -12,7 +12,7 @@
 #   - agent-core 不是模块：构建期已并入 dbdog-agent 的运行时。
 #   - ddprof 是数据库主机上的原生 profiler（ddprof -S <service> ... <target_command> 包住
 #     数据库进程）。**只发 aarch64**，版本与 sha256 均在发布侧固定，不解析 latest。
-dbdog-server	first-party	stack	yes	0.1.26	dbdog-server-0.1.26-aarch64.tar.gz	6fb97488f577baeaac925673174f26f1d44878a92eae632037d0e6a6a96c13a7	441e53c	aarch64
+dbdog-server	first-party	stack	yes	0.1.27	dbdog-server-0.1.27-aarch64.tar.gz	c4f5732eb7a7cc6460cef3b84ee7a0c2a8ad7ab1f7e5c6474992edb9386f0849	25b8ae7	aarch64
 dbdog-web	first-party	stack	yes	0.1.30	dbdog-web-0.1.30-aarch64.tar.gz	5494bde80ec19135034b5fe08525eea3d924d66ed652ff0deef56ee35ae76a7d	53bf74d	aarch64
 dbdog-mcp	first-party	stack	yes	0.1.22	dbdog-mcp-0.1.22-noarch.tar.gz	c7d947b24789c00e786a0620317f7beed614be53812fd3ed61e8167cae8e7487	7f65e02	noarch
 dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-aarch64.tar.gz	369b113bb42c9b255d766eed388cbb0eafe47f9d49d255e0075c91a74e4abddb	agent:2a56956,core:7c9f179	aarch64
