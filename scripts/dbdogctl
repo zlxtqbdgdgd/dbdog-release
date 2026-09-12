@@ -10,7 +10,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/agent-lib.sh"
 
 # 启动顺序即依赖顺序；stop 时倒序。
 SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
-STARTUP_ATTEMPTS="${DBDOG_STARTUP_ATTEMPTS:-30}"
+# 就绪等待预算。30 秒曾经够用，2026-09-12 起**不够了**：dbdog-server 直跑实测 22~28 秒才应答
+# /healthz，而这里是 ATTEMPTS×INTERVAL 再要求连续 STABLE_SUCCESSES 次成功 ⇒ 实际预算比 30 秒还
+# 少一点，正好卡在边缘。一旦判失败，upgrade.sh 会杀进程并回滚，而**回滚版同样起不来**（它慢在
+# 启动本身，不在版本），结果是服务停摆、要人工 `DBDOG_STARTUP_ATTEMPTS=90 dbdogctl start` 才能
+# 拉起来——这正是军规 10 不许留给人的那种烂摊子。放宽到 90 秒：真起不来时多等一分钟，
+# 换的是「启动慢一点就把线上弄停」不再发生。
+STARTUP_ATTEMPTS="${DBDOG_STARTUP_ATTEMPTS:-90}"
 STARTUP_INTERVAL="${DBDOG_STARTUP_INTERVAL:-1}"
 STARTUP_STABLE_SUCCESSES="${DBDOG_STARTUP_STABLE_SUCCESSES:-2}"
 
