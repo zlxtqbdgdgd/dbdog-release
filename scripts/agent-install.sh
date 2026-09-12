@@ -40,6 +40,8 @@ readonly AGENT_HBA_RULE='host all dbdog 127.0.0.1/32 md5'
 # 预检记下的 gauss 系角色存在性（按进程索引）与本次未接入的实例（engine|port|原因）。
 AGENT_GAUSS_ROLE_EXISTS=()
 AGENT_SKIPPED_INSTANCES=()
+# 本次升级会改变 database_instance 的实例（<引擎目录>|<旧模板>|<新模板>），收尾再报一遍。
+AGENT_IDENTIFIER_DRIFTS=()
 AGENT_HOST_ARCH=""
 AGENT_HEALTH_TIMEOUT_SECONDS=90
 AGENT_HEALTH_WAIT_ATTEMPTS=0
@@ -503,6 +505,69 @@ agent_hba_managed_block_is_sane() { # <HBA 文件>；受管块残缺、嵌套或
   ' "$1"
 }
 
+# 受管块历史上写过的形态。render 会把整块重写成当前 AGENT_HBA_RULE，所以这些旧行被替换是
+# **有意**的；除它们之外，块内任何行都不是本安装器放进去的。
+readonly AGENT_HBA_LEGACY_RULES='local all dbdog trust'
+
+agent_hba_managed_block_foreign_lines() { # <HBA 文件>；stdout=受管块内**不是**受管规则的行（原样）
+  # 为什么单独判这个：agent_hba_render_desired 的做法是「整块删掉重写」，所以块内任何一行
+  # 只要不是本版或历史版的受管规则，就会被静默抹掉。
+  #
+  # 2026-09-12 实地事故：有人把 DBA 的 `local all all trust` 挪进了标记内。升级时它被删掉，
+  # 本机唯一允许实例属主走 Unix socket 的规则随之消失——而安装器自己的管理连接正走 socket
+  # （见 agent_gsql/PGHOST 的注释：安装期管理连接固定走实例自己的 socket）。于是它亲手切断
+  # 了下一步要用的连接，三步之后以「无法在预检阶段判断监控用户是否存在」报错，把人指向完全
+  # 无关的地方；回滚时连 reload 都做不了。
+  #
+  # 合同是「标记内是我的、标记外是你的」。块内出现不认识的行 = 状态不明，与受管标记残缺
+  # 同一类，按同样的教条处理：停下来问，不替操作者决定删掉。
+  awk -v begin="$AGENT_HBA_BLOCK_BEGIN" -v end="$AGENT_HBA_BLOCK_END" \
+      -v rule="$AGENT_HBA_RULE" -v legacy="$AGENT_HBA_LEGACY_RULES" '
+    function norm(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); gsub(/[ \t]+/, " ", s); return s }
+    BEGIN {
+      n = split(legacy, L, "\n")
+      for (i = 1; i <= n; i++) known[norm(L[i])] = 1
+      known[norm(rule)] = 1
+    }
+    $0 == begin { inside = 1; next }
+    $0 == end { inside = 0; next }
+    !inside { next }
+    { line = norm($0) }
+    line == "" || line ~ /^#/ { next }
+    !(line in known) { print }
+  ' "$1"
+}
+
+agent_hba_reload_signal() { # <进程索引>；gs_ctl reload（SIGHUP）——**不需要数据库连接**
+  # 回滚路径专用。agent_hba_reload 走 gsql，而回滚要撤销的正是可能切断那条连接的 HBA 改动：
+  # 拿被改对象本身当回滚通道是循环依赖。2026-09-12 实地事故里正是这么失败的——文件恢复成功、
+  # reload 失败，磁盘与内存从此不一致，实例一重启配置就跳变（当时靠人工 gs_ctl reload 救回）。
+  local index="$1" data
+  data="${AGENT_GAUSS_PID_DATA_DIRS[$index]}"
+  [ -n "$data" ] || return 1
+  agent_gauss_timed_exec "$index" 20 gs_ctl reload -D "$data" >/dev/null 2>&1
+}
+
+agent_identifier_templates() { # <conf.d 目录>；stdout=<引擎目录>\t<database_identifier 模板>
+  # 判据要算不要背：不枚举已知的漂移形状（枚举必漏——2026-09-12 就漏了 'opengauss-' 前缀那种），
+  # 而是把新旧两棵 conf 渲染出的模板直接比出来。模板一变，database_instance 就变，同一个库在
+  # 历史数据里裂成两个 id，按实例分组的图会断。
+  local dir="$1" f tag
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.d/conf.yaml; do
+    [ -f "$f" ] || continue
+    tag="$(basename "$(dirname "$f")")"
+    awk -v tag="$tag" '
+      /^[[:space:]]*template:[[:space:]]*/ {
+        line = $0
+        sub(/^[[:space:]]*template:[[:space:]]*/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        gsub(/^['"'"'"]|['"'"'"]$/, "", line)
+        print tag "\t" line
+      }' "$f"
+  done
+}
+
 agent_hba_render_desired() { # <HBA 文件>；stdout=受管块置顶 + 原文去掉旧受管块后的其余行（DBA 的行逐字节不动）
   printf '%s\n%s\n%s\n' "$AGENT_HBA_BLOCK_BEGIN" "$AGENT_HBA_RULE" "$AGENT_HBA_BLOCK_END"
   awk -v begin="$AGENT_HBA_BLOCK_BEGIN" -v end="$AGENT_HBA_BLOCK_END" '
@@ -534,6 +599,12 @@ agent_ensure_gaussdb_hba_rule() { # <进程索引>；把受管 MD5 规则置于 
     die "无法确定 GaussDB HBA 文件（实例 127.0.0.1:${port}）：SHOW hba_file 与数据目录都拿不到"
   agent_hba_managed_block_is_sane "$hba" || \
     die "GaussDB HBA 的 dbdog-release BEGIN/END 受管标记残缺、嵌套或重复，拒绝改写，请人工清理后重跑: $hba"
+  local foreign
+  foreign="$(agent_hba_managed_block_foreign_lines "$hba")"
+  [ -z "$foreign" ] || die \
+    "GaussDB HBA 的 dbdog-release 受管标记内有不是本安装器写的行，拒绝改写（整块重写会把它们静默删掉，而它们可能正是本机唯一的本地访问规则）: ${hba}
+请把下面这些行移到 BEGIN/END 标记**之外**再重跑；标记内只应有受管规则 '${AGENT_HBA_RULE}'：
+${foreign}"
   temp="$(mktemp "$(dirname "$hba")/.dbdog-gs-hba.XXXXXX")" || die "无法在 HBA 同目录创建临时文件: $hba"
   # 先整份拷贝再覆写内容：属主/权限/上下文随 cp -a 继承，不依赖 GNU 专有的 --reference。
   if ! cp -a -- "$hba" "$temp" || ! agent_hba_render_desired "$hba" >"$temp"; then
@@ -563,7 +634,9 @@ agent_ensure_gaussdb_hba_rule() { # <进程索引>；把受管 MD5 规则置于 
   if ! agent_hba_reload "$index"; then
     cp -a -- "$backup" "$hba"
     command -v restorecon >/dev/null 2>&1 && restorecon "$hba" >/dev/null 2>&1 || true
-    agent_hba_reload "$index" || true
+    # 先用信号式 reload：gsql 那条路可能正是被这次改动切断的（见 agent_hba_reload_signal）。
+    agent_hba_reload_signal "$index" || agent_hba_reload "$index" || \
+      warn "GaussDB HBA 文件已恢复，但 reload 没成功（实例 127.0.0.1:${port}）：**运行中的配置仍是本次改动后的那份**，磁盘与内存不一致，实例一重启就会跳变。请以实例属主执行 gs_ctl reload -D <数据目录> 让两者一致：${hba}"
     AGENT_HBA_PATHS[index]=""
     die "GaussDB HBA 写入后 reload 失败（实例 127.0.0.1:${port}），已恢复原文件；请 DBA 核对 pg_reload_conf 权限与实例状态"
   fi
@@ -817,6 +890,14 @@ preflight_gaussdb_clients() {
     ldd_bin="$(agent_find_in_path "${AGENT_GAUSS_PID_PATHS[$index]}" ldd 2>/dev/null || true)"
     [ -n "$ldd_bin" ] || die "GaussDB 客户端环境找不到 ldd（实例索引 ${index}）"
 
+    # ldd 只对动态 ELF 有意义。gsql 若是包装脚本或静态二进制，ldd 会输出
+    # "not a dynamic executable" 并以非 0 退出——那不是「动态库有问题」，报成
+    # 「动态库预检执行失败」会把人指向完全错误的方向。2026-09-12 实地踩过：
+    # $GAUSSHOME/bin/gsql 被测试平台的适配脚本覆盖成 371 字节的 sh，安装器甩了一屏 ldd
+    # 输出，真正的原因（发行版自己的客户端被换掉了）一个字都没提。先判形态，再决定怎么说话。
+    if [ "$(head -c 4 "$gsql" 2>/dev/null | od -An -c | tr -d ' \n')" != '177ELF' ]; then
+      die "目标 gsql 不是可执行 ELF（是脚本或包装器）: ${gsql}（实例索引 ${index}）。安装器要用它建管理连接并做动态库预检。请把 \$GAUSSHOME/bin/gsql 指回该实例自己的真实客户端，或用 DBDOG_GAUSSDB_ENV_FILE 提供一份可用的客户端环境。"
+    fi
     out="$WORK_DIR/gsql-ldd.$index.out"
     if ! agent_gauss_timed_exec "$index" 20 "$ldd_bin" "$gsql" >"$out" 2>&1; then
       agent_show_preflight_error "$out" "gsql 动态库预检执行失败（实例索引 ${index}）"
@@ -1578,6 +1659,41 @@ write_installer_contract_marker() { # 在全部验收成功后原子确认安装
   fi
 }
 
+agent_detect_identifier_drift() { # <现有 conf.d> <本次渲染出的 conf.d>
+  # agent_render_checks 会整份重写 conf.d，database_identifier 模板因此按**本次脚本**的形制
+  # 落地。模板一变，database_instance 就变：同一个库在历史数据里裂成新旧两个 id，按实例分组
+  # 的图会断。清理动作在 dbdog-server 那侧（CH/PG），本机做不了，所以这里只检测并指路。
+  #
+  # 判据是算出来的，不是枚举的。上一版硬编码 grep 'resolved_hostname:$port' 只认「冒号形→
+  # 横线形」那一种；2026-09-12 实地事故：靶机上的 /root/dbdog/release 是非 git 副本、落后 main，
+  # 旧模板把 openGauss 的实例标识重新加上了 'opengauss-' 前缀，身份当场裂开——而那条硬编码
+  # 检查一声不吭，安装全程显示成功。**静默的身份漂移比装不上危险得多**。
+  #
+  # 顺序铁律：先换模板 + 重启 agent，再去服务端清理；反过来会先删完、agent 又按旧模板写回来。
+  local old_dir="$1" new_dir="$2" old_map tag old_tpl new_tpl line
+  [ -d "$old_dir" ] || return 0
+  # 旧模板一次性读出来再查表：逐 tag 重跑一遍既是 O(n^2)，而且 awk 里用 `exit` 提前收管道会
+  # 把上游打成 SIGPIPE，在 set -e -o pipefail 下直接终止整个安装（写这条守门时实地踩到）。
+  old_map="$(agent_identifier_templates "$old_dir")"
+  while IFS="$(printf '\t')" read -r tag new_tpl; do
+    [ -n "$tag" ] || continue
+    old_tpl="$(printf '%s\n' "$old_map" | awk -F'\t' -v t="$tag" '$1 == t { v = $2 } END { print v }')"
+    [ -n "$old_tpl" ] || continue          # 该引擎本次首装，没有「变没变」可言
+    [ "$old_tpl" != "$new_tpl" ] || continue
+    AGENT_IDENTIFIER_DRIFTS+=("${tag}|${old_tpl}|${new_tpl}")
+  done < <(agent_identifier_templates "$new_dir")
+  [ "${#AGENT_IDENTIFIER_DRIFTS[@]}" -gt 0 ] || return 0
+  printf '\n[!] 本次升级会改变 database_instance（实例标识），历史数据会裂成新旧两个 id：\n'
+  for line in "${AGENT_IDENTIFIER_DRIFTS[@]}"; do
+    IFS='|' read -r tag old_tpl new_tpl <<<"$line"
+    printf '      %-16s %s  ->  %s\n' "$tag" "$old_tpl" "$new_tpl"
+  done
+  printf '    先确认这是你要的：如果本机 /root/dbdog/release 之类的脚本副本落后于 main，\n'
+  printf '    旧模板会把已经改掉的标识**改回去**（2026-09-12 实地事故）。先同步脚本再重跑。\n'
+  printf '    确属有意的迁移：换完模板并重启 agent 之后，再去 dbdog-server 侧一次性清理历史数据；\n'
+  printf '    反过来会先删完、agent 又按旧模板写回来。\n\n'
+}
+
 render_install_state() {
   CONFIG_STAGE="$(mktemp -d /etc/.dbdog-agent-stage.XXXXXX)"
   UNIT_STAGE="$(mktemp -d /etc/systemd/system/.dbdog-agent-units.XXXXXX)"
@@ -1589,21 +1705,12 @@ render_install_state() {
   agent_render_datadog_yaml "$CONFIG_STAGE/datadog.yaml" "$DBDOG_SERVER_URL" \
     "$DBDOG_API_KEY" "$DBDOG_AGENT_HOSTNAME" "$RC_ROOT_JSON"
   agent_render_system_probe_yaml "$CONFIG_STAGE/system-probe.yaml"
-  # 升级路径的一次性提醒（2026-08-06）：agent_render_checks 会整份重写 conf.d，因此
-  # database_identifier 模板自动切到新的横线形（'$resolved_hostname-$port'）。但**历史数据里
-  # 的冒号标识不会自己消失**——同一实例会裂成新旧两个 database_instance，按实例分组的图会断。
-  # 清理动作在 dbdog-server 那侧（CH/PG），本机做不了，故只在这里检测并指路。
-  # 顺序铁律：先换模板 + 重启 agent，再去服务端清理；反过来会先删完、agent 又按旧模板写回来。
-  if grep -rqs 'resolved_hostname:\$port' /etc/dbdog-agent/conf.d 2>/dev/null; then
-    printf '\n[!] 本机原有 conf 使用**冒号**形 database_identifier，升级后将切为横线形。\n'
-    printf '    历史数据需在 dbdog-server 机器上一次性清理（否则同实例标识裂成两个）：\n'
-    printf '    清理脚本随该次升级单独提供，不随本仓分发；用完即弃，别留成常驻工具。\n\n'
-  fi
   # host-only 未走密码生成/收割路径（resolve_inputs 跳过），渲染时以空串传入——
   # render 对空密码的校验只挂在 has_gauss 位上，host-only 引擎事实已清空，不会触发。
   local gauss_password="${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}"
   agent_render_checks "$CONFIG_STAGE/conf.d" "$gauss_password" \
     "$DBDOG_GAUSSDB_USER" "$DBDOG_GAUSSDB_DBNAME" "$DBDOG_ENV"
+  agent_detect_identifier_drift "$AGENT_CONFIG_DIR/conf.d" "$CONFIG_STAGE/conf.d"
   find "$CONFIG_STAGE" -type d -exec chmod 0700 {} +
   find "$CONFIG_STAGE" -type f -exec chmod 0600 {} +
   chown -R root:root "$CONFIG_STAGE"
@@ -2263,6 +2370,15 @@ main() {
       warn "  ${skipped_engine} 127.0.0.1:${skipped_port} —— ${skipped_reason}"
     done
     warn "接入步骤：控制台 Databases →「添加数据库实例」向导。第 1 步由 DBA 建 dbdog 账号并初始化各库（脚本在 ${AGENT_RUNTIME_DIR}/scripts），第 2 步复制带 *_MONITOR_PASSWORD 的安装命令重跑本安装器"
+  fi
+  if [ "${#AGENT_IDENTIFIER_DRIFTS[@]}" -gt 0 ]; then
+    local drift drift_tag drift_old drift_new
+    warn "本次升级改变了 database_instance（实例标识）——历史数据已裂成新旧两个 id："
+    for drift in "${AGENT_IDENTIFIER_DRIFTS[@]}"; do
+      IFS='|' read -r drift_tag drift_old drift_new <<<"$drift"
+      warn "  ${drift_tag}: ${drift_old}  ->  ${drift_new}"
+    done
+    warn "  若这不是你要的：多半是本机脚本副本落后于 main（靶机的 /root/dbdog/release 是非 git 副本），同步后重跑即可改回；已产生的旧 id 数据在 dbdog-server 侧清理"
   fi
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"
