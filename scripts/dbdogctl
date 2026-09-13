@@ -110,7 +110,32 @@ process_exec_ready() { # Linux 上确认后台 wrapper 已 exec 成真正的服�
   [ "$actual_real" = "$expected_real" ]
 }
 
+http_service_port() { # HTTP 类服务的监听端口；就绪探测与端口归属检查共用这一个来源
+  case "$1" in
+    dbdog-server | ddsql-server | dbdog-web | dbdog-mcp) ;;
+    *) return 1 ;;
+  esac
+  (
+    load_app_env "$1" >/dev/null 2>&1 || true
+    case "$1" in
+      dbdog-server) port="${DBDOG_HTTP_ADDR:-:8080}"; port="${port##*:}" ;;
+      ddsql-server) port="${DDSQL_ADDR:-127.0.0.1:8770}"; port="${port##*:}" ;;
+      dbdog-web) port="${PORT:-3000}" ;;
+      dbdog-mcp) port="${DBDOG_HTTP_PORT:-8090}" ;;
+    esac
+    printf '%s\n' "$port"
+  )
+}
+
+http_service_url() {
+  local port path=/healthz
+  port="$(http_service_port "$1")" || return 1
+  [ "$1" != dbdog-web ] || path=/login
+  printf 'http://127.0.0.1:%s%s\n' "$port" "$path"
+}
+
 service_probe() { # 进程存活之外的最小就绪检查
+  local url
   case "$1" in
     postgresql)
       "$MODULES_DIR/postgresql/current/bin/pg_isready" \
@@ -120,33 +145,120 @@ service_probe() { # 进程存活之外的最小就绪检查
       "$MODULES_DIR/clickhouse/current/bin/clickhouse" client \
         --host 127.0.0.1 --query "SELECT 1" >/dev/null 2>&1
       ;;
-    dbdog-server) (
-      load_app_env dbdog-server
-      port="${DBDOG_HTTP_ADDR:-:8080}"; port="${port##*:}"
-      local_http_probe "http://127.0.0.1:$port/healthz"
-      ) >/dev/null 2>&1
-      ;;
-    ddsql-server) (
-      load_app_env ddsql-server
-      port="${DDSQL_ADDR:-127.0.0.1:8770}"; port="${port##*:}"
-      local_http_probe "http://127.0.0.1:$port/healthz"
-      ) >/dev/null 2>&1
-      ;;
-    dbdog-web) (
-      load_app_env dbdog-web
-      local_http_probe "http://127.0.0.1:${PORT:-3000}/login"
-      ) >/dev/null 2>&1
-      ;;
-    dbdog-mcp) (
-      load_app_env dbdog-mcp
-      local_http_probe "http://127.0.0.1:${DBDOG_HTTP_PORT:-8090}/healthz"
-      ) >/dev/null 2>&1
+    *)
+      url="$(http_service_url "$1")" || return 1
+      local_http_probe "$url" >/dev/null 2>&1
       ;;
   esac
 }
 
-wait_started() { # 要求同一 PID 连续存活且探测成功，避免 daemon 父进程的假成功
-  local svc="$1" i pid="" observed_pid="" successes=0
+proc_loopback_listen_inodes() { # <proc 根> <端口>：能接住 127.0.0.1:<端口> 连接的 LISTEN socket inode
+  local root="$1" hex f
+  local -a tables=()
+  hex="$(printf '%04X' "$2")"
+  for f in "$root/net/tcp" "$root/net/tcp6"; do
+    [ ! -r "$f" ] || tables+=("$f")
+  done
+  [ "${#tables[@]}" -gt 0 ] || return 0
+  # 列序：1=序号 2=local 3=rem 4=st 5=tx:rx 6=tr:when 7=retrnsmt 8=uid 9=timeout 10=inode
+  # （与 agent-lib.sh 的 mysqld 端口发现同一列序）。地址按主机字节序打印，x86_64/aarch64 都是小端。
+  # 探测连的是 127.0.0.1，能接住它的监听地址只有 0.0.0.0、127.0.0.1、::（双栈）、::ffff:127.0.0.1；
+  # 绑在别的地址上的同端口监听者接不到探测，不算占用。
+  awk -v port="$hex" '
+    $4 != "0A" { next }
+    {
+      if (split($2, part, ":") != 2 || part[2] != port) next
+      a = part[1]
+      if (a == "00000000" || a == "0100007F" ||
+          a == "00000000000000000000000000000000" ||
+          a == "0000000000000000FFFF00000100007F") print $10
+    }
+  ' "${tables[@]}" 2>/dev/null | sort -u
+}
+
+proc_descendants() { # <proc 根> <pid>：该 PID 的全部子孙 PID（不含自身）
+  # 用 cat 喂 awk，不把 glob 直接交给 awk：扫描途中有进程退出时，gawk 对打不开的输入文件
+  # 是 fatal，整张进程表被静默截断（2026-09-13 x86 构建机 gawk 4.2.1 实测）；cat 跳过继续。
+  cat "$1"/[0-9]*/stat 2>/dev/null | awk -v top="$2" '
+    {
+      pid = $1; rest = $0
+      sub(/^.*\) /, "", rest)   # comm 可含空格与括号：栈机 web 的 comm 就是「next-server (v1」
+      split(rest, f, " ")
+      parent[pid] = f[2]
+    }
+    END {
+      keep[top] = 1
+      do {
+        changed = 0
+        for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; changed = 1 }
+      } while (changed)
+      for (p in keep) if (p != top) print p
+    }
+  '
+}
+
+proc_socket_inodes() { # <proc 根> <pid>...：这些进程持有的 socket inode
+  local root="$1" p; shift
+  for p in "$@"; do
+    ls -l "$root/$p/fd" 2>/dev/null
+  done | sed -n 's/.*socket:\[\([0-9][0-9]*\)\].*/\1/p' | sort -u
+}
+
+proc_socket_owner() { # <proc 根> <inode>：本账户看得见的持有者 PID（看不见则无输出）
+  ls -l "$1"/[0-9]*/fd 2>/dev/null | awk -v want="socket:[$2]" '
+    /\/fd:$/ { dir = $0; next }
+    index($0, want) { sub(/\/fd:$/, "", dir); sub(/.*\//, "", dir); print dir; exit }
+  '
+}
+
+HTTP_LISTENER_DETAIL=""
+http_listener_owned() { # <服务名> <pid>：接住就绪探测的端口监听者必须属于该 PID 的进程树
+  # 只看 HTTP 应答，会把「端口上别的进程在应答」当成「我起的进程就绪了」：新版还在慢启动、
+  # 尚未 bind，不在 pidfile 里的旧进程照样应答 /healthz ⇒ 报启动成功而版本没换，新进程随后
+  # bind 失败自行退出（657 圈实测「current 指新版、跑的是旧二进制」）。
+  local svc="$1" pid="$2" root="${DBDOG_PROC_ROOT:-/proc}" port listeners held ino owner comm
+  HTTP_LISTENER_DETAIL=""
+  port="$(http_service_port "$svc")" || return 0   # 非 HTTP 类服务不适用
+  case "$port" in
+    '' | *[!0-9]*) HTTP_LISTENER_DETAIL="端口配置不是数字: $port"; return 1 ;;
+  esac
+  # 没有 procfs 网络表（macOS 开发机）时与 process_exec_ready 同口径：跳过，交给 HTTP 探测。
+  [ -r "$root/net/tcp" ] || [ -r "$root/net/tcp6" ] || return 0
+  listeners="$(proc_loopback_listen_inodes "$root" "$port")"
+  if [ -z "$listeners" ]; then
+    HTTP_LISTENER_DETAIL="端口 $port 尚无人监听"
+    return 1
+  fi
+  # inode 是纯数字，拆词安全；两侧补空格做整词匹配。
+  # shellcheck disable=SC2046,SC2086
+  held=" $(printf '%s ' $(proc_socket_inodes "$root" "$pid"))"
+  for ino in $listeners; do
+    case "$held" in *" $ino "*) continue ;; esac
+    # 监听者通常就是 pidfile 里的 PID（2026-09-13 栈机实测 server/ddsql/web/mcp 四个都是）；
+    # 不是时才展开进程树，容许「父进程起子进程监听」的形态。
+    # shellcheck disable=SC2046,SC2086
+    held=" $(printf '%s ' $(proc_socket_inodes "$root" "$pid" $(proc_descendants "$root" "$pid")))"
+    break
+  done
+  for ino in $listeners; do
+    case "$held" in *" $ino "*) continue ;; esac
+    owner="$(proc_socket_owner "$root" "$ino")"
+    if [ -n "$owner" ]; then
+      comm=""
+      [ ! -r "$root/$owner/comm" ] || IFS= read -r comm <"$root/$owner/comm" || true
+      HTTP_LISTENER_DETAIL="端口 $port 被 pid ${owner}（${comm:-?}）占着，不是 pid $pid 的进程树"
+    else
+      HTTP_LISTENER_DETAIL="端口 $port 被本账户看不到的进程占着（socket inode ${ino}），不是 pid $pid 的进程树"
+    fi
+    return 1
+  done
+  return 0
+}
+
+STARTUP_FAILURE_DETAIL=""
+wait_started() { # 要求同一 PID 连续存活、端口监听者属于它、探测成功，挡住 daemon 父进程与端口占用者的假成功
+  local svc="$1" i pid="" observed_pid="" successes=0 started="$SECONDS" last="PID 文件为空或不存在"
+  STARTUP_FAILURE_DETAIL=""
   for ((i=1; i<=STARTUP_ATTEMPTS; i++)); do
     pid="$(pid_of "$svc")"
     if [ -n "$pid" ] && process_alive "$pid"; then
@@ -154,21 +266,32 @@ wait_started() { # 要求同一 PID 连续存活且探测成功，避免 daemon 
         observed_pid="$pid"
         successes=0
       fi
-      if process_exec_ready "$svc" "$pid" && service_probe "$svc"; then
-        successes=$((successes + 1))
-        [ "$successes" -ge "$STARTUP_STABLE_SUCCESSES" ] && return 0
-      else
+      if ! process_exec_ready "$svc" "$pid"; then
         successes=0
+        last="pid $pid 还不是 $(expected_process_executable "$svc")"
+      elif ! http_listener_owned "$svc" "$pid"; then
+        successes=0
+        last="$HTTP_LISTENER_DETAIL"
+      elif ! service_probe "$svc"; then
+        successes=0
+        last="就绪探测不通（$(http_service_url "$svc" || printf '%s 的内置探测' "$svc")）"
+      else
+        successes=$((successes + 1))
+        [ "$successes" -lt "$STARTUP_STABLE_SUCCESSES" ] || return 0
+        last="探测已通过 $successes 次，未达连续 $STARTUP_STABLE_SUCCESSES 次"
       fi
     elif [ -n "$pid" ]; then
       # 已写入 PID 的 daemon/后台进程已退出，不再把确定失败拖到超时。
+      STARTUP_FAILURE_DETAIL="探到第 $i 次（$((SECONDS - started)) 秒）时 pid $pid 已退出"
       return 1
     else
       observed_pid=""
       successes=0
+      last="PID 文件为空或不存在"
     fi
     [ "$i" -eq "$STARTUP_ATTEMPTS" ] || sleep "$STARTUP_INTERVAL"
   done
+  STARTUP_FAILURE_DETAIL="等了 $((SECONDS - started)) 秒、探了 $STARTUP_ATTEMPTS 次（间隔 ${STARTUP_INTERVAL}s），最后一次失败在：$last"
   return 1
 }
 
@@ -207,7 +330,7 @@ start_one() {
       log "$svc 已在运行且通过启动检查 (pid $(pid_of "$svc"))"
       return 0
     fi
-    warn "$svc 进程存在但未通过启动检查；查看 $(service_log_path "$svc")"
+    warn "$svc 进程存在但未通过启动检查（${STARTUP_FAILURE_DETAIL}）；查看 $(service_log_path "$svc")"
     return 1
   fi
   case "$svc" in
@@ -266,7 +389,7 @@ start_one() {
   esac
 
   if ! wait_started "$svc"; then
-    warn "$svc 启动命令已返回，但进程未稳定就绪；查看 $(service_log_path "$svc")"
+    warn "$svc 启动命令已返回，但进程未稳定就绪（${STARTUP_FAILURE_DETAIL}）；查看 $(service_log_path "$svc")"
     if is_running "$svc"; then
       stop_one "$svc" || warn "$svc 启动失败后的清理也失败，请人工检查"
     elif [ "$svc" != "postgresql" ]; then
