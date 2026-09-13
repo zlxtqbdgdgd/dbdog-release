@@ -50,6 +50,19 @@
 | 上机判据 | ① `psql "$PG_DSN" -Atqc "SELECT org_id, version, last_error FROM public.org_blueprint_state WHERE engine = 'ch' ORDER BY org_id"` 每行 version ≥ 37 且 last_error 为空；② 每个租户库 `SELECT count() FROM obs_t_<org>.dbm_query_statements WHERE statement = '' AND raw_statement != '' AND NOT mapContains(tags, 'raw_query_statement')` 为 0 |
 | 删除清单 | ① 蓝图步骤**不能删文件**（`tenancy.ParseFS` 要求版本号连续，删了新租户推进会断档）：把 `0037_…sql.tmpl` 的两条 UPDATE 换成一条以 `{{ .CHDatabase }}.dbm_query_statements` 限定的零命中只读语句（`TestRealBlueprintParsesAndRenders` 要求 CH 语句带租户库前缀；该替换写法没在真 CH 上验过）；② server `internal/storage/clickhouse/statement_dictionary_live_test.go` 里「存量自愈」那一段连同 `dictHealStepName`。**读路径只认脱敏列、写路径按子类分列不删**——那是长期语义，不是脚手架 |
 
+### S3 · openGauss/GaussDB 每库 explain 入口带 OUT 参数（proc_outparam_override 下零计划）
+<!-- scaffold id=S3 module=dbdog-agent introduced=e884ed4 -->
+
+| 项 | 值 |
+|---|---|
+| 引入 | 2026-09-13 loop S321：release `e884ed4` 负责自愈，agent-core `68284237f1` 负责诊断点名。本仓提交直接快进合入 main，hash 不变 |
+| 病症 | 库级或会话级 `behavior_compat_options` 含 `proc_outparam_override` 的库，explain 报 `function public.dbdog_explain_statement(unknown) does not exist`，该库样本永远没有计划（`plan_collection_errors` = failed_function）。同库常缺 `dbdog.explain_statement` 和 `dbdog.column_statistics`，因为 perdb.sql 停在了 REVOKE |
+| 谁中招 | 生效版本之前用旧 perdb.sql 接入的所有 og/gauss 库都是旧形态；选项没开的库暂时不出症状。生效版本之后接入的库天然正确 |
+| 自愈 | `agent-install.sh: agent_heal_gauss_dbm_objects`。对已渲染的 og/gauss 实例逐库跑探针：public 入口在，并且满足以下任一条（explain 入口 `proargmodes` 含 o/t、兼容入口缺、列统计缺），就用本版 perdb.sql 重建（在事务内，可重跑）。单库失败只 warn，不中断升级 |
+| 探测 | 不进 `pending_stack_config`：栈机看不到 DB 主机上的库内对象。由 agent diagnose `undefined-explain-function` 点名选项和旧签名 |
+| 上机判据 | 在 DB 主机上，对每个接入库执行 `SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE ((n.nspname='public' AND p.proname='dbdog_explain_statement') OR (n.nspname='dbdog' AND p.proname='explain_statement')) AND p.proargmodes::text ~ '[ot]'`，结果为 0 |
+| 删除清单 | ① agent-install.sh 的 `AGENT_GAUSS_DBM_HEAL_PROBE_SQL`、`agent_heal_gauss_dbm_objects` 和 main 里那行接线；② 两份 perdb.sql 里两条 `DROP FUNCTION IF EXISTS …(l_query text, OUT explain json)`（BEGIN/COMMIT 和新形态保留）；③ 两份 all-databases.sh cleanup 里的旧签名 DROP。**不删的**：就绪判断里的 proargmodes 条件和 diagnose 点名。DBA 随时可能打开这个选项，它们是长期语义 |
+
 ## 长期机制（不是脚手架，永不到期，故不写在册表那行机器可读的登记元数据）
 
 本节收「军规 10 要求升级脚本自己做掉、但没有到期日」的那些能力。它们和上面的在册脚手架
