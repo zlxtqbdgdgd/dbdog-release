@@ -16,7 +16,7 @@
 #     docker compose 起；install.sh/upgrade.sh 认识这行但一律不碰它，产物是那台机器的
 #     运行件快照（backend 二进制 / frontend dist / diagbench 物料 / diagbench-mcp bundle）。
 dbdog-server	first-party	stack	yes	0.1.29	dbdog-server-0.1.29-aarch64.tar.gz	d58eb8c934a2390982bcb67c7f9dacdc3af9e9a6365e170fa27001dcb1f744ef	621c93b	aarch64
-dbdog-web	first-party	stack	yes	0.1.32	dbdog-web-0.1.32-aarch64.tar.gz	79306f50d54109f704f27f018d7d249438c0d3b70637b3a0f991ec4ddd8ccef9	ed81dd6	aarch64
+dbdog-web	first-party	stack	yes	0.1.33	dbdog-web-0.1.33-aarch64.tar.gz	c84f3bc04b7eb45f2fea9846895edbf0ea82ef10ca3cfcd19806e38d95a2e41c	9215ce9	aarch64
 dbdog-mcp	first-party	stack	yes	0.1.23	dbdog-mcp-0.1.23-noarch.tar.gz	a0dbb79a6d77e267b8410a1ef71322b5d0f6222227a05e248720f38df2dde17c	fa9adad	noarch
 dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-aarch64.tar.gz	369b113bb42c9b255d766eed388cbb0eafe47f9d49d255e0075c91a74e4abddb	agent:2a56956,core:7c9f179	aarch64
 ddprof	third-party	dbhost	no	-	-	-	-	aarch64
