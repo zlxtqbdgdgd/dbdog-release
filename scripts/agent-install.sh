@@ -1339,6 +1339,71 @@ agent_gate_engine_credentials() {
   [ "$changed" -eq 0 ] || agent_rerender_confd
 }
 
+# 军规 10 · 升级脚手架 S3（登记见 docs/upgrade-scaffolds.md）：openGauss/GaussDB 每库 explain 入口
+# 旧形态带 OUT 参数，库级/会话级 behavior_compat_options 含 proc_outparam_override 时单参调用解析
+# 不到（该库永远零计划），perdb.sql 也会停在按 (text) 写的 REVOKE 上、兼容入口与列统计半截没建。
+# 建号与「哪些库接入」仍归 DBA（上面 agent_gate_engine_credentials 的口径不变）：这里只在 DBA
+# 已经接入过的库（public.dbdog_explain_statement 在）里，把我们自己出货的对象改到新形态、补齐
+# 半截——判据从目录算（proargmodes 含 o/t，或兼容入口/列统计缺），不看版本号；新 perdb.sql 自带
+# 事务替换，重跑幂等。单库失败只告警不中断升级：采集别的库照常，诊断会点名该库的选项。
+AGENT_GAUSS_DBM_HEAL_PROBE_SQL="$(cat <<'SQL'
+SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public' AND p.proname = 'dbdog_explain_statement'
+) AND (
+  EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE ((n.nspname = 'public' AND p.proname = 'dbdog_explain_statement')
+        OR (n.nspname = 'dbdog' AND p.proname = 'explain_statement'))
+      AND p.proargmodes IS NOT NULL AND p.proargmodes::text ~ '[ot]'
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'dbdog' AND p.proname = 'explain_statement'
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'dbdog' AND p.proname = 'column_statistics'
+  )
+) THEN 1 ELSE 0 END;
+SQL
+)"
+
+agent_heal_gauss_dbm_objects() {
+  local engine port index sql db dbs need healed=0 failed=0
+  local -a ports
+  for engine in gaussdb opengauss; do
+    if [ "$engine" = gaussdb ]; then
+      ports=(${AGENT_GAUSSDB_RENDER_PORTS[@]+"${AGENT_GAUSSDB_RENDER_PORTS[@]}"})
+    else
+      ports=(${AGENT_OPENGAUSS_RENDER_PORTS[@]+"${AGENT_OPENGAUSS_RENDER_PORTS[@]}"})
+    fi
+    [ "${#ports[@]}" -gt 0 ] || continue
+    sql="$AGENT_RUNTIME_DIR/scripts/init-dbdog-user-${engine}-perdb.sql"
+    [ -f "$sql" ] || { warn "缺少 ${sql}，跳过 ${engine} 每库对象自愈"; continue; }
+    for port in "${ports[@]}"; do
+      index="$(agent_gauss_pid_index_of_port "$port")" || continue
+      dbs="$(agent_gsql "$index" -c \
+        'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false AND datallowconn ORDER BY datname;' \
+        2>/dev/null)" || { warn "${engine}:${port} 列库失败，跳过每库对象自愈"; continue; }
+      while IFS= read -r db; do
+        db="${db%$'\r'}"
+        [ -n "$db" ] || continue
+        need="$(agent_gsql "$index" -d "$db" -c "$AGENT_GAUSS_DBM_HEAL_PROBE_SQL" 2>/dev/null | tr -d '\r' | tail -n 1)" || continue
+        [ "$need" = 1 ] || continue
+        if agent_gsql "$index" -d "$db" <"$sql" >"$WORK_DIR/gauss-dbm-heal.out" 2>&1; then
+          healed=$((healed + 1))
+          log "${engine}:${port} 库 ${db}: explain 入口已换成不带 OUT 参数的形态并补齐每库对象"
+        else
+          failed=$((failed + 1))
+          warn "${engine}:${port} 库 ${db} 每库对象自愈失败（采集照常，诊断会点名）: $(tail -n 3 "$WORK_DIR/gauss-dbm-heal.out" | tr '\n' ' ')"
+        fi
+      done <<<"$dbs"
+    done
+  done
+  [ "$((healed + failed))" -eq 0 ] || log "openGauss/GaussDB 每库对象自愈: 修好 ${healed} 个库，失败 ${failed} 个"
+}
+
 # 库内对象不归安装器：首次接入（建号 + 各库对象）与此后每次 CREATE DATABASE 都由 DBA 用这套
 # 脚本做。把批量脚本、每库 SQL 和全局建号 SQL 一起落到 runtime 树下的固定路径，控制台「添加数据库
 # 实例」向导与「采集配置」页就能给出绝对路径的可执行命令（dbdog-web src/lib/db-init-commands.ts
@@ -2335,6 +2400,7 @@ main() {
   if [ "${AGENT_HOST_ONLY:-0}" != 1 ]; then
     install_dbm_init_scripts
     agent_gate_engine_credentials
+    agent_heal_gauss_dbm_objects
   fi
   start_and_verify
 

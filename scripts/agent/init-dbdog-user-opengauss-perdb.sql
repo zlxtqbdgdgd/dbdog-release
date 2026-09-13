@@ -28,7 +28,23 @@ GRANT USAGE ON SCHEMA public TO dbdog;
 -- openGauss 与 GaussDB 同规则:SECURITY DEFINER 动态 SQL 按函数所属 schema 解析
 -- 未限定表名,业务 SQL 通常依赖默认 public,因此 canonical 入口必须放 public
 -- (即上面的解析规则);函数不向 PUBLIC 开放,只授权监控用户执行。
-CREATE OR REPLACE FUNCTION public.dbdog_explain_statement(l_query text, OUT explain json)
+-- 形态不带 OUT 参数(RETURNS SETOF json,入参只有 l_query):库级/会话级
+-- behavior_compat_options 含 proc_outparam_override 时,plpgsql 函数的 OUT 与 RETURNS TABLE 列都计入
+-- 调用签名(LANGUAGE sql 不受影响,列统计入口不用改),带 OUT 的旧形态单参调用报 `function public.dbdog_explain_statement(unknown)
+-- does not exist`,按 (text) 写的 REVOKE/GRANT 也解析不到——ON_ERROR_STOP 让本文件停在
+-- 那一行,兼容入口与列统计都没建(203 mogdb1 的半截初始化即此)。补一个 NULL 占位的
+-- 双参调用能解析,但返回 0 行,拿不到计划。无 OUT 的 SETOF json 在该选项开/关下单参
+-- 调用都成立(2026-09-13 loop S321 在 203 openGauss 7.0.0-RC1 / 202 GaussDB 507
+-- 自建库实测四格)。
+-- 旧形态替换:按带 OUT 的完整签名 DROP——选项开时只命中旧形态,选项关时 OUT 不计入
+-- 签名、新旧形态都命中;随后 CREATE OR REPLACE 重建并重新授权。整段放一个事务,
+-- 并发的 explain 探针看不到函数缺失的空窗(空窗一次会让 agent 按库退避 ≥5 分钟)。
+-- 已在网的旧形态库由 agent 升级自愈(agent-install.sh agent_heal_gauss_dbm_objects)。
+BEGIN;
+DROP FUNCTION IF EXISTS dbdog.explain_statement(l_query text, OUT explain json);
+DROP FUNCTION IF EXISTS public.dbdog_explain_statement(l_query text, OUT explain json);
+
+CREATE OR REPLACE FUNCTION public.dbdog_explain_statement(l_query text)
  RETURNS SETOF json
  LANGUAGE plpgsql
  STRICT SECURITY DEFINER
@@ -49,19 +65,19 @@ REVOKE ALL ON FUNCTION public.dbdog_explain_statement(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.dbdog_explain_statement(text) TO dbdog;
 
 -- 旧配置兼容入口;实现只委托给 public 中的 canonical 函数,避免保留两份 explain 逻辑。
-CREATE OR REPLACE FUNCTION dbdog.explain_statement(l_query text, OUT explain json)
+CREATE OR REPLACE FUNCTION dbdog.explain_statement(l_query text)
  RETURNS SETOF json
  LANGUAGE plpgsql
  STRICT SECURITY DEFINER
 AS $function$
 BEGIN
-  RETURN QUERY SELECT plan.explain
-  FROM public.dbdog_explain_statement(l_query) AS plan;
+  RETURN QUERY SELECT * FROM public.dbdog_explain_statement(l_query);
 END;
 $function$;
 
 REVOKE ALL ON FUNCTION dbdog.explain_statement(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION dbdog.explain_statement(text) TO dbdog;
+COMMIT;
 
 -- 列统计采集入口(SECURITY DEFINER:pg_stats 按 has_column_privilege 过滤行,
 -- dbdog 无业务表 SELECT 权限会读到空集,故借函数属主身份读取)。

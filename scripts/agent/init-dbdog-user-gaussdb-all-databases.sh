@@ -229,6 +229,9 @@ SELECT
     FROM pg_catalog.pg_proc p
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'public' AND p.proname = 'dbdog_explain_statement'
+      -- 带 OUT/TABLE 参数的旧形态在 proc_outparam_override 下单参调用解析不到,不算就绪
+      -- (位置 0 → 未配置 → configure 重跑 perdb.sql 替换)。A 兼容库 '' 即 NULL,别用 COALESCE 空串。
+      AND (p.proargmodes IS NULL OR p.proargmodes::text !~ '[ot]')
   ) THEN 1 ELSE 0 END || '|' ||
   CASE WHEN EXISTS (
     SELECT 1
@@ -294,6 +297,9 @@ cleanup_database() { # <database>
     || { echo "CLEANUP_FAILED database=$database (reset search_path)" >&2; return 1; }
   run_sql "$database" "DROP SCHEMA IF EXISTS dbdog CASCADE;" \
     || { echo "CLEANUP_FAILED database=$database (drop schema)" >&2; return 1; }
+  # 两条签名:新形态 (text);带 OUT 的旧形态在 proc_outparam_override 下只认完整签名。
+  run_sql "$database" "DROP FUNCTION IF EXISTS public.dbdog_explain_statement(l_query text, OUT explain json);" \
+    || { echo "CLEANUP_FAILED database=$database (drop legacy public explain entry)" >&2; return 1; }
   run_sql "$database" "DROP FUNCTION IF EXISTS public.dbdog_explain_statement(text);" \
     || { echo "CLEANUP_FAILED database=$database (drop public explain entry)" >&2; return 1; }
   run_sql "$database" "REVOKE USAGE ON SCHEMA public FROM ${MONITOR_ROLE};" \
