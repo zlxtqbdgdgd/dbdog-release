@@ -36,6 +36,20 @@
 | 判据 | 每台机 `grep '^DBDOG_APIKEY_ENC_KEY=' ~/dbdog/etc/dbdog-web.env` 是 44 位 base64 |
 | 删除清单 | ① `pending_stack_config` 里这一项（表空了就连函数带 `check-upgrade.sh` 的接线一起删）；② dbdog-build `test-release-contracts.sh` 里「待校准配置探测」那段。**`ensure_apikey_enc_key` 不删**——发布模板里这行永远是空的，首装生成是长期能力，不是脚手架 |
 
+### S2 · dbm 签名字典：被丢弃计划的 plan 脱敏正文落在 `raw_statement` 列
+
+<!-- scaffold id=S2 module=dbdog-server introduced=68fe706 -->
+
+| 项 | 值 |
+|---|---|
+| 引入 | 2026-09-13，loop S305。机制与步骤都在 **dbdog-server**（读路径只认脱敏列、写路径按样本子类分列、蓝图 `migrations/blueprint/ch/0037_dbm_statement_dictionary_obfuscated_column.sql.tmpl`），本仓只登记。`introduced` 取登记时本仓 main 头：生效版本 = 其后第一次 `publish: dbdog-server@…`，**前提是那次发布已含上述 server 改动**——若 server 改动合入之前已有一次 server 发布，把 `introduced` 改成合入之后的本仓 HEAD |
+| 病症 | 升级前的 server 把「计划不可能（no_plans_possible）而被丢弃计划」的 plan 事件正文（agent 已脱敏）写进 `dbm_query_statements.raw_statement`、`statement` 留空；新读路径为了永不回出原文只读 `statement`，这批签名在 `get_dbdog_database_query_statement` 上会变成 found:false，直到同签名的新 plan 事件重写或行按表 TTL 过期 |
+| 谁中招 | 生效版本之前摄入过 DBM 样本的每个租户库；生效版本之后首装的环境没有存量 |
+| 自愈 | 不在本仓：dbdog-server 启动期 `tenancy.Provisioner.MigrateAll` 推进蓝图 ch/0037——两条 `ALTER … UPDATE … SETTINGS mutations_sync = 2`，只搬 **tags 里没有 `raw_query_statement` 键** 的行（该 tag 与 rqt/rqp 原文事件由同一 agent 开关、同一上游提交引入，带它的行分不清来源，一行不动），重跑收敛。`upgrade.sh` 升级 server 后的重启即触发 |
+| 探测 | 不另加 `pending_stack_config` 项：步骤失败写 `org_blueprint_state.last_error`，已由 L1 的 `blueprint_drift_rows` 报出；步骤成功则 ch 版本 ≥ 37，版本号看得出来 |
+| 上机判据 | ① `psql "$PG_DSN" -Atqc "SELECT org_id, version, last_error FROM public.org_blueprint_state WHERE engine = 'ch' ORDER BY org_id"` 每行 version ≥ 37 且 last_error 为空；② 每个租户库 `SELECT count() FROM obs_t_<org>.dbm_query_statements WHERE statement = '' AND raw_statement != '' AND NOT mapContains(tags, 'raw_query_statement')` 为 0 |
+| 删除清单 | ① 蓝图步骤**不能删文件**（`tenancy.ParseFS` 要求版本号连续，删了新租户推进会断档）：把 `0037_…sql.tmpl` 的两条 UPDATE 换成一条以 `{{ .CHDatabase }}.dbm_query_statements` 限定的零命中只读语句（`TestRealBlueprintParsesAndRenders` 要求 CH 语句带租户库前缀；该替换写法没在真 CH 上验过）；② server `internal/storage/clickhouse/statement_dictionary_live_test.go` 里「存量自愈」那一段连同 `dictHealStepName`。**读路径只认脱敏列、写路径按子类分列不删**——那是长期语义，不是脚手架 |
+
 ## 长期机制（不是脚手架，永不到期，故不写在册表那行机器可读的登记元数据）
 
 本节收「军规 10 要求升级脚本自己做掉、但没有到期日」的那些能力。它们和上面的在册脚手架
