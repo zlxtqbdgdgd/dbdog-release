@@ -25,4 +25,4 @@ clickhouse	third-party	stack	yes	26.8.1.184	clickhouse-26.8.1.184-aarch64.tar.gz
 node	third-party	stack	no	20.18.1	node-20.18.1-aarch64.tar.gz	fdcb9715f091fe19d58f6e98f0acc27962977e0e28344f2f31189931cb0986c3	-	aarch64
 goose	third-party	stack	no	3.27.3	goose-3.27.3-aarch64.tar.gz	8607989eb322f392521d0a8b5ba9dbaaf2a508d619ca30ffe18c9085d4edffd4	-	aarch64
 dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-x86_64.tar.gz	cd96343f0bf8d43d31d44217305ac744025e71ad9429654942a4d6bc71c46938	agent:2a56956,core:7c9f179	x86_64
-dbdog-benchmark	first-party	benchhost	no	0.1.0	dbdog-benchmark-0.1.0-aarch64.tar.gz	37f21a9feab58eb1d426cca3bf3bb1b86e035f4b1c534bbae2ac2c9b149de905	61ff3e9	aarch64
+dbdog-benchmark	first-party	benchhost	no	0.1.1	dbdog-benchmark-0.1.1-aarch64.tar.gz	fb9fe9c04ed76cd670270bde7e08c32fba6043ba82f79808e592c2c14d0d47f8	6de8e26	aarch64
