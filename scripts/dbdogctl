@@ -19,10 +19,18 @@ SERVICES=(postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp)
 STARTUP_ATTEMPTS="${DBDOG_STARTUP_ATTEMPTS:-90}"
 STARTUP_INTERVAL="${DBDOG_STARTUP_INTERVAL:-1}"
 STARTUP_STABLE_SUCCESSES="${DBDOG_STARTUP_STABLE_SUCCESSES:-2}"
+# 停止时「进程真正没了」的等待预算（TERM 窗口仍是下面 stop_one 里的 20×0.5 秒，不在这里）。
+# 2026-09-13 快升级 mcp：KILL 后只 `sleep 0.1` 就判，进程还在就报「停止失败」并回滚——而它一秒内就没了。
+# S298 实测（node 20.18.1、400MB 堆、父进程 = init，x86 构建机 32 核）：KILL → 监听端口释放、/proc 消失，
+# 空闲 38~66ms；128 个忙循环抢 32 核时 257~770ms（5 次）。CPU 抢满时 0.1 秒本来就不够；KILL 挡不住，
+# 拖长它的只有调度与内核回收，所以给到 10 秒（≈实测最坏的 13 倍）：真正杀不死（卡在 D 态）时多等几秒，
+# 换的是「机器忙一点就把升级判失败」不再发生。
+STOP_WAIT_ATTEMPTS="${DBDOG_STOP_WAIT_ATTEMPTS:-100}"
+STOP_WAIT_INTERVAL="${DBDOG_STOP_WAIT_INTERVAL:-0.1}"
 
-for startup_count in "$STARTUP_ATTEMPTS" "$STARTUP_STABLE_SUCCESSES"; do
+for startup_count in "$STARTUP_ATTEMPTS" "$STARTUP_STABLE_SUCCESSES" "$STOP_WAIT_ATTEMPTS"; do
   case "$startup_count" in
-    '' | 0 | *[!0-9]*) die "启动探测次数必须是正整数: $startup_count" ;;
+    '' | 0 | *[!0-9]*) die "启动/停止探测次数必须是正整数: $startup_count" ;;
   esac
 done
 [ "$STARTUP_STABLE_SUCCESSES" -le "$STARTUP_ATTEMPTS" ] \
@@ -58,6 +66,40 @@ is_running() {
   local pid
   pid="$(pid_of "$1")"
   [ -n "$pid" ] && process_alive "$pid"
+}
+
+process_gone() { # <pid>：连同全部线程都退出了，端口等资源已释放
+  # process_alive 把僵尸算退出，对启动门禁是对的；停止时不够：S298 实测 KILL 后主线程先成 Z、
+  # 另一线程还在回收，那段时间监听端口仍被占着（最长 676ms），紧跟着的 start 会撞 EADDRINUSE。
+  # 所有线程都走完 exit_files 之后 Threads 才回到 1，所以「Z 且 Threads=1」才算资源已放。
+  local pid="$1" status="" line state="" threads=""
+  kill -0 "$pid" 2>/dev/null || return 0
+  if [ -r "/proc/$pid/status" ] && status="$(cat "/proc/$pid/status" 2>/dev/null)"; then
+    while IFS= read -r line; do
+      case "$line" in
+        State:*) state="${line#State:}"; state="${state#"${state%%[![:space:]]*}"}" ;;
+        Threads:*) threads="${line#Threads:}"; threads="${threads//[[:space:]]/}" ;;
+      esac
+    done <<<"$status"
+    [ -n "$state" ] || return 0 # 读到一半进程被回收
+    case "$state" in Z*) [ "$threads" = 1 ] && return 0 ;; esac
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null || return 0
+  ! process_alive "$pid" # 无 procfs（macOS）：退回僵尸即退出的口径
+}
+
+STOP_FAILURE_DETAIL=""
+wait_process_gone() { # <pid>：按 STOP_WAIT_* 轮询到进程真正没了；超时写 STOP_FAILURE_DETAIL
+  local pid="$1" i started="$SECONDS"
+  STOP_FAILURE_DETAIL=""
+  for ((i=1; i<=STOP_WAIT_ATTEMPTS; i++)); do
+    process_gone "$pid" && return 0
+    sleep "$STOP_WAIT_INTERVAL"
+  done
+  process_gone "$pid" && return 0
+  STOP_FAILURE_DETAIL="等了 $((SECONDS - started)) 秒、查了 $STOP_WAIT_ATTEMPTS 次（间隔 ${STOP_WAIT_INTERVAL}s）仍未退出"
+  return 1
 }
 
 load_app_env() { # 在调用者作用域加载应用配置；调用者决定是否 set -a
@@ -401,7 +443,7 @@ start_one() {
 }
 
 stop_one() {
-  local svc="$1" i
+  local svc="$1" i pid
   case "$svc" in
     postgresql)
       if is_running "$svc"; then
@@ -414,15 +456,16 @@ stop_one() {
       ;;
     *)
       if is_running "$svc"; then
-        kill "$(pid_of "$svc")" 2>/dev/null || true
+        pid="$(pid_of "$svc")"
+        kill "$pid" 2>/dev/null || true
         for ((i=1; i<=20; i++)); do is_running "$svc" || break; sleep 0.5; done
         if is_running "$svc"; then
           warn "$svc 未响应 TERM，发送 KILL"
-          kill -9 "$(pid_of "$svc")" 2>/dev/null || true
-          sleep 0.1
+          kill -9 "$pid" 2>/dev/null || true
         fi
-        if is_running "$svc"; then
-          warn "$svc 停止失败 (pid $(pid_of "$svc"))"
+        # TERM 自己退了也要等：主线程成僵尸时别的线程可能还攥着端口（见 process_gone）。
+        if ! wait_process_gone "$pid"; then
+          warn "$svc 停止失败 (pid ${pid}，发送信号后${STOP_FAILURE_DETAIL})"
           return 1
         fi
       fi
