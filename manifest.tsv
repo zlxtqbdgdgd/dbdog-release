@@ -17,7 +17,7 @@
 #     运行件快照（backend 二进制 / frontend dist / diagbench 物料 / diagbench-mcp bundle）。
 dbdog-server	first-party	stack	yes	0.1.29	dbdog-server-0.1.29-aarch64.tar.gz	d58eb8c934a2390982bcb67c7f9dacdc3af9e9a6365e170fa27001dcb1f744ef	621c93b	aarch64
 dbdog-web	first-party	stack	yes	0.1.33	dbdog-web-0.1.33-aarch64.tar.gz	c84f3bc04b7eb45f2fea9846895edbf0ea82ef10ca3cfcd19806e38d95a2e41c	9215ce9	aarch64
-dbdog-mcp	first-party	stack	yes	0.1.23	dbdog-mcp-0.1.23-noarch.tar.gz	a0dbb79a6d77e267b8410a1ef71322b5d0f6222227a05e248720f38df2dde17c	fa9adad	noarch
+dbdog-mcp	first-party	stack	yes	0.1.24	dbdog-mcp-0.1.24-noarch.tar.gz	7849aee8bd5478143672b97ed8f51fff50a6b399b637aed9cfaf4f736555df98	7001553	noarch
 dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-aarch64.tar.gz	369b113bb42c9b255d766eed388cbb0eafe47f9d49d255e0075c91a74e4abddb	agent:2a56956,core:7c9f179	aarch64
 ddprof	third-party	dbhost	no	-	-	-	-	aarch64
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-	aarch64
