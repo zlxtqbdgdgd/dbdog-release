@@ -18,11 +18,11 @@
 dbdog-server	first-party	stack	yes	0.1.29	dbdog-server-0.1.29-aarch64.tar.gz	d58eb8c934a2390982bcb67c7f9dacdc3af9e9a6365e170fa27001dcb1f744ef	621c93b	aarch64
 dbdog-web	first-party	stack	yes	0.1.33	dbdog-web-0.1.33-aarch64.tar.gz	c84f3bc04b7eb45f2fea9846895edbf0ea82ef10ca3cfcd19806e38d95a2e41c	9215ce9	aarch64
 dbdog-mcp	first-party	stack	yes	0.1.24	dbdog-mcp-0.1.24-noarch.tar.gz	7849aee8bd5478143672b97ed8f51fff50a6b399b637aed9cfaf4f736555df98	7001553	noarch
-dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-aarch64.tar.gz	369b113bb42c9b255d766eed388cbb0eafe47f9d49d255e0075c91a74e4abddb	agent:2a56956,core:7c9f179	aarch64
+dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.3	dbdog-agent-7.83.0-dbdog.3-aarch64.tar.gz	7418aa87d21bbc2c72decda86c83e35f059c828341c478fc6c7bd5210acc09aa	agent:36c8277,core:3cd859f	aarch64
 ddprof	third-party	dbhost	no	-	-	-	-	aarch64
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-	aarch64
 clickhouse	third-party	stack	yes	26.8.1.184	clickhouse-26.8.1.184-aarch64.tar.gz	fb72234cc32e9f3ea6247511cddb9994b129002f9c05f48fc797f6451e237130	-	aarch64
 node	third-party	stack	no	20.18.1	node-20.18.1-aarch64.tar.gz	fdcb9715f091fe19d58f6e98f0acc27962977e0e28344f2f31189931cb0986c3	-	aarch64
 goose	third-party	stack	no	3.27.3	goose-3.27.3-aarch64.tar.gz	8607989eb322f392521d0a8b5ba9dbaaf2a508d619ca30ffe18c9085d4edffd4	-	aarch64
-dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.2	dbdog-agent-7.83.0-dbdog.2-x86_64.tar.gz	cd96343f0bf8d43d31d44217305ac744025e71ad9429654942a4d6bc71c46938	agent:2a56956,core:7c9f179	x86_64
+dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.3	dbdog-agent-7.83.0-dbdog.3-x86_64.tar.gz	5c04b9db3a713a693ab90f389326720372e6f2395b39b92f4226a75ed0745398	agent:36c8277,core:3cd859f	x86_64
 dbdog-benchmark	first-party	benchhost	no	0.1.2	dbdog-benchmark-0.1.2-aarch64.tar.gz	f40106eb464e54d37f46a47e7ea94ed58eeb2c10947ab8e6a2c8306e1599159b	e77fa13	aarch64

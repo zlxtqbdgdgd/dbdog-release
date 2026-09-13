@@ -7,20 +7,20 @@ GitHub Release [`artifacts`](../../releases/tag/artifacts) 里，文件名自带
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-09-12 23:12（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-09-13 01:03（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |
 | --- | --- | --- | --- | --- | --- |
 | dbdog-server | first-party | 全家桶机 | 0.1.29 | dbdog-server-0.1.29-aarch64.tar.gz | aarch64 |
 | dbdog-web | first-party | 全家桶机 | 0.1.33 | dbdog-web-0.1.33-aarch64.tar.gz | aarch64 |
 | dbdog-mcp | first-party | 全家桶机 | 0.1.24 | dbdog-mcp-0.1.24-noarch.tar.gz | noarch |
-| dbdog-agent | first-party | DB 主机 | 7.83.0-dbdog.2 | dbdog-agent-7.83.0-dbdog.2-aarch64.tar.gz | aarch64 |
+| dbdog-agent | first-party | DB 主机 | 7.83.0-dbdog.3 | dbdog-agent-7.83.0-dbdog.3-aarch64.tar.gz | aarch64 |
 | ddprof | third-party | DB 主机 | - | - | aarch64 |
 | postgresql | third-party | 全家桶机 | 16.14-dbdog.1 | postgresql-16.14-dbdog.1-aarch64.tar.gz | aarch64 |
 | clickhouse | third-party | 全家桶机 | 26.8.1.184 | clickhouse-26.8.1.184-aarch64.tar.gz | aarch64 |
 | node | third-party | 全家桶机 | 20.18.1 | node-20.18.1-aarch64.tar.gz | aarch64 |
 | goose | third-party | 全家桶机 | 3.27.3 | goose-3.27.3-aarch64.tar.gz | aarch64 |
-| dbdog-agent | first-party | DB 主机 | 7.83.0-dbdog.2 | dbdog-agent-7.83.0-dbdog.2-x86_64.tar.gz | x86_64 |
+| dbdog-agent | first-party | DB 主机 | 7.83.0-dbdog.3 | dbdog-agent-7.83.0-dbdog.3-x86_64.tar.gz | x86_64 |
 | dbdog-benchmark | first-party | 压测机 | 0.1.2 | dbdog-benchmark-0.1.2-aarch64.tar.gz | aarch64 |
 <!-- VERSION-TABLE:END -->
 
