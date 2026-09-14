@@ -18,9 +18,10 @@ RUN_DIR="$DBDOG_HOME/run"
 CACHE_DIR="$DBDOG_HOME/cache"
 MODULE_VERSION_MARKER=".dbdog-manifest-version"
 MODULE_ARTIFACT_SHA256_MARKER=".dbdog-artifact-sha256"
-# 基础运行时必须先于应用；应用按当前依赖图先 server、再 web、最后 MCP。
+# 基础运行时必须先于应用；应用按当前依赖图先 server、再 web、再 MCP，最后 benchweb
+#（它只依赖 postgresql，回推 dbdog-server 是可选的，排最后不阻塞控制台三件）。
 # 表结构的跨模块兼容不能依赖这个顺序，必须使用 expand/contract 迁移。
-UPGRADE_MODULE_ORDER=(node goose postgresql clickhouse dbdog-server dbdog-web dbdog-mcp)
+UPGRADE_MODULE_ORDER=(node goose postgresql clickhouse dbdog-server dbdog-web dbdog-mcp dbdog-benchweb)
 # 配置校准会在 upgrade 切包前发生；调用方用这些标记决定是否需要重启仍在运行、
 # 但因产物身份相同而被 upgrade_one 跳过的服务。
 # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh 读取
@@ -29,6 +30,10 @@ DBDOG_SERVER_CONFIG_CHANGED=0
 DBDOG_WEB_CONFIG_CHANGED=0
 # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
 DBDOG_MCP_CONFIG_CHANGED=0
+# shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
+DBDOG_BENCHWEB_CONFIG_CHANGED=0
+# benchweb 的元数据库：与 web/server 的 ctl 同一个 PostgreSQL 实例、独立库。
+BENCHWEB_PG_DATABASE=dbdog_benchweb
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -388,7 +393,45 @@ configure_ready_to_use_stack() {
     # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
     DBDOG_MCP_CONFIG_CHANGED=1
   fi
+  configure_benchweb_env
   log "已生成可直接使用的本机配置（访问地址: ${app_url}；已有真实配置保持不变）"
+}
+
+# benchweb 是可选装的应用件：还没装过（没有 env 文件）的机器上什么都不做，不能让它的缺席挡住
+# server/web/mcp 的校准。装过之后与其它应用件同一条规矩——只接管缺失值与发布模板里的占位，
+# 已有真实值永不覆盖。路径型变量一律校准成绝对路径：dbdogctl 在带版本号的模块目录里拉起进程，
+# 相对路径会把用例与日志写进 modules/dbdog-benchweb/<版本>/，下次升级就没了。
+configure_benchweb_env() {
+  local envf="$ETC_DIR/dbdog-benchweb.env" before current generated
+  [ -e "$envf" ] || [ -L "$envf" ] || return 0
+  [ -f "$envf" ] && [ ! -L "$envf" ] || die "benchweb 配置不是普通文件: $envf"
+  before="$(cksum "$envf")"
+
+  mkdir -p "$DATA_DIR/dbdog-benchweb/cases" "$DATA_DIR/dbdog-benchweb/logs" "$ETC_DIR/dbdog-benchweb"
+  # 注册表含 SSH 密码；界面保存是「同目录临时文件 + 改名」，所以目录本身必须归运行账户且可写。
+  chmod 700 "$ETC_DIR/dbdog-benchweb"
+
+  ensure_env_default "$envf" DBDOG_BENCHWEB_ADDR :18888 change-me
+  ensure_env_default "$envf" DBDOG_BENCHWEB_META_DSN \
+    "postgres://dbdog@127.0.0.1:5432/${BENCHWEB_PG_DATABASE}?sslmode=disable" user:pass
+  ensure_env_default "$envf" DBDOG_BENCHWEB_CASE_DIR "$DATA_DIR/dbdog-benchweb/cases" change-me
+  ensure_env_default "$envf" DBDOG_BENCHWEB_LOG_DIR "$DATA_DIR/dbdog-benchweb/logs" change-me
+  ensure_env_default "$envf" DBDOG_BENCHWEB_INSTANCES "$ETC_DIR/dbdog-benchweb/instances.json" change-me
+  ensure_env_default "$envf" DBDOG_BENCHWEB_SITE_USER admin change-me
+  # 站点密码只在缺失/占位时生成一次；生成放在判断之后，免得每次校准都白算一个随机数。
+  current="$(env_literal_value "$envf" DBDOG_BENCHWEB_SITE_PASS)"
+  case "$current" in
+    "" | change-me*)
+      generated="$(generate_secret)" || die "生成 DBDOG_BENCHWEB_SITE_PASS 失败"
+      ensure_env_default "$envf" DBDOG_BENCHWEB_SITE_PASS "$generated" "${current:-change-me}"
+      log "已为 dbdog-benchweb 生成站点登录密码（用户 admin，密码见 ${envf}）"
+      ;;
+  esac
+
+  if [ "$before" != "$(cksum "$envf")" ]; then
+    # shellcheck disable=SC2034 # 由 source 本库的 upgrade.sh/合同测试读取
+    DBDOG_BENCHWEB_CONFIG_CHANGED=1
+  fi
 }
 
 # ---- 架构规范化 ----
@@ -807,6 +850,7 @@ module_services() {
     dbdog-server) echo "dbdog-server ddsql-server" ;;
     dbdog-web) echo "dbdog-web" ;;
     dbdog-mcp) echo "dbdog-mcp" ;;
+    dbdog-benchweb) echo "dbdog-benchweb" ;;
     postgresql) echo "postgresql" ;;
     clickhouse) echo "clickhouse" ;;
     *) echo "" ;;
@@ -846,6 +890,13 @@ service_initialized() { # <服务> → 0=可以拉起；1=首装尚未初始化�
     dbdog-mcp)
       envf="$ETC_DIR/dbdog-mcp.env"
       [ -f "$envf" ] && ! env_value_is_placeholder "$envf" DBDOG_INTERNAL_TOKEN
+      ;;
+    dbdog-benchweb)
+      envf="$ETC_DIR/dbdog-benchweb.env"
+      [ -f "$envf" ] && ! env_value_is_placeholder "$envf" DBDOG_BENCHWEB_META_DSN user:pass \
+        && ! env_value_is_placeholder "$envf" DBDOG_BENCHWEB_CASE_DIR \
+        && ! env_value_is_placeholder "$envf" DBDOG_BENCHWEB_LOG_DIR \
+        && ! env_value_is_placeholder "$envf" DBDOG_BENCHWEB_INSTANCES
       ;;
     *) return 0 ;;
   esac

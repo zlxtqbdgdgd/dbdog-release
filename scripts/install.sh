@@ -10,7 +10,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DBDOGCTL="$SCRIPTS_DIR/dbdogctl"
 
 BASE_MODULES=(node goose postgresql clickhouse)
-APP_MODULES=(dbdog-server dbdog-web dbdog-mcp)
+APP_MODULES=(dbdog-server dbdog-web dbdog-mcp dbdog-benchweb)
 
 preflight_host() {
   local arch cmd
@@ -38,6 +38,9 @@ finish_installation() {
   configure_ready_to_use_stack
   "$DBDOGCTL" start postgresql clickhouse \
     || die "数据库未全部启动就绪；未执行迁移或启动应用服务"
+  # 已有 stack 的机器首次装新应用件（如 benchweb）只会走 --finish，不会再跑 init_databases；
+  # 应用库在这里补建，幂等。
+  ensure_pg_databases
   run_migrations
   "$DBDOGCTL" start all || die "服务未全部启动；本次新启动的服务已回滚"
   "$SCRIPTS_DIR/verify.sh"
@@ -101,9 +104,29 @@ EOF
   log "已生成 ${cfg}（默认仅本机访问、default 用户空密码）"
 }
 
+ensure_pg_database() { # <库名>；已存在不动，不存在才建（幂等）
+  local pgbin="$MODULES_DIR/postgresql/current/bin" db="$1" exists
+  if ! exists="$("$pgbin/psql" -h 127.0.0.1 -d postgres -Atqc \
+      "SELECT 1 FROM pg_database WHERE datname = '$db'")"; then
+    die "查询 PG 数据库列表失败；未继续初始化逻辑数据库"
+  fi
+  case "$exists" in
+    1) log "PG 库 $db 已存在" ;;
+    "")
+      "$pgbin/createdb" -h 127.0.0.1 "$db" || die "创建 PG 库 $db 失败"
+      log "已创建 PG 库 $db"
+      ;;
+    *) die "PG 数据库列表返回了意外结果: $exists" ;;
+  esac
+}
+
+ensure_pg_databases() { # 控制面 ctl（server/web）与 benchweb 元数据库：同一个 PG 实例、分库
+  ensure_pg_database ctl
+  ensure_pg_database "$BENCHWEB_PG_DATABASE"
+}
+
 init_databases() {
   local pgbin="$MODULES_DIR/postgresql/current/bin"
-  local ctl_exists
   [ -x "$pgbin/initdb" ] || die "postgresql 模块未安装（先 upgrade.sh postgresql）"
 
   if [ -d "$DATA_DIR/pg" ]; then
@@ -132,18 +155,7 @@ init_databases() {
   "$DBDOGCTL" start postgresql clickhouse \
     || die "数据库未全部启动就绪；未继续创建 ctl/obs，请查看 $LOGS_DIR 下数据库日志"
 
-  if ! ctl_exists="$("$pgbin/psql" -h 127.0.0.1 -d postgres -Atqc \
-      "SELECT 1 FROM pg_database WHERE datname = 'ctl'")"; then
-    die "查询 PG 数据库列表失败；未继续初始化逻辑数据库"
-  fi
-  case "$ctl_exists" in
-    1) log "PG 库 ctl 已存在" ;;
-    "")
-      "$pgbin/createdb" -h 127.0.0.1 ctl || die "创建 PG 库 ctl 失败"
-      log "已创建 PG 库 ctl"
-      ;;
-    *) die "PG 数据库列表返回了意外结果: $ctl_exists" ;;
-  esac
+  ensure_pg_databases
 
   if ! "$MODULES_DIR/clickhouse/current/bin/clickhouse" client --host 127.0.0.1 \
       --query "CREATE DATABASE IF NOT EXISTS obs"; then
@@ -153,8 +165,8 @@ init_databases() {
 }
 
 run_migrations() {
-  # 重跑各应用模块 current 的 pre-switch 钩子（内部即 goose up / drizzle 迁移，幂等）
-  for m in dbdog-server dbdog-web; do
+  # 重跑各应用模块 current 的 pre-switch 钩子（内部即 goose up / drizzle 迁移 / benchweb --init-db，幂等）
+  for m in dbdog-server dbdog-web dbdog-benchweb; do
     local cur="$MODULES_DIR/$m/current"
     [ -L "$cur" ] || die "缺少应用模块 current，无法执行迁移: $m"
     DBDOG_MIGRATION_REQUIRED=1 run_hook "$cur" pre-switch

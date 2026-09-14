@@ -199,7 +199,7 @@ release_identity
 
 STACK_ROLE=0
 AGENT_ROLE=0
-for role_module in postgresql clickhouse dbdog-server dbdog-web dbdog-mcp; do
+for role_module in postgresql clickhouse dbdog-server dbdog-web dbdog-mcp dbdog-benchweb; do
   if [ -e "$MODULES_DIR/$role_module/current" ] || [ -L "$MODULES_DIR/$role_module/current" ]; then
     STACK_ROLE=1
     break
@@ -304,6 +304,7 @@ if [ "$STACK_ROLE" -eq 1 ]; then
   snapshot_log stack.ddsql "$LOGS_DIR/ddsql-server.log"
   snapshot_log stack.web "$LOGS_DIR/dbdog-web.log"
   snapshot_log stack.mcp "$LOGS_DIR/dbdog-mcp.log"
+  snapshot_log stack.benchweb "$LOGS_DIR/dbdog-benchweb.log"
 fi
 if [ "$AGENT_ROLE" -eq 1 ]; then
   snapshot_log agent.core "$AGENT_LOG_DIR/agent.log"
@@ -344,7 +345,7 @@ scan_until=$(epoch_iso "$SCAN_UNTIL_EPOCH")
 scan_from_epoch=$SCAN_FROM_EPOCH
 scan_until_epoch=$SCAN_UNTIL_EPOCH
 host_role=$HOST_ROLE
-stack_coverage=postgresql,clickhouse,dbdog-server,ddsql-server,dbdog-web,dbdog-mcp
+stack_coverage=postgresql,clickhouse,dbdog-server,ddsql-server,dbdog-web,dbdog-mcp,dbdog-benchweb
 agent_coverage=core,trace,process,system-probe
 profiling_coverage=profiling_has_no_independent_process_and_is_covered_by_agent_core_trace_and_backend_evidence
 cursor_status=$CURSOR_STATUS
@@ -385,7 +386,7 @@ collect_modules() {
     [ -n "$module" ] || continue
     [ "$target" = stack ] || continue
     case "$module" in
-      node | goose | postgresql | clickhouse | dbdog-server | dbdog-web | dbdog-mcp) ;;
+      node | goose | postgresql | clickhouse | dbdog-server | dbdog-web | dbdog-mcp | dbdog-benchweb) ;;
       *)
         printf 'module=invalid manifest_entry_rejected=true\n' >>"$RAW_REPORT"
         COLLECTION_COMPLETE=0
@@ -423,7 +424,7 @@ stack_pid() {
 collect_stack_processes() {
   local svc pid name state threads rss
   section "stack service processes"
-  for svc in postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp; do
+  for svc in postgresql clickhouse dbdog-server ddsql-server dbdog-web dbdog-mcp dbdog-benchweb; do
     if pid="$(stack_pid "$svc")"; then
       STACK_RUNNING_COUNT=$((STACK_RUNNING_COUNT + 1))
       name=unavailable; state=unavailable; threads=unavailable; rss=unavailable
@@ -505,6 +506,8 @@ collect_stack_probes() {
       -o /dev/null http://127.0.0.1:3000/login
     run_probe dbdog-mcp curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
       -o /dev/null http://127.0.0.1:8090/healthz
+    run_probe dbdog-benchweb curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+      -o /dev/null http://127.0.0.1:18888/healthz
   else
     printf 'http_probes=unavailable reason=curl_missing\n' >>"$RAW_REPORT"
     COLLECTION_COMPLETE=0
@@ -538,7 +541,7 @@ collect_resources() {
     resource_complete=false
   fi
   if command -v ss >/dev/null 2>&1; then
-    for port in 5432 8123 9000 8080 8770 3000 8090; do
+    for port in 5432 8123 9000 8080 8770 3000 8090 18888; do
       if ss -ltn 2>/dev/null | awk -v wanted="$port" '
           NR > 1 {
             address = $4
@@ -1153,7 +1156,7 @@ if [ "$STACK_ROLE" -eq 1 ]; then
   collect_stack_processes
   collect_stack_probes
   collect_resources
-  if [ "$STACK_RUNNING_COUNT" -eq 6 ] && [ "$STACK_PROBE_OK_COUNT" -eq 6 ]; then
+  if [ "$STACK_RUNNING_COUNT" -eq 7 ] && [ "$STACK_PROBE_OK_COUNT" -eq 7 ]; then
     STACK_HEALTHY=true
   else
     STACK_HEALTHY=false
@@ -1192,8 +1195,8 @@ agent_processed_until_epoch=$AGENT_PROCESSED_UNTIL_EPOCH
 agent_window_complete=$AGENT_WINDOW_COMPLETE
 agent_backlog_pending=$AGENT_BACKLOG_PENDING
 agent_evidence_complete=$AGENT_EVIDENCE_COMPLETE
-stack_services_running=$STACK_RUNNING_COUNT/6
-stack_probes_ok=$STACK_PROBE_OK_COUNT/6
+stack_services_running=$STACK_RUNNING_COUNT/7
+stack_probes_ok=$STACK_PROBE_OK_COUNT/7
 plain_log_files_scanned=$LOG_FILES_SCANNED
 plain_log_bytes_scanned=$LOG_BYTES_SCANNED
 plain_log_rotations_detected=$LOG_ROTATIONS
@@ -1296,10 +1299,10 @@ ISSUE_DIAGNOSTIC_CONTRACT_SHA256="$(issue_safe_hash "$DIAGNOSTIC_CONTRACT_SHA256
   printf 'agent_evidence_complete=%s\nagent_window_complete=%s\nagent_backlog_pending=%s\n' \
     "$AGENT_EVIDENCE_COMPLETE" "$AGENT_WINDOW_COMPLETE" "$AGENT_BACKLOG_PENDING"
   printf 'stack_services_running=%s\nstack_probes_ok=%s\n' \
-    "$STACK_RUNNING_COUNT/6" "$STACK_PROBE_OK_COUNT/6"
+    "$STACK_RUNNING_COUNT/7" "$STACK_PROBE_OK_COUNT/7"
   while IFS=$'\t' read -r module desired installed; do
     case "$module" in
-      node | goose | postgresql | clickhouse | dbdog-server | dbdog-web | dbdog-mcp | dbdog-agent) ;;
+      node | goose | postgresql | clickhouse | dbdog-server | dbdog-web | dbdog-mcp | dbdog-benchweb | dbdog-agent) ;;
       *) continue ;;
     esac
     desired="$(issue_safe_desired_version "$desired")"

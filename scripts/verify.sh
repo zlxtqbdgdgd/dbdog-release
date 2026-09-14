@@ -35,6 +35,7 @@ clear_probe_env() {
   unset DBDOG_INTERNAL_TOKEN DBDOG_OAUTH_JWT_SECRET DBDOG_SERVER_URL
   unset PUBLIC_APP_URL PUBLIC_INGEST_URL PUBLIC_MCP_URL
   unset DBDOG_BASE_URL DBDOG_OAUTH_ISSUER DBDOG_PUBLIC_MCP_URL DBDOG_APP_BASE_URL
+  unset DBDOG_BENCHWEB_ADDR DBDOG_BENCHWEB_META_DSN
 }
 
 env_value() ( # env_value <服务名> <变量名>
@@ -73,7 +74,7 @@ retry_http() { # retry_http <URL> [curl 其他参数...]
 
 probe_env_files() {
   local svc
-  for svc in dbdog-server ddsql-server dbdog-web dbdog-mcp; do
+  for svc in dbdog-server ddsql-server dbdog-web dbdog-mcp dbdog-benchweb; do
     [ -f "$ETC_DIR/$svc.env" ] || return 1
   done
 }
@@ -153,6 +154,25 @@ probe_server_pg_migrations() (
   [ -n "${PG_DSN:-}" ] || return 1
   "$MODULES_DIR/postgresql/current/bin/psql" "$PG_DSN" -v ON_ERROR_STOP=1 \
     -Atc "SELECT to_regclass('public.goose_db_version') IS NOT NULL" | grep -qx 't'
+)
+
+probe_benchweb_postgresql() (
+  clear_probe_env
+  load_env dbdog-benchweb || return 1
+  if [ -z "${DBDOG_BENCHWEB_META_DSN:-}" ] || [[ "$DBDOG_BENCHWEB_META_DSN" = *user:pass* ]]; then
+    return 1
+  fi
+  "$MODULES_DIR/postgresql/current/bin/psql" "$DBDOG_BENCHWEB_META_DSN" -v ON_ERROR_STOP=1 \
+    -Atc "SELECT current_database(), 1" | grep -qx "${BENCHWEB_PG_DATABASE}|1"
+)
+
+probe_benchweb_schema() ( # pre-switch 钩子的 --init-db（服务启动时也会再确保一次）建出来的表
+  clear_probe_env
+  load_env dbdog-benchweb || return 1
+  [ -n "${DBDOG_BENCHWEB_META_DSN:-}" ] || return 1
+  "$MODULES_DIR/postgresql/current/bin/psql" "$DBDOG_BENCHWEB_META_DSN" -v ON_ERROR_STOP=1 \
+    -Atc "SELECT to_regclass('public.testcases') IS NOT NULL AND to_regclass('public.reproduce_runs') IS NOT NULL" \
+    | grep -qx 't'
 )
 
 probe_web_pg_migrations() (
@@ -296,6 +316,14 @@ probe_mcp() (
   retry_http "http://127.0.0.1:${DBDOG_HTTP_PORT:-8090}/healthz"
 )
 
+probe_benchweb() (
+  local addr
+  clear_probe_env
+  load_env dbdog-benchweb || return 1
+  addr="${DBDOG_BENCHWEB_ADDR:-:8080}"
+  retry_http "http://127.0.0.1:${addr##*:}/healthz" -o /dev/null
+)
+
 probe_oauth_discovery() (
   clear_probe_env
   local node web_port mcp_port app_url issuer resource web_metadata resource_metadata challenge
@@ -419,7 +447,7 @@ main() {
   "$SCRIPTS_DIR/dbdogctl" status all
   echo
 
-  check "4 个应用 env 文件存在" probe_env_files
+  check "5 个应用 env 文件存在" probe_env_files
   check "server/web/MCP 内部 token 一致且非占位" probe_shared_internal_token
   check "web/MCP OAuth JWT 一致且非占位" probe_shared_oauth_secret
   check "web 后端与 PUBLIC_* URL 已配置" probe_web_urls
@@ -431,6 +459,8 @@ main() {
   check "web Drizzle 迁移记录已落库" probe_web_pg_migrations
   check "Web OAuth 表结构已迁移" probe_web_oauth_schema
   check "web 至少有一个可登录管理员" probe_web_admin
+  check "benchweb META_DSN 可查询 ${BENCHWEB_PG_DATABASE}" probe_benchweb_postgresql
+  check "benchweb 元数据表已建" probe_benchweb_schema
   check "ClickHouse 可查询目标库" probe_clickhouse
   check "默认租户 PG 蓝图已推进且无错误" probe_tenant_pg_blueprint
   check "默认租户 ClickHouse 核心表已创建" probe_tenant_clickhouse_blueprint
@@ -441,6 +471,7 @@ main() {
   check "dbdog-web /login（仅 HTTP smoke）" probe_web
   check "dbdog-mcp /healthz（仅存活）" probe_mcp
   check "MCP OAuth discovery 与 401 challenge 可用" probe_oauth_discovery
+  check "dbdog-benchweb /healthz（仅存活）" probe_benchweb
 
   finish_checks "基础部署及 OAuth 自动发现链验收通过；agent 仍需业务场景验证"
 }

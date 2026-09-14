@@ -507,7 +507,7 @@ if [ "$#" -eq 0 ]; then
 else
   for requested in "$@"; do
     case "$requested" in
-      dbdog-server) stack_config_requested=1 ;;
+      dbdog-server | dbdog-benchweb) stack_config_requested=1 ;;
       dbdog-web | dbdog-mcp)
         stack_config_requested=1
         oauth_url_migration_requested=1
@@ -563,6 +563,13 @@ else
     for m in "${targets[@]}"; do [ "$m" = dbdog-mcp ] && found=1; done
     [ "$found" -eq 1 ] || targets+=(dbdog-mcp)
   fi
+  if [ "$DBDOG_BENCHWEB_CONFIG_CHANGED" -eq 1 ] \
+    && { [ -e "$MODULES_DIR/dbdog-benchweb/current" ] \
+      || [ -L "$MODULES_DIR/dbdog-benchweb/current" ]; }; then
+    found=0
+    for m in "${targets[@]}"; do [ "$m" = dbdog-benchweb ] && found=1; done
+    [ "$found" -eq 1 ] || targets+=(dbdog-benchweb)
+  fi
   if [ ${#targets[@]} -eq 0 ]; then
     # 没有模块要换，不等于这台机没事：租户蓝图（storage v3 的 CH 表）可能停在某一步失败上，
     # 而那件事版本号看不出来（军规 10）。这条路径要在 exit 前给它一次重试，否则
@@ -591,6 +598,7 @@ server_was_running=0
 ddsql_was_running=0
 web_was_running=0
 mcp_was_running=0
+benchweb_was_running=0
 if [ "$DBDOG_SERVER_CONFIG_CHANGED" -eq 1 ] \
   && "$DBDOGCTL" status dbdog-server | grep -q '运行中'; then
   server_was_running=1
@@ -607,6 +615,10 @@ if [ "$DBDOG_MCP_CONFIG_CHANGED" -eq 1 ] \
   && "$DBDOGCTL" status dbdog-mcp | grep -q '运行中'; then
   mcp_was_running=1
 fi
+if [ "$DBDOG_BENCHWEB_CONFIG_CHANGED" -eq 1 ] \
+  && "$DBDOGCTL" status dbdog-benchweb | grep -q '运行中'; then
+  benchweb_was_running=1
+fi
 log "升级计划: ${targets[*]}"
 for m in "${targets[@]}"; do upgrade_one "$m"; done
 if [ "$server_was_running" -eq 1 ]; then
@@ -620,6 +632,9 @@ if [ "$web_was_running" -eq 1 ]; then
 fi
 if [ "$mcp_was_running" -eq 1 ]; then
   "$DBDOGCTL" restart dbdog-mcp
+fi
+if [ "$benchweb_was_running" -eq 1 ]; then
+  "$DBDOGCTL" restart dbdog-benchweb
 fi
 start_target_services "${targets[@]}"
 if [ "$oauth_upgrade" -eq 1 ]; then
