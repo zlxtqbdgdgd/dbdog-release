@@ -138,12 +138,29 @@ cd ~/dbdog/release
 ```
 
 数据库结构升级已包含在上述流程中，不需要另跑迁移命令。`upgrade.sh` 先按依赖顺序处理基础
-运行时，再升级 server、web 和 MCP；各自的数据库迁移在模块切换前自动执行，失败即停止升级。
+运行时，再升级 server、web、MCP 和 benchweb；各自的数据库迁移在模块切换前自动执行，失败即停止升级。
 迁移文件随模块产物发布并校验完整性。Web/MCP 升级还会自动补齐缺失或空的本机 OAuth/public
 URL，迁移已知旧模板地址，重启受影响的运行中服务，并执行 OAuth 专项验收；已有自定义域名、
 反代地址和真实凭证不覆盖。
 
 缺失模块不会被无参数升级自动安装，需要显式点名，例如 `./scripts/upgrade.sh dbdog-web`。
+
+**给已有的全家桶机加装新模块**（例如 `dbdog-benchweb`，测试用例管理与复现调度）：点名落包后，用首装的
+收尾入口补齐建库、配置、迁移与验收。`--finish` 对已在运行的服务是幂等的。
+
+```bash
+./scripts/upgrade.sh dbdog-benchweb   # 落包并生成 etc/dbdog-benchweb.env（此时仍是模板，不会拉起）
+./scripts/install.sh --finish         # 建库 dbdog_benchweb、校准配置、建表、拉起全部服务并验收
+```
+
+benchweb 监听 `18888`，元数据库是本机 PostgreSQL 的独立库 `dbdog_benchweb`；站点登录用户 `admin`，
+密码首跑随机生成，写在 `~/dbdog/etc/dbdog-benchweb.env` 的 `DBDOG_BENCHWEB_SITE_PASS`。随包带的用例
+种子不会自动导入，需要时（以目录为准覆盖同编号用例）：
+
+```bash
+cd ~/dbdog && set -a && . etc/dbdog-benchweb.env && set +a
+modules/dbdog-benchweb/current/bin/dbdog-benchweb --import-cases modules/dbdog-benchweb/current/cases
+```
 旧版目录首次会因没有 SHA marker 做一次身份校准；之后即使版本号相同，只要 manifest SHA
 改变也会安装新产物。升级保留有效缓存与旧身份目录，但数据库迁移只向前；不要把切软链当成
 完整数据库回滚。破坏性的 `./scripts/reset.sh --yes-i-mean-it` 会删掉 PG/CH 全部数据，只能
