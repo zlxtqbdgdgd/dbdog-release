@@ -52,9 +52,9 @@ while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source
   if [ "$version" = "-" ]; then
     st="未发布"
   elif [ "$inst" = "-" ]; then
-    # 非 stack 的模块都不由 install.sh/upgrade.sh 装：dbhost 走 Agent 自己的安装器，
-    # benchhost（dbdog-benchmark）走压测机上的 docker compose。它们在这台机上"没装"是
-    # 常态，不该提示去跑 upgrade.sh——那条路在 upgrade_one 里本来就 fail closed。
+    # 非 stack 的模块都不由 install.sh/upgrade.sh 装：dbhost 走 Agent 自己的安装器。
+    # 它们在这台机上"没装"是常态，不该提示去跑 upgrade.sh——那条路在 upgrade_one 里
+    # 本来就 fail closed。
     if [ "$target" != "stack" ] && [ "$m" != "dbdog-agent" ]; then
       st="未安装/由专属流程管理"
     else

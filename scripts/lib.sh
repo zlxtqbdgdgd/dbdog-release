@@ -601,7 +601,7 @@ manifest_get() { # manifest_get <module> <列号> [arch]；精确架构优先，
   fi
 }
 
-manifest_module_target() { # manifest_module_target <module> → 该模块登记的 target（stack|dbhost|benchhost），与架构无关
+manifest_module_target() { # manifest_module_target <module> → 该模块登记的 target（stack|dbhost），与架构无关
   # kind/target/service 是模块的属性而不是某一架构行的属性（manifest_all_rows 已校验同模块各行
   # 一致），所以这里不按主机架构选行：--artifact 快升级在 manifest 没有本机架构行的主机上
   #（x86 开发机）也要能回答「这是不是 stack 模块」。
