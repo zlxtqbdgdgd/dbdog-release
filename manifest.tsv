@@ -15,11 +15,11 @@
 dbdog-server	first-party	stack	yes	0.1.30	dbdog-server-0.1.30-aarch64.tar.gz	7cc909f6fcc5789b2741096df0381c025486f0ace65c9f1d266bf5ac4f4c96a3	bc306d2	aarch64
 dbdog-web	first-party	stack	yes	0.1.34	dbdog-web-0.1.34-aarch64.tar.gz	5351a2efa7f598dc4c0ee81e581aaa544e2da209a3106cc09b52d58276609160	b061796	aarch64
 dbdog-mcp	first-party	stack	yes	0.1.25	dbdog-mcp-0.1.25-noarch.tar.gz	899735b8f2cde92e6d7ff7cae3480c5ae990b910c84bbb6709fc386a2361b45d	942cf28	noarch
-dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.3	dbdog-agent-7.83.0-dbdog.3-aarch64.tar.gz	7418aa87d21bbc2c72decda86c83e35f059c828341c478fc6c7bd5210acc09aa	agent:36c8277,core:3cd859f	aarch64
+dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.4	dbdog-agent-7.83.0-dbdog.4-aarch64.tar.gz	05854e8d2e6f163b0e8abd0d47037069057d3bdeaf5f3ccc4623a3c4c62b5681	agent:e9f5b04,core:d21efcb	aarch64
 ddprof	third-party	dbhost	no	-	-	-	-	aarch64
 postgresql	third-party	stack	yes	16.14-dbdog.1	postgresql-16.14-dbdog.1-aarch64.tar.gz	b06dda29e65ad765c6defaff2b4d8e9519dc8569b9a772ad1b38ac155c34184b	-	aarch64
 clickhouse	third-party	stack	yes	26.8.1.184	clickhouse-26.8.1.184-aarch64.tar.gz	fb72234cc32e9f3ea6247511cddb9994b129002f9c05f48fc797f6451e237130	-	aarch64
 node	third-party	stack	no	20.18.1	node-20.18.1-aarch64.tar.gz	fdcb9715f091fe19d58f6e98f0acc27962977e0e28344f2f31189931cb0986c3	-	aarch64
 goose	third-party	stack	no	3.27.3	goose-3.27.3-aarch64.tar.gz	8607989eb322f392521d0a8b5ba9dbaaf2a508d619ca30ffe18c9085d4edffd4	-	aarch64
-dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.3	dbdog-agent-7.83.0-dbdog.3-x86_64.tar.gz	5c04b9db3a713a693ab90f389326720372e6f2395b39b92f4226a75ed0745398	agent:36c8277,core:3cd859f	x86_64
+dbdog-agent	first-party	dbhost	no	7.83.0-dbdog.4	dbdog-agent-7.83.0-dbdog.4-x86_64.tar.gz	82434707ea7c6c84cb6b6915fa3f6416059ec8cbabb080ae211f42352b913c69	agent:e9f5b04,core:d21efcb	x86_64
 dbdog-benchweb	first-party	stack	yes	0.1.0	dbdog-benchweb-0.1.0-aarch64.tar.gz	2efbb64a4748c3a92385922c6f696caad51dbd704ab81057b1eba5ecf75313e3	c41169a	aarch64
