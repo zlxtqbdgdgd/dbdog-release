@@ -1122,7 +1122,10 @@ EOF
 # 渲染语义的权威是 dbdog-agent/dbdog-deploy/conf/conf.d 的三引擎模板（84a58e3 对齐）：
 # 显式项只留 dbm/database_identifier/service/连接五元组/ignore_databases/relations/
 # database_autodiscovery/query_samples.explain_function/collect_column_statistics/
-# collect_activity_metrics/tags，其余采集开关一律用 check 默认值（避免部署漂移）。
+# collect_activity_metrics/tags，外加 2026-09-15 owner 定显式开启的 collect_bloat_metrics/
+# collect_buffercache_metrics（三引擎）与 collect_function_metrics（仅 PostgreSQL）——有意偏离
+# DD 默认，登记在 dbdog-web docs/adr/0002-agent-template-enables-bloat-buffercache-function-metrics.md；
+# 其余采集开关一律用 check 默认值（避免部署漂移）。
 # 引擎在位由检测结果决定：GaussDB 走完整建号链，openGauss/PostgreSQL 凭证只验不建
 #（监控用户由 DBA 按 scripts/agent/init-dbdog-user-*-all-databases.sh 预先准备）。
 agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
@@ -1273,6 +1276,12 @@ EOF
       function_name: dbdog.column_statistics()
     # activity 直发指标(active_queries/transactions.open 等；出厂默认 false)，显式开启。
     collect_activity_metrics: true
+    # 膨胀 / 缓冲区两组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
+    # 登记在 dbdog-web docs/adr/0002）。buffercache 查内核 pg_buffercache_pages()，check 先探测能力再注册。
+    # collect_function_metrics 不开：靶机实测 track_functions = none、pg_stat_user_functions 为空，开了也没数；
+    # 安装器不改库参数，DBA 设成 pl/all 后可自行显式开。
+    collect_bloat_metrics: true
+    collect_buffercache_metrics: true
     # 完成态(已结束语句)采集。check 默认 false，这里显式开启：它是 dbm_type:query_completion
     # 这条流的唯一来源，关着的话流是空的，而空集在诊断语境下会被读成"这台库没有慢 SQL"。
     # 来源是 dbe_perf.statement_history 系统表，不读服务器日志，故与下面 logs stanza 不重叠。
@@ -1354,6 +1363,10 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
+    # 膨胀 / 缓冲区两组显式开启、function 不开（靶机实测 track_functions = none，开了也没数）。
+    # 有意偏离 DD 默认（军规 5，登记在 dbdog-web docs/adr/0002）。
+    collect_bloat_metrics: true
+    collect_buffercache_metrics: true
     # 完成态(已结束语句)采集，同 gaussdb.d：check 默认 false，显式开启。读
     # dbe_perf.statement_history 系统表，与下面 logs stanza 采的服务器日志不是同一份数据。
     statement_history:
@@ -1451,6 +1464,12 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
+    # 函数 / 膨胀 / 缓冲区三组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
+    # 登记在 dbdog-web docs/adr/0002）。function 要库侧 track_functions = pl/all（PG 默认 none）——
+    # 安装器不改库参数，由 DBA 设，不设则这组无数；buffercache 要 pg_buffercache 扩展（perdb SQL 建）。
+    collect_function_metrics: true
+    collect_bloat_metrics: true
+    collect_buffercache_metrics: true
     # 完成态(已结束语句)采集。check 默认 false，这里显式开启。
     # PG 没有服务端执行历史，来源只能是服务器日志：auto_explain(log_format=json) 为每条超过
     # auto_explain.log_min_duration 的执行写一条 plan 记录，本 job 直接 tail 该文件。
