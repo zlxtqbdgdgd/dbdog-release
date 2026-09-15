@@ -1122,10 +1122,11 @@ EOF
 # 渲染语义的权威是 dbdog-agent/dbdog-deploy/conf/conf.d 的三引擎模板（84a58e3 对齐）：
 # 显式项只留 dbm/database_identifier/service/连接五元组/ignore_databases/relations/
 # database_autodiscovery/query_samples.explain_function/collect_column_statistics/
-# collect_activity_metrics/tags，外加 2026-09-15 owner 定显式开启的 collect_bloat_metrics（三引擎）、
-# collect_buffercache_metrics（仅 openGauss/GaussDB）与 collect_function_metrics（仅 PostgreSQL）——有意偏离
-# DD 默认，登记在 dbdog-web docs/adr/0002-agent-template-enables-bloat-buffercache-function-metrics.md；
-# PostgreSQL 的 collect_buffercache_metrics 显式 false（开销，同一篇 ADR）。其余采集开关一律用 check 默认值（避免部署漂移）。
+# collect_activity_metrics/tags，外加 2026-09-15 owner 定显式开启的 collect_bloat_metrics（三引擎）
+# 与 collect_function_metrics（仅 PostgreSQL）——有意偏离 DD 默认，登记在
+# dbdog-web docs/adr/0002-agent-template-enables-bloat-buffercache-function-metrics.md；
+# 三引擎的 collect_buffercache_metrics 都显式 false（逐格扫描开销，同一篇 ADR：PG 定 B、openGauss/GaussDB 定 C）。
+# 其余采集开关一律用 check 默认值（避免部署漂移）。
 # 引擎在位由检测结果决定：GaussDB 走完整建号链，openGauss/PostgreSQL 凭证只验不建
 #（监控用户由 DBA 按 scripts/agent/init-dbdog-user-*-all-databases.sh 预先准备）。
 agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
@@ -1276,12 +1277,14 @@ EOF
       function_name: dbdog.column_statistics()
     # activity 直发指标(active_queries/transactions.open 等；出厂默认 false)，显式开启。
     collect_activity_metrics: true
-    # 膨胀 / 缓冲区两组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
-    # 登记在 dbdog-web docs/adr/0002）。buffercache 查内核 pg_buffercache_pages()，check 先探测能力再注册。
+    # 膨胀组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，登记在 dbdog-web docs/adr/0002）。
     # collect_function_metrics 不开：靶机实测 track_functions = none、pg_stat_user_functions 为空，开了也没数；
     # 安装器不改库参数，DBA 设成 pl/all 后可自行显式开。
     collect_bloat_metrics: true
-    collect_buffercache_metrics: true
+    # 缓冲区逐格组显式关（owner 2026-09-15 定 C，同一篇 ADR）：每轮物化 pg_buffercache_pages() 的每个缓冲格，
+    # 代价随 shared_buffers 线性涨；缓冲池状态由 check 常开的 pagewriter.* / candidate.* 实例级指标给。
+    # 写 false 不省略：生效值不随 check 默认值漂移。
+    collect_buffercache_metrics: false
     # 完成态(已结束语句)采集。check 默认 false，这里显式开启：它是 dbm_type:query_completion
     # 这条流的唯一来源，关着的话流是空的，而空集在诊断语境下会被读成"这台库没有慢 SQL"。
     # 来源是 dbe_perf.statement_history 系统表，不读服务器日志，故与下面 logs stanza 不重叠。
@@ -1363,10 +1366,12 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
-    # 膨胀 / 缓冲区两组显式开启、function 不开（靶机实测 track_functions = none，开了也没数）。
+    # 膨胀组显式开启、function 不开（靶机实测 track_functions = none，开了也没数）。
     # 有意偏离 DD 默认（军规 5，登记在 dbdog-web docs/adr/0002）。
     collect_bloat_metrics: true
-    collect_buffercache_metrics: true
+    # 缓冲区逐格组显式关（owner 2026-09-15 定 C，同 gaussdb.d）：代价随 shared_buffers 线性涨，
+    # 缓冲池状态由 check 常开的 pagewriter.* / candidate.* 实例级指标给；写 false 不省略。
+    collect_buffercache_metrics: false
     # 完成态(已结束语句)采集，同 gaussdb.d：check 默认 false，显式开启。读
     # dbe_perf.statement_history 系统表，与下面 logs stanza 采的服务器日志不是同一份数据。
     statement_history:
