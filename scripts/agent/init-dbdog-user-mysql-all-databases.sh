@@ -150,7 +150,7 @@ quote_ident() { # <identifier>（MySQL 用反引号）
 # 就绪位串：proc|grant。
 #   proc  = 当前库有裸名 explain_statement 过程（information_schema.ROUTINES）
 #   grant = dbdog 有该过程的 EXECUTE（mysql.procs_priv）
-# 拼接必须用 CONCAT()：MySQL 的 || 是逻辑 OR（PG 习惯害人——vm204 E2E 首跑位串退化成
+# 拼接必须用 CONCAT()：MySQL 的 || 是逻辑 OR（PG 习惯害人——vm204 端到端首跑位串退化成
 # 单个 "1"，对不上 "1|1" 全库误报 MISSING，实库对象其实全装好了）。
 readiness_sql() { # <database>
   cat <<EOF

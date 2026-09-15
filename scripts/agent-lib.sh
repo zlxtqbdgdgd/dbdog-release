@@ -862,7 +862,7 @@ agent_detect_mysql() {
       for arg in /proc/net/tcp /proc/net/tcp6; do
         # 列序（vm204 实测核对）：1=sl序号 2=local 3=rem 4=st 5=tx:rx 6=tr:when
         # 7=retransmt 8=uid 9=timeout 10=inode。首版把 st 对到了 tx:rx（永不等于 0A，
-        # 候选恒空）——E2E 实锤后按真实列序钉死。
+        # 候选恒空）——端到端实锤后按真实列序钉死。
         while read -r _ hex_local _rem st _tq _tr _rt _uid _to ino _rest; do
           [ "$st" = 0A ] || continue
           for arg2 in "${inodes[@]}"; do
@@ -895,7 +895,7 @@ agent_detect_mysql() {
     AGENT_MYSQL_PORTS+=("$port")
     # 日志路径两路推导：argv --log-error= 优先；没有则读 --defaults-file= 指向的 my.cnf
     # 里的 log-error（vm204 形态：源码装，日志路径只在配置文件——首版只看 argv 漏采，
-    # E2E 实锤）。只收绝对路径的 .err/.log；推不出留空——软缺口不拦安装（同 PG 口径）。
+    # 端到端实锤）。只收绝对路径的 .err/.log；推不出留空——软缺口不拦安装（同 PG 口径）。
     logpath="$(printf '%s\n' "$cmdline" | awk -F= '$1=="--log-error"{print $2;exit}')"
     if [ -z "$logpath" ]; then
       local defaults_file
@@ -1216,7 +1216,7 @@ EOF
   - dbm: true
     database_identifier:
       # 分隔符用 '-' 不用 ':'（2026-08-06）：':' 是 DD 查询语法的 key/value 分隔符，标识里带它会让
-      # 「按实例过滤」必须整体加引号——round-19 实证：裸写 database_instance:<host>:<port> 的调用
+      # 「按实例过滤」必须整体加引号——实证：裸写 database_instance:<host>:<port> 的调用
       # 104 次、98% 报错，而 skill 教的 service:<engine> 写法 80 次仅 4% 报错。区分同机多实例效果不变。
       # 有意偏离 conf.yaml.example 的 \$env-\$resolved_hostname:\$port 形制，已登记。
       # **首次安装即为横线形**；老机器的冒号形由 upgrade 路径一次性迁移（见 agent_migrate_identifier_separator）。
