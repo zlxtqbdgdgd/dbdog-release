@@ -1122,10 +1122,10 @@ EOF
 # 渲染语义的权威是 dbdog-agent/dbdog-deploy/conf/conf.d 的三引擎模板（84a58e3 对齐）：
 # 显式项只留 dbm/database_identifier/service/连接五元组/ignore_databases/relations/
 # database_autodiscovery/query_samples.explain_function/collect_column_statistics/
-# collect_activity_metrics/tags，外加 2026-09-15 owner 定显式开启的 collect_bloat_metrics/
-# collect_buffercache_metrics（三引擎）与 collect_function_metrics（仅 PostgreSQL）——有意偏离
+# collect_activity_metrics/tags，外加 2026-09-15 owner 定显式开启的 collect_bloat_metrics（三引擎）、
+# collect_buffercache_metrics（仅 openGauss/GaussDB）与 collect_function_metrics（仅 PostgreSQL）——有意偏离
 # DD 默认，登记在 dbdog-web docs/adr/0002-agent-template-enables-bloat-buffercache-function-metrics.md；
-# 其余采集开关一律用 check 默认值（避免部署漂移）。
+# PostgreSQL 的 collect_buffercache_metrics 显式 false（开销，同一篇 ADR）。其余采集开关一律用 check 默认值（避免部署漂移）。
 # 引擎在位由检测结果决定：GaussDB 走完整建号链，openGauss/PostgreSQL 凭证只验不建
 #（监控用户由 DBA 按 scripts/agent/init-dbdog-user-*-all-databases.sh 预先准备）。
 agent_render_checks() { # <conf.d> <gauss_password> <db_user> <gauss_dbname> <env>
@@ -1464,12 +1464,14 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
-    # 函数 / 膨胀 / 缓冲区三组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
+    # 函数 / 膨胀两组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
     # 登记在 dbdog-web docs/adr/0002）。function 要库侧 track_functions = pl/all（PG 默认 none）——
-    # 安装器不改库参数，由 DBA 设，不设则这组无数；buffercache 要 pg_buffercache 扩展（perdb SQL 建）。
+    # 安装器不改库参数，由 DBA 设，不设则这组无数。
     collect_function_metrics: true
     collect_bloat_metrics: true
-    collect_buffercache_metrics: true
+    # 缓冲区组显式关（owner 2026-09-15 定）：每轮全扫 pg_buffercache，格子数 = shared_buffers/8KB，
+    # 16GB 实例单次 2.4–2.6 秒、会撞 5 秒查询超时。写 false 不省略：生效值不随 check 默认值漂移。
+    collect_buffercache_metrics: false
     # 完成态(已结束语句)采集。check 默认 false，这里显式开启。
     # PG 没有服务端执行历史，来源只能是服务器日志：auto_explain(log_format=json) 为每条超过
     # auto_explain.log_min_duration 的执行写一条 plan 记录，本 job 直接 tail 该文件。
