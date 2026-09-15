@@ -118,6 +118,7 @@ agent_clear_engine_facts() {
   AGENT_GAUSSDB_RENDER_PORTS=()
   AGENT_OPENGAUSS_RENDER_PORTS=()
   AGENT_OPENGAUSS_LOG_GLOBS=()
+  AGENT_OPENGAUSS_FFIC_GLOBS=()
   AGENT_OPENGAUSS_RENDER_PASSWORDS=()
   AGENT_PG_PORTS=()
   AGENT_PG_DATA_DIRS=()
@@ -264,6 +265,20 @@ agent_proc_env() { # <pid> <KEY>
   [ -r "$root/$pid/environ" ] || return 1
   tr '\000' '\n' <"$root/$pid/environ" |
     awk -v prefix="$key=" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
+}
+
+agent_opengauss_ffic_glob() { # <pid> <data-dir>：openGauss 崩溃记录（FFIC）文件 glob
+  # 与内核 fatal_err.cpp open_gs_err 同一推导：进程自己的 GAUSSLOG 非空即用，否则相对进程工作
+  # 目录（postmaster 启动即 chdir 到数据目录；读不到 cwd 时退回数据目录）。只看进程环境、不看属主
+  # profile——内核调的是自己的 getenv。ffic_log 目录由内核在第一次崩溃时才 mkdir，glob 暂时落空
+  # 无副作用（tailer 每轮扫描重新求值）。
+  local pid="$1" data="$2" root="${DBDOG_PROC_ROOT:-/proc}" base=""
+  [ -z "$pid" ] || base="$(agent_proc_env "$pid" GAUSSLOG 2>/dev/null || true)"
+  if [ -z "$base" ] && [ -n "$pid" ]; then
+    base="$(readlink "$root/$pid/cwd" 2>/dev/null || true)"
+  fi
+  [ -n "$base" ] || base="$data"
+  printf '%s/ffic_log/ffic_gaussdb-*.log\n' "${base%/}"
 }
 
 agent_merge_path_lists() { # <colon-list>...；保序去重并丢弃隐式当前目录
@@ -1361,6 +1376,28 @@ EOF
       - type: multi_line
         name: new_log_start_with_date
         pattern: '\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])'
+EOF
+    done
+    # 崩溃记录（FFIC）：内核致命信号处理器 gen_err_msg 每次崩溃写一份独立文件，信号、调用栈、
+    # unique SQL id 只在这里。openGauss 是线程模型，线程崩溃带走整个进程，不会像 PostgreSQL 那样
+    # 由 postmaster 在服务器日志里补一行 terminated by signal——不采这份文件，日志面上就只剩重启
+    # 序列（host109-vm203 2026-09-13 实证：崩溃秒的 pg_log 没有任何原因行）。文件头照内核
+    # gen_err_msg 以 "FFIC start time: <epoch>" 开头，按它切多行 = 一次崩溃一条事件。
+    # 放在全部 pg_log 段之后：Agent 打开文件数上限（logs_config.open_files_limit）按 source 顺序
+    # 贪心分配，崩溃文件只写一次，名额不够时让它先让，不许挤掉服务器日志。
+    for glob in ${AGENT_OPENGAUSS_FFIC_GLOBS[@]+"${AGENT_OPENGAUSS_FFIC_GLOBS[@]}"}; do
+      cat >>"$dir/conf.yaml" <<EOF
+  - type: file
+    path: $(agent_yaml_quote "$glob")
+    source: opengauss
+    service: opengauss
+    tags:
+      - $(agent_yaml_quote "env:$env_name")
+      - dbm_source:opengauss_logs
+    log_processing_rules:
+      - type: multi_line
+        name: new_ffic_record
+        pattern: 'FFIC start time:'
 EOF
     done
   fi

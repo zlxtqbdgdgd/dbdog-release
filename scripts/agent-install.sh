@@ -693,7 +693,7 @@ agent_apply_engine_allowlist() {
       opengauss)
         if [ -n "${AGENT_OPENGAUSS_RENDER_PORTS[*]-}" ]; then
           log "引擎白名单 [${DBDOG_ENGINES}]：显式跳过 openGauss 端口 ${AGENT_OPENGAUSS_RENDER_PORTS[*]}（不渲染）"
-          AGENT_OPENGAUSS_RENDER_PORTS=() AGENT_OPENGAUSS_LOG_GLOBS=() AGENT_OPENGAUSS_RENDER_PASSWORDS=()
+          AGENT_OPENGAUSS_RENDER_PORTS=() AGENT_OPENGAUSS_LOG_GLOBS=() AGENT_OPENGAUSS_FFIC_GLOBS=() AGENT_OPENGAUSS_RENDER_PASSWORDS=()
         fi ;;
       gaussdb)
         if [ -n "${AGENT_GAUSSDB_RENDER_PORTS[*]-}" ]; then
@@ -721,6 +721,7 @@ agent_classify_gauss_engines() {
   AGENT_GAUSSDB_RENDER_PORTS=()
   AGENT_OPENGAUSS_RENDER_PORTS=()
   AGENT_OPENGAUSS_LOG_GLOBS=()
+  AGENT_OPENGAUSS_FFIC_GLOBS=()
   count="${#AGENT_GAUSS_PID_PORTS[@]}"
   for ((index=0; index<count; index++)); do
     out="$WORK_DIR/engine-classify.$index.out"
@@ -734,6 +735,9 @@ agent_classify_gauss_engines() {
       # openGauss 单机日志在 $PGDATA/pg_log（GAUSSLOG 常缺省），从数据目录直接推导。
       [ ! -d "${AGENT_GAUSS_PID_DATA_DIRS[$index]}/pg_log" ] || \
         agent_add_unique AGENT_OPENGAUSS_LOG_GLOBS "${AGENT_GAUSS_PID_DATA_DIRS[$index]}/pg_log/postgresql-*.log"
+      # 崩溃记录（FFIC）不看 pg_log 在不在：目录由内核在第一次崩溃时才建。
+      agent_add_unique AGENT_OPENGAUSS_FFIC_GLOBS \
+        "$(agent_opengauss_ffic_glob "${AGENT_GAUSS_PID_SOURCE_PIDS[$index]-}" "${AGENT_GAUSS_PID_DATA_DIRS[$index]}")"
     else
       AGENT_GAUSS_PID_ENGINES+=(gaussdb)
       agent_add_unique AGENT_GAUSSDB_RENDER_PORTS "${AGENT_GAUSS_PID_PORTS[$index]}"
