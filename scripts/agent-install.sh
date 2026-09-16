@@ -248,25 +248,30 @@ latest_failed_agent_config() { # 首装验收失败后复用同一次生成的�
 }
 
 resolve_inputs() {
-  local old_datadog="$AGENT_CONFIG_DIR/datadog.yaml"
+  # 主配置只在 $AGENT_CONFIG_DIR（/etc/dbdog-agent）里找；201/204 上并排的
+  # /etc/datadog-agent/datadog.yaml 是官方对照机，绝不能当收割源。
+  local old_main=""
   local old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
   local old recovery=""
 
   if [ ! -f "$old_gauss" ]; then
     recovery="$(latest_failed_agent_config 2>/dev/null || true)"
     if [ -n "$recovery" ] && [ -f "$recovery/conf.d/gaussdb.d/conf.yaml" ]; then
-      old_datadog="$recovery/datadog.yaml"
       old_gauss="$recovery/conf.d/gaussdb.d/conf.yaml"
+      old_main="$(agent_resolve_main_config "$recovery" 2>/dev/null || true)"
       log "复用上次首装失败目录中的凭证，避免已创建监控用户在重跑时凭证失配: $recovery"
     fi
   fi
+  if [ -z "$old_main" ]; then
+    old_main="$(agent_resolve_main_config "$AGENT_CONFIG_DIR" 2>/dev/null || true)"
+  fi
 
   if [ -z "${DBDOG_SERVER_URL:-}" ]; then
-    old="$(agent_existing_top_scalar "$old_datadog" dd_url 2>/dev/null || true)"
+    old="$(agent_existing_top_scalar "$old_main" dd_url 2>/dev/null || true)"
     [ -z "$old" ] || DBDOG_SERVER_URL="$old"
   fi
   if [ -z "${DBDOG_API_KEY:-}" ]; then
-    old="$(agent_existing_top_scalar "$old_datadog" api_key 2>/dev/null || true)"
+    old="$(agent_existing_top_scalar "$old_main" api_key 2>/dev/null || true)"
     [ -z "$old" ] || DBDOG_API_KEY="$old"
   fi
   if [ -z "${DBDOG_GAUSSDB_MONITOR_PASSWORD:-}" ]; then
@@ -1767,11 +1772,12 @@ render_install_state() {
   CONFIG_STAGE="$(mktemp -d /etc/.dbdog-agent-stage.XXXXXX)"
   UNIT_STAGE="$(mktemp -d /etc/systemd/system/.dbdog-agent-units.XXXXXX)"
   install -d -m 0700 "$CONFIG_STAGE/conf.d"
-  # datadog.yaml 里 additional_checksd 指向它；目录不存在时 Agent 每轮都会抱怨路径缺失。
+  # dbdog.yaml 里 additional_checksd 指向它；目录不存在时 Agent 每轮都会抱怨路径缺失。
   # 之所以必须有这个目录（而不是干脆不设 additional_checksd）：不设就会落回上游编译进
   # 二进制的 /etc/datadog-agent/checks.d，在并排装着官方 Agent 的主机上会读到别人的 check。
+  # （官方对照机配置在 /etc/datadog-agent/，与本目录隔离；渲染只写 $AGENT_CONFIG_DIR。）
   install -d -m 0700 "$CONFIG_STAGE/checks.d"
-  agent_render_datadog_yaml "$CONFIG_STAGE/datadog.yaml" "$DBDOG_SERVER_URL" \
+  agent_render_dbdog_yaml "$CONFIG_STAGE/$AGENT_MAIN_CONFIG_BASENAME" "$DBDOG_SERVER_URL" \
     "$DBDOG_API_KEY" "$DBDOG_AGENT_HOSTNAME" "$RC_ROOT_JSON"
   agent_render_system_probe_yaml "$CONFIG_STAGE/system-probe.yaml"
   # host-only 未走密码生成/收割路径（resolve_inputs 跳过），渲染时以空串传入——

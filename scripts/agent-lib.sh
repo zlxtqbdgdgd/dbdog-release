@@ -4,6 +4,10 @@
 
 AGENT_RUNTIME_DIR="${AGENT_RUNTIME_DIR:-/opt/dbdog-agent}"
 AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
+# 主配置文件名（dbdog fork）。官方对照机在 /etc/datadog-agent/datadog.yaml——
+# 两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
+AGENT_MAIN_CONFIG_BASENAME="${AGENT_MAIN_CONFIG_BASENAME:-dbdog.yaml}"
+AGENT_MAIN_CONFIG_BASENAME_LEGACY="${AGENT_MAIN_CONFIG_BASENAME_LEGACY:-datadog.yaml}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
 # shellcheck disable=SC2034 # 由 source 本文件的 agent-install.sh/check-upgrade.sh 使用。
@@ -178,6 +182,27 @@ agent_yaml_unquote() { # 读取本安装器生成的单/双引号或裸标量
       ;;
     *) printf '%s\n' "$value" ;;
   esac
+}
+
+
+# 在「我们的」配置目录里找主配置：优先新名，回退旧名（升级自愈窗口）。
+# 只接受传入目录下的文件；调用方必须传 $AGENT_CONFIG_DIR 或其失败回滚副本，
+# 绝不要传 /etc/datadog-agent（官方对照机，201/204 上并排存在着）。
+agent_resolve_main_config() { # <config_dir>
+  local dir="$1"
+  case "$dir" in
+    /etc/datadog-agent|/etc/datadog-agent/*)
+      die "拒绝在官方 datadog-agent 目录里解析主配置: $dir（只许动 $AGENT_CONFIG_DIR）" ;;
+  esac
+  if [ -f "$dir/$AGENT_MAIN_CONFIG_BASENAME" ]; then
+    printf '%s\n' "$dir/$AGENT_MAIN_CONFIG_BASENAME"
+    return 0
+  fi
+  if [ -f "$dir/$AGENT_MAIN_CONFIG_BASENAME_LEGACY" ]; then
+    printf '%s\n' "$dir/$AGENT_MAIN_CONFIG_BASENAME_LEGACY"
+    return 0
+  fi
+  return 1
 }
 
 agent_existing_top_scalar() { # <yaml> <key>；只读顶层简单标量
@@ -932,7 +957,7 @@ agent_detect_mysql() {
   done
 }
 
-agent_render_datadog_yaml() { # <文件> <server_url> <api_key> <hostname> <rc_root_json>
+agent_render_dbdog_yaml() { # <文件> <server_url> <api_key> <hostname> <rc_root_json>
   local out="$1" server="$2" api_key="$3" hostname="$4" rc_root="$5" hostport no_ssl
   hostport="$(agent_server_hostport "$server")"
   case "$server" in https://*) no_ssl=false ;; *) no_ssl=true ;; esac
@@ -1636,7 +1661,7 @@ PartOf=dbdog-agent.service
 [Service]
 Type=simple
 User=root
-ExecStart=$AGENT_RUNTIME_DIR/embedded/bin/trace-loader $AGENT_CONFIG_DIR/datadog.yaml $AGENT_RUNTIME_DIR/embedded/bin/trace-agent --config $AGENT_CONFIG_DIR/datadog.yaml --pidfile $AGENT_RUN_DIR/trace-agent.pid
+ExecStart=$AGENT_RUNTIME_DIR/embedded/bin/trace-loader $AGENT_CONFIG_DIR/$AGENT_MAIN_CONFIG_BASENAME $AGENT_RUNTIME_DIR/embedded/bin/trace-agent --config $AGENT_CONFIG_DIR/$AGENT_MAIN_CONFIG_BASENAME --pidfile $AGENT_RUN_DIR/trace-agent.pid
 Restart=always
 RestartSec=10
 UMask=0077
@@ -1656,7 +1681,7 @@ Type=simple
 User=root
 PIDFile=$AGENT_RUN_DIR/process-agent.pid
 ExecStartPre=/usr/bin/timeout 60 /bin/bash -c 'until test -S $AGENT_RUN_DIR/sysprobe.sock; do sleep 1; done'
-ExecStart=$AGENT_RUNTIME_DIR/embedded/bin/process-agent --cfgpath=$AGENT_CONFIG_DIR/datadog.yaml --sysprobe-config=$AGENT_CONFIG_DIR/system-probe.yaml --pid=$AGENT_RUN_DIR/process-agent.pid
+ExecStart=$AGENT_RUNTIME_DIR/embedded/bin/process-agent --cfgpath=$AGENT_CONFIG_DIR/$AGENT_MAIN_CONFIG_BASENAME --sysprobe-config=$AGENT_CONFIG_DIR/system-probe.yaml --pid=$AGENT_RUN_DIR/process-agent.pid
 Restart=on-failure
 RestartSec=10
 AmbientCapabilities=CAP_NET_BIND_SERVICE
