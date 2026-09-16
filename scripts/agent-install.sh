@@ -2535,7 +2535,7 @@ main() {
       IFS='|' read -r drift_tag drift_old drift_new <<<"$drift"
       warn "  ${drift_tag}: ${drift_old}  ->  ${drift_new}"
     done
-    warn "  若这不是你要的：多半是本机脚本副本落后于 main（靶机的 /root/dbdog/release 是非 git 副本），同步后重跑即可改回；已产生的旧 id 数据在 dbdog-server 侧清理"
+    warn "  若这不是你要的：多半是执行的这份脚本落后于 main（手工跑的检出先 git pull；agent 快升级每次随包下发 release origin/main，不会落后），同步后重跑即可改回；已产生的旧 id 数据在 dbdog-server 侧清理"
   fi
   [ -z "$OLD_RUNTIME" ] || log "上一 runtime 回滚副本: $OLD_RUNTIME"
   [ -z "$OLD_CONFIG" ] || log "上一配置回滚副本: $OLD_CONFIG"
