@@ -270,12 +270,88 @@ heal_blueprint_drift() { # 升级收尾自愈：重启一次 dbdog-server 让 Mi
   warn "  判据: SELECT org_id, engine, version, last_error FROM public.org_blueprint_state;"
 }
 
+# ---- 表结构签名（dbm_schema_objects.signature）没对齐到当前算法 ----
+#
+# 签名是 dbdog-server 入库时持久化的派生值，算法一改存量就过期：在采的实例下一轮快照自己重写，
+# **停采实例/库的老行采集永远不会再碰**。对齐由 server 启动期的签名对账做（ReconcileSchemaSignatures：
+# 每行按当前算法重算、对不上才写回；放后台 goroutine，失败只记日志、下次启动重试）——又是一件
+# 「模块版本全对、功能却坏着」的漂移（军规 10）。
+#
+# release 这侧不实现第二份签名算法（军规 3），只探**病症**：同一张表、同一份列结构与引擎身份头，
+# 库里却存着不止一个签名 = 裸名查询把一张表分成了几条。分组键是 DD 契约层面「同一张表」的定义
+# （索引/外键/分区不进签名，DD get_database_schemas 描述原文），不是算法细节：当前算法下同组必同签名，
+# 所以不会误报；以后若把这组之外的字段放回算式，server 的 schema_signature_test（索引/外键/分区不许
+# 改签名）先红，这里的分组键要一起改。
+# 探不到的（明写）：停采行在库里没有同构「孪生行」时，旧签名不形成分裂——这里看不见，用户也看不见分裂。
+schema_signature_drift_rows() { # 只读探测：每个存着表结构的 schema 一行（有分裂才出）
+  local psql="$MODULES_DIR/postgresql/current/bin/psql"
+  local server_env="$ETC_DIR/dbdog-server.env" dsn schemas nsp n
+  [ -x "$psql" ] || return 0
+  [ -f "$server_env" ] && [ ! -L "$server_env" ] || return 0
+  dsn="$(env_literal_value "$server_env" PG_DSN)"
+  case "$dsn" in postgres://* | postgresql://*) ;; *) return 0 ;; esac
+  # 租户 schema 不写死 t_1：凡有带 signature 列的 dbm_schema_objects 的 schema 都探。
+  schemas="$(PGCONNECT_TIMEOUT="${DBDOG_PG_PROBE_TIMEOUT:-3}" "$psql" "$dsn" -X -Atq -v ON_ERROR_STOP=1 \
+    -c "SET statement_timeout = 5000;
+SELECT DISTINCT table_schema FROM information_schema.columns
+ WHERE table_name = 'dbm_schema_objects' AND column_name = 'signature' ORDER BY 1" 2>/dev/null)" || return 0
+  while IFS= read -r nsp; do
+    # 名字要拼进 SQL：只收小写标识符（t_<org> / public），其余一律跳过。
+    case "$nsp" in '' | *[!a-z0-9_]*) continue ;; esac
+    n="$(PGCONNECT_TIMEOUT="${DBDOG_PG_PROBE_TIMEOUT:-3}" "$psql" "$dsn" -X -Atq -v ON_ERROR_STOP=1 \
+      -c "SET statement_timeout = 5000;
+SELECT count(*) FROM (
+  SELECT 1 FROM ${nsp}.dbm_schema_objects
+   GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns
+  HAVING count(DISTINCT signature) > 1) g" 2>/dev/null)" || continue
+    case "$n" in '' | *[!0-9]*) continue ;; esac
+    [ "$n" -gt 0 ] || continue
+    printf '%s 里有 %s 组「同一张表、列结构相同」却存着不止一个签名（dbdog-server 启动期签名对账没做完，裸名查询会把一张表分成几条）\n' "$nsp" "$n"
+  done <<<"$schemas"
+}
+
+wait_schema_signature_drift_clear() { # 最多等 DBDOG_SERVER_HEAL_WAIT 秒（默认 30），输出仍在的分裂项
+  local deadline rows
+  deadline=$(($(date +%s) + ${DBDOG_SERVER_HEAL_WAIT:-30}))
+  rows="$(schema_signature_drift_rows)"
+  while [ -n "$rows" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 2
+    rows="$(schema_signature_drift_rows)"
+  done
+  printf '%s' "$rows"
+}
+
+heal_schema_signature_drift() { # 升级收尾自愈：签名对账没做完就重启一次 dbdog-server 让它重跑
+  local rows ctl
+  [ "${DBDOG_SIGNATURE_HEALED:-0}" = 0 ] || return 0
+  # 对账在 server 里是后台跑的：本次升级刚换过 server 时它可能还在跑，先等它，别白重启一轮。
+  rows="$(wait_schema_signature_drift_clear)"
+  [ -n "$rows" ] || return 0
+  DBDOG_SIGNATURE_HEALED=1
+  ctl="${DBDOGCTL:-$RELEASE_DIR/scripts/dbdogctl}"
+  # 蓝图自愈这一轮已经重启过 server（对账随之重跑过一次）：不再重启第二轮，只报出来要人看。
+  if [ "${DBDOG_BLUEPRINT_HEALED:-0}" = 0 ] && [ -x "$ctl" ]; then
+    log "表结构签名没对齐到当前算法，重启 dbdog-server 让启动期签名对账重跑:"
+    printf '%s\n' "$rows" | while IFS= read -r row; do log "  $row"; done
+    if "$ctl" restart dbdog-server; then
+      rows="$(wait_schema_signature_drift_clear)"
+      if [ -z "$rows" ]; then
+        log "表结构签名已对齐（同一张表不再分成几条）"
+        return 0
+      fi
+    fi
+  fi
+  warn "表结构签名仍未对齐——server 启动期签名对账多半在报错，需要人看 $LOGS_DIR/ 下 server 日志里的「schema 结构签名对账」:"
+  printf '%s\n' "$rows" >&2
+}
+
 pending_stack_config() { # 只读探测：还需升级脚本补齐、且版本号看不出来的漂移项
   # 收的是「装的是最新版本、模块身份全对，功能却坏着」的那类漂移——check-upgrade 只比
   # 版本和产物 SHA，这类项不报出来就没人会去跑升级，最后只能靠人手改 env / 手工 ALTER。
   # 配置类的每一项都是有到期日的脚手架：登记与删除条件见 docs/upgrade-scaffolds.md
-  # （家族军规 10）；租户蓝图那一项是长期机制，同文件「长期机制」一节说明为什么不删。
+  # （家族军规 10）；租户蓝图与表结构签名两项是长期机制，同文件「长期机制」一节说明为什么不删。
   blueprint_drift_rows
+  schema_signature_drift_rows
   local web_env="$ETC_DIR/dbdog-web.env"
   [ -f "$web_env" ] && [ ! -L "$web_env" ] || return 0
   if ! apikey_enc_key_ok "$(env_literal_value "$web_env" DBDOG_APIKEY_ENC_KEY)"; then

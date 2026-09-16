@@ -575,6 +575,7 @@ else
     # 而那件事版本号看不出来（军规 10）。这条路径要在 exit 前给它一次重试，否则
     # check-upgrade 报了待校准、人跑了 upgrade.sh、脚本却直接退出，漂移永远好不了。
     heal_blueprint_drift
+    heal_schema_signature_drift
     log "没有可升级的模块（check-upgrade.sh 可查看详情）"
     exit 0
   fi
@@ -662,4 +663,6 @@ done
 # 服务都拉起来之后再看租户蓝图：本次升级若换了 server，MigrateAll 已经随重启跑过一轮，
 # 这里只兜「跑过还是失败」的残留（重启一次重试，仍失败就报出来要人看）。
 heal_blueprint_drift
+# 表结构签名同理（server 启动期后台对账）；蓝图那一步已重启过 server 就不再重启第二轮。
+heal_schema_signature_drift
 log "全部完成。运行 $DBDOGCTL status all 查看服务状态。"

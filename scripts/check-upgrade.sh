@@ -114,8 +114,9 @@ while IFS=$'\t' read -r m _kind target _service version _artifact sha256 _source
   printf '%-14s %-12s %-12s %s\n' "$m" "$inst" "$version" "$st"
 done < <(manifest_selected_rows "" "$selected_arch")
 
-# 版本与产物 SHA 全对、功能却坏着的那类漂移（军规 10）：env 里缺的密钥，以及租户蓝图
-# （storage v3 的 CH 表）停在某一步失败上。两者都在 pending_stack_config 里探，探到就退 10。
+# 版本与产物 SHA 全对、功能却坏着的那类漂移（军规 10）：env 里缺的密钥、租户蓝图
+# （storage v3 的 CH 表）停在某一步失败上，以及表结构签名没对齐到当前算法（同一张表分成几条）。
+# 都在 pending_stack_config 里探，探到就退 10。
 config_pending=0
 if [ "$(installed_version dbdog-web)" != "-" ] || [ "$(installed_version dbdog-server)" != "-" ]; then
   while IFS= read -r pending_item; do
@@ -127,7 +128,7 @@ fi
 
 echo
 if [ "$config_pending" -eq 1 ] && [ "$updates" -eq 0 ]; then
-  log "模块身份均一致，但存在待校准项。执行: scripts/upgrade.sh（校准配置并重启受影响服务；租户蓝图没推进到位的也在那里重试）"
+  log "模块身份均一致，但存在待校准项。执行: scripts/upgrade.sh（校准配置并重启受影响服务；租户蓝图没推进到位、表结构签名没对齐的也在那里重试）"
   exit 10
 fi
 if [ "$updates" -gt 0 ]; then

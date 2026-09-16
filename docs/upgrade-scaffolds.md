@@ -107,3 +107,16 @@
 | 上机判据 | `head -3 $(gsql -Atc 'SHOW hba_file;')` 前三行正是受管块；`SELECT 1` 用 dbdog 经 127.0.0.1 TCP 收到 MD5 challenge（安装器的最小握手探针 code=5） |
 | 为什么不删 | 只要采集走标准 libpq、GaussDB 默认不是 md5，这条就是每台 GaussDB 主机的接入基础，没有「线上都升过 X 版」这个终点 |
 
+### L3 · 表结构签名（`dbm_schema_objects.signature`）没对齐到当前算法
+
+| 项 | 值 |
+|---|---|
+| 机制归属 | **dbdog-server**，不是本仓。启动期后台 goroutine `ReconcileSchemaSignatures`（`internal/storage/postgres/schema_store.go`，接线在 `cmd/dbdog-server/main.go`）：每行用存着的整份对象按当前 `domain.StructureSignature` 重算，≠ 存量（含空）才写回；只改 signature 一列、不动 updated_at、不删行；content_hash 守卫让扫描后被采集改写的行以采集为准；幂等，每次启动多扫一遍（2026-09-16 luyouxia t_1 826 行、毫秒级） |
+| 触发它的那次变更 | 2026-09-16 server `1404eade`（签名缩到「列结构 + 引擎身份头」，索引/外键/分区移出算式，对齐 DD get_database_schemas 契约）+ `68577751`（本对账）。本条不写生效版本字面量：机制跟着二进制走，不随某一版到期 |
+| 病症 | 签名是入库时持久化的派生值（聚合形要按它走索引）。算法一改：在采的实例/库下一轮快照自己重写；**停采的实例/库的老行采集永远不会再碰、快照对账也删不到**，同一张表在裸名 `get_database_schemas` 里分成两条（旧签名一条、新签名一条）。上线前 t_1 量到 16 组（gaussdb bmsql_* 九张、sbtest1..4；og gs_source/gs_errors/snapshot 横跨 49 个 09-15 起不再上报的库） |
+| 为什么落在 server 启动期而不是 `upgrade.sh` | 算法只有 Go 这一份（军规 3）；shell 侧重算等于抄第二份算法，算法再改一次就两边对不上。server 每次升级都会重启，快升级（dev）也一样走到；判据「存量 ≠ 重算」由算法本身定义，不需要版本常量或清单 |
+| 自愈（升级侧） | `lib.sh: heal_schema_signature_drift`——`upgrade.sh` 收尾（含「没有可升级的模块」早退路径）先等后台对账最多 `DBDOG_SERVER_HEAL_WAIT` 秒（默认 30），仍分裂就重启一次 dbdog-server 让对账重跑；同一次升级里蓝图自愈已重启过 server 的，不叠第二轮，只报出来要人看 |
+| 探测 | `lib.sh: schema_signature_drift_rows` → `pending_stack_config` → `check-upgrade.sh` 打进表格并退 10。只探**病症**：每个有 `dbm_schema_objects.signature` 的 schema 里 `GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1`。分组键是 DD 契约层面「同一张表」的定义，不是算法细节：当前算法下同组必同签名，不会误报；以后若把这组之外的字段放回算式，server `schema_signature_test`（索引/外键/分区不许改签名）先红，这里跟着改。探不到（PG 没起、模块没装、DSN 自定义形态）一律当没漂移 |
+| 上机判据 | `psql "$PG_DSN" -Atqc "SELECT count(*) FROM (SELECT 1 FROM t_1.dbm_schema_objects GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1) g"` 为 0；server 日志有 `schema 结构签名对账完成`（`stale` 首次升级后非零、之后每次启动为 0） |
+| 为什么不删 | 签名只要还是持久化的派生值，下一次改算法（例如 `compatibility` 从表级移到库级，S271 接力点 4）就会再来一遍同样的病症；对账不绑定某一版，删了等于把这个坑留给下次改算法的人 |
+| **它探不到、也不处理什么**（明写） | ① 停采行在库里没有同构「孪生行」时旧签名不形成分裂——探测看不见（用户也看不见分裂），server 对账照样会改；② **停采实例/库的行本身要不要老化**（例如 og 旧实例身份 `-s267`、`opengauss-` 前缀在 09-13 时每张表多列两个实例）——签名对齐后它们并入同一条聚合行、作为多出来的成员挂着，不再分裂，但也不消失。DD 对停报主机的 schema 保留多久，官方文档（Data Collected / Schema Explorer）未写，无证据不删 |
