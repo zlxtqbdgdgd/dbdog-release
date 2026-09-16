@@ -228,8 +228,9 @@ conf 逐实例沿用。不要把明文写进仓库、shell history 或命令参�
 的 `restart_delta`、PID 和当前错误判断。诊断文件均为 root `0600`，位于
 `/var/log/dbdog-agent/install-*.log`。
 
-极慢主机可在 30–600 秒内显式设置 `DBDOG_AGENT_HEALTH_TIMEOUT`（默认 90 秒）；这只延长严格的
-全组件验收，不会把单次 forwarder 202 当作整机健康。`DBDOG_GAUSSDB_ENV_FILE`、
+极慢主机可在 30–600 秒内显式设置 `DBDOG_AGENT_HEALTH_TIMEOUT`（默认 90 秒）；它同时是等 Core 命令
+API 起来（configcheck）与严格全组件验收两段各自的截止时间，只延长「还在起」的等待：Core 退出/重启、
+API 应答报错或报告配置错误照样立刻回滚，也不会把单次 forwarder 202 当作整机健康。`DBDOG_GAUSSDB_ENV_FILE`、
 `DBDOG_GAUSSDB_PGHOST`、`DBDOG_GAUSSDB_LD_LIBRARY_PATH`、`DBDOG_GAUSSDB_PORT`、
 `DBDOG_GAUSSDB_LOG_GLOB`、`DBDOG_GAUSSDB_DEPLOYMENT`、`DBDOG_ENV`、`DBDOG_AGENT_HOSTNAME`
 只用于自动发现无法表达的特殊部署，正常安装不需要。上一套运行时/配置会保留在安装输出给出的

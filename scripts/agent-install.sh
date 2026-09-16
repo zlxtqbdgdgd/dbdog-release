@@ -47,6 +47,9 @@ AGENT_HEALTH_TIMEOUT_SECONDS=90
 AGENT_HEALTH_WAIT_ATTEMPTS=0
 AGENT_HEALTH_WAIT_ELAPSED=0
 AGENT_HEALTH_WAIT_REASON="not-started"
+AGENT_CONFIGCHECK_WAIT_ATTEMPTS=0
+AGENT_CONFIGCHECK_WAIT_ELAPSED=0
+AGENT_CONFIGCHECK_WAIT_REASON="not-started"
 
 usage() {
   cat <<'EOF'
@@ -1854,6 +1857,101 @@ wait_socket() { # <path> <seconds>
   return 1
 }
 
+agent_core_same_generation() { # <all-active snapshot> <scratch snapshot>；Core 仍 active 且仍是快照里那一代进程
+  local active="$1" now="$2" want got
+  systemctl is-active --quiet dbdog-agent.service || return 1
+  capture_agent_unit_snapshot "$now" 0 || return 1
+  want="$(awk -F'\t' '$1 == "dbdog-agent.service" { print; exit }' "$active")"
+  got="$(awk -F'\t' '$1 == "dbdog-agent.service" { print; exit }' "$now")"
+  [ -n "$want" ] && [ "$want" = "$got" ]
+}
+
+# configcheck 取的是运行中 Core 的 CMD API（/agent/config-check），不是离线 YAML parser，
+# 所以它的非零退出混着两类性质相反的失败，必须分开判：
+#   - Agent 还在起：API 还没监听（拨号报 connect: connection refused），或单次调用超时；
+#     且 Core 仍是四单元 all-active 快照里那一代进程（PID/InvocationID/NRestarts 不变）。继续等。
+#   - 真错：API 已应答却报错、CLI 自己读配置/IPC 凭据就失败、Core 退出或重启、应答里带
+#     「=== Configuration errors ===」（这种应答 CLI 照样 exit 0）。立刻失败，交回滚。
+# 等待上限与 readiness 共用 AGENT_HEALTH_TIMEOUT_SECONDS（默认 90，DBDOG_AGENT_HEALTH_TIMEOUT
+# 可调 30–600）：两段等的是同一次 Core 启动，慢主机调大这一个旋钮就该两段一起放宽。
+# 依据：agent.log 中 Core 启动到「Started HTTP server 'CMD API Server'」的秒数，201–204 在
+# 2026-09-07～09-16 共 42 次启动：常态 1–4 s；多台并行部署时 6、12、14 s；09-16 三台并行时
+# 201/202 到 37/42 s 仍未监听，被原先固定的 8 次×(调用+2 s) 重试判死回滚——而两台 VM 的 journal
+# 一直在走，没有冻结；随后逐台重装 2 s 就绪，配置与失败那次逐字节相同（只差 auth_token/ipc_cert/
+# install.json）。原判据在常态约 16 s 就耗尽，连已量到的 14 s 慢启动都只剩边缘余量。
+wait_agent_configcheck() { # <diagnostic output> <wall-clock deadline seconds> <all-active snapshot>
+  local output="$1" limit="$2" active_snapshot="$3" attempt_output now_snapshot
+  local start_seconds elapsed remaining command_timeout rc sleep_seconds verdict
+  attempt_output="$(mktemp "$WORK_DIR/configcheck-attempt.XXXXXX")"
+  now_snapshot="$(mktemp "$WORK_DIR/configcheck-core-generation.XXXXXX")"
+  : >"$output"
+  chmod 0600 "$output"
+  start_seconds=$SECONDS
+  AGENT_CONFIGCHECK_WAIT_ATTEMPTS=0
+  AGENT_CONFIGCHECK_WAIT_ELAPSED=0
+  AGENT_CONFIGCHECK_WAIT_REASON="deadline-exceeded"
+
+  while :; do
+    elapsed=$((SECONDS - start_seconds))
+    [ "$elapsed" -lt "$limit" ] || break
+    remaining=$((limit - elapsed))
+    command_timeout=8
+    [ "$remaining" -ge "$command_timeout" ] || command_timeout="$remaining"
+    AGENT_CONFIGCHECK_WAIT_ATTEMPTS=$((AGENT_CONFIGCHECK_WAIT_ATTEMPTS + 1))
+    : >"$attempt_output"
+    if timeout "$command_timeout" "$AGENT_RUNTIME_DIR/bin/agent/agent" configcheck \
+      -c "$AGENT_CONFIG_DIR" >"$attempt_output" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    elapsed=$((SECONDS - start_seconds))
+    AGENT_CONFIGCHECK_WAIT_ELAPSED="$elapsed"
+    printf '\n===== configcheck attempt %s at %s elapsed=%ss command_timeout=%ss rc=%s =====\n' \
+      "$AGENT_CONFIGCHECK_WAIT_ATTEMPTS" "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+      "$elapsed" "$command_timeout" "$rc" >>"$output"
+    cat "$attempt_output" >>"$output"
+
+    if [ "$rc" -eq 0 ]; then
+      if grep -Eq '^=== Configuration .*errors' "$attempt_output"; then
+        AGENT_CONFIGCHECK_WAIT_REASON="configuration-errors"
+        printf '\nverdict=configuration-errors（API 已应答，Agent 报告了配置错误）\n' >>"$output"
+        return 1
+      fi
+      AGENT_CONFIGCHECK_WAIT_REASON="ready"
+      return 0
+    fi
+    # 先核 Core 代际：进程已退出/重启时 connection refused 是结果不是「还在起」。
+    if ! agent_core_same_generation "$active_snapshot" "$now_snapshot"; then
+      AGENT_CONFIGCHECK_WAIT_REASON="core-exited-or-restarted"
+      printf '\nverdict=core-exited-or-restarted\n' >>"$output"
+      cat "$now_snapshot" >>"$output" 2>/dev/null || true
+      return 1
+    fi
+    if [ "$rc" -eq 124 ]; then
+      verdict="still-starting:command-timeout"
+    elif grep -Fq 'connect: connection refused' "$attempt_output"; then
+      verdict="still-starting:api-not-listening"
+    else
+      AGENT_CONFIGCHECK_WAIT_REASON="configcheck-error:rc=$rc"
+      printf '\nverdict=configcheck-error（Core 仍在同一代运行，但失败不是 API 未监听/超时）\n' >>"$output"
+      return 1
+    fi
+    printf '\nverdict=%s\n' "$verdict" >>"$output"
+
+    elapsed=$((SECONDS - start_seconds))
+    AGENT_CONFIGCHECK_WAIT_ELAPSED="$elapsed"
+    [ "$elapsed" -lt "$limit" ] || break
+    remaining=$((limit - elapsed))
+    sleep_seconds=2
+    [ "$remaining" -ge "$sleep_seconds" ] || sleep_seconds="$remaining"
+    [ "$sleep_seconds" -gt 0 ] || break
+    sleep "$sleep_seconds"
+  done
+  AGENT_CONFIGCHECK_WAIT_ELAPSED=$((SECONDS - start_seconds))
+  return 1
+}
+
 wait_agent_readiness() { # <diagnostic output> <wall-clock deadline seconds>
   local output="$1" limit="$2" attempt_output start_seconds elapsed remaining
   local command_timeout rc sleep_seconds unit
@@ -2214,7 +2312,6 @@ agent_validation_has_known_runtime_error() { # <file>...
 start_and_verify() {
   local unit health_out="$AGENT_LOG_DIR/install-agent-health.log"
   local config_out="$AGENT_LOG_DIR/install-configcheck.log"
-  local config_attempt="$WORK_DIR/configcheck-attempt.out"
   local check_out="$AGENT_LOG_DIR/install-gaussdb-check.log"
   local stability_out="$AGENT_LOG_DIR/install-agent-stability.log"
   local validation_out="$AGENT_LOG_DIR/install-agent-validation.log"
@@ -2238,28 +2335,12 @@ start_and_verify() {
   capture_agent_unit_snapshot "$active_snapshot" 1 || \
     die "无法记录四个 Agent 单元全部 active 后的 PID/NRestarts，本次安装会回滚"
 
-  local ready=0 i
-  # configcheck 通过 Core command API 取配置，不是离线 YAML parser。即使 systemd
-  # 已 active，API 仍可能短暂未监听，所以直接保留有限重试与完整诊断。
-  : >"$config_out"
-  chmod 0600 "$config_out"
-  for ((i=1; i<=8; i++)); do
-    : >"$config_attempt"
-    if timeout 8 "$AGENT_RUNTIME_DIR/bin/agent/agent" configcheck \
-      -c "$AGENT_CONFIG_DIR" >"$config_attempt" 2>&1; then
-      printf '\n===== configcheck attempt %s: success =====\n' "$i" >>"$config_out"
-      cat "$config_attempt" >>"$config_out"
-      ready=1
-      break
-    fi
-    printf '\n===== configcheck attempt %s: failed =====\n' "$i" >>"$config_out"
-    cat "$config_attempt" >>"$config_out"
-    systemctl is-active --quiet dbdog-agent.service || break
-    sleep 2
-  done
-  if [ "$ready" -ne 1 ]; then
+  if ! wait_agent_configcheck "$config_out" "$AGENT_HEALTH_TIMEOUT_SECONDS" "$active_snapshot"; then
     systemctl status dbdog-agent.service --no-pager >>"$config_out" 2>&1 || true
-    die "Agent 配置校验失败；详情留在 ${config_out}，本次安装会回滚"
+    if [ "$AGENT_CONFIGCHECK_WAIT_REASON" = deadline-exceeded ]; then
+      die "Agent Core 进程一直在跑，但 CMD API 未在 ${AGENT_HEALTH_TIMEOUT_SECONDS} 秒内就绪（attempts=${AGENT_CONFIGCHECK_WAIT_ATTEMPTS}, elapsed=${AGENT_CONFIGCHECK_WAIT_ELAPSED}s）；主机确实很慢可设 DBDOG_AGENT_HEALTH_TIMEOUT（30–600）重跑；详情留在 ${config_out}，本次安装会回滚"
+    fi
+    die "Agent 配置校验失败（reason=${AGENT_CONFIGCHECK_WAIT_REASON}, attempts=${AGENT_CONFIGCHECK_WAIT_ATTEMPTS}, elapsed=${AGENT_CONFIGCHECK_WAIT_ELAPSED}s）；详情留在 ${config_out}，本次安装会回滚"
   fi
 
   if ! wait_agent_readiness "$health_out" "$AGENT_HEALTH_TIMEOUT_SECONDS"; then
