@@ -120,3 +120,15 @@
 | 上机判据 | `psql "$PG_DSN" -Atqc "SELECT count(*) FROM (SELECT 1 FROM t_1.dbm_schema_objects GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1) g"` 为 0；server 日志有 `schema 结构签名对账完成`（`stale` 首次升级后非零、之后每次启动为 0） |
 | 为什么不删 | 签名只要还是持久化的派生值，下一次改算法（例如 `compatibility` 从表级移到库级，S271 接力点 4）就会再来一遍同样的病症；对账不绑定某一版，删了等于把这个坑留给下次改算法的人 |
 | **它探不到、也不处理什么**（明写） | ① 停采行在库里没有同构「孪生行」时旧签名不形成分裂——探测看不见（用户也看不见分裂），server 对账照样会改；② **停采实例/库的行本身要不要老化**（例如 og 旧实例身份 `-s267`、`opengauss-` 前缀在 09-13 时每张表多列两个实例）——签名对齐后它们并入同一条聚合行、作为多出来的成员挂着，不再分裂，但也不消失。DD 对停报主机的 schema 保留多久，官方文档（Data Collected / Schema Explorer）未写，无证据不删 |
+
+### L4 · 指标目录镜像（`metric_catalog` 的 `source=embed` 行）留着内嵌目录已删掉的指标
+
+| 项 | 值 |
+|---|---|
+| 机制归属 | **dbdog-server**，不是本仓。启动期 `SyncMetricCatalog`（`internal/storage/clickhouse/metric_catalog.go`，接线 `cmd/dbdog-server/main.go` 的 `buildTelemetry`）：先 upsert 内嵌 metadata.csv 全部行，**插入成功后**算「表里现存 embed 名字 − 本次内嵌目录名字」，非空才发一条 `ALTER TABLE metric_catalog DELETE WHERE source='embed' AND metric_name IN (…)`（异步 mutation）；`source=ingest` 行不动；空集不发 mutation，幂等。引入：server `cba51aee`（2026-09-17） |
+| 病症 | 此前只插不删。ReplacingMergeTree 只按 `(metric_name, source)` 合并版本，某版从内嵌目录删掉的指标没有更新版本去替它，旧行一直留着：`get_dbdog_metric_context` 照样回旧 description / unit / integration，DDSQL 全历史名册也照样列名字。2026-09-16 实例：09-15 从 og 目录删掉的 `opengauss.snapshot.xip_count`、`opengauss.control.checkpoint_delay` 升级后仍被宣称 |
+| 为什么落在 server 启动期而不是 `upgrade.sh` | 「当前内嵌目录有哪些名字」只在二进制里（`go:embed`），shell 侧要判就得抄一份名单（军规 3）；server 每次升级（含快升级）都会重启，同步随启动跑，不需要版本常量或清单 |
+| 自愈（升级侧） | 无额外步骤：`upgrade.sh` 升级 dbdog-server 后的重启即触发。同步失败只记 `metric_catalog 同步失败` Warn、读侧降级 embed CSV（旧行照旧），下次启动重算 |
+| 探测 | 不进 `pending_stack_config`：栈机 shell 拿不到内嵌目录名单（同上）。server 日志 `metric_catalog 删除内嵌目录已不再声明的指标行`（带条数与样例）说明这次启动删过 |
+| 上机判据 | 升级后对已知删掉的名字查：`SELECT count() FROM obs_t_1.metric_catalog WHERE source='embed' AND metric_name IN ('opengauss.snapshot.xip_count','opengauss.control.checkpoint_delay')` 为 0（mutation 异步，给几秒）；`get_dbdog_metric_context` 对这些名字 description 为空、无 unit_name |
+| 为什么不删 | 以后任何一版再从目录删指标，都是同一个病症；判据是集合差、不绑定某一版，删了等于把坑留给下一次删指标的人 |
