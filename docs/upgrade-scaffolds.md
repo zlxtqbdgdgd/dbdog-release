@@ -77,6 +77,19 @@
 | 上机判据 | `[ -f /etc/dbdog-agent/dbdog.yaml ] && [ ! -f /etc/dbdog-agent/datadog.yaml ]`；官方对照机 `[ -f /etc/datadog-agent/datadog.yaml ]` 仍在（201/204） |
 | 删除清单 | ① `AGENT_MAIN_CONFIG_BASENAME_LEGACY` 与 `agent_resolve_main_config` 的旧名回退分支；② 本脚手架行。**不删**：`AGENT_MAIN_CONFIG_BASENAME=dbdog.yaml`、渲染/unit 新路径 |
 
+### S5 · Watchdog 事件存量 `event_status` 落成 `info`、`priority` 为空
+<!-- scaffold id=S5 module=dbdog-server introduced=b706f03 -->
+
+| 项 | 值 |
+|---|---|
+| 引入 | 2026-09-17。机制与步骤都在 **dbdog-server**（写路径 `internal/discovery/sink` 按 story 状态算 DD alert 类事件的 status / priority，蓝图 `migrations/blueprint/ch/0043_watchdog_events_alert_status_priority.sql.tmpl`），本仓只登记。`introduced` 取登记时本仓 main 头：生效版本 = 其后第一次 `publish: dbdog-server@…`，前提同 S2（那次发布已含 server `dab88f9b` 起的改动） |
+| 病症 | 升级前的 server 把 story 状态（ongoing / resolved / expired）当监控器判定态换 `event_status`，三个词都不认识、一律落 `info`，`priority` 不写。新写路径 ongoing 落 `error`、收尾落 `ok`、priority 恒 `"3"`；不搬的话同一条 story 新旧事件在 `status:` 查询与 events 内层里分进 info / error 两个桶，直到 events 表 TTL 过期 |
+| 谁中招 | 生效版本之前产过 watchdog 发现（`event_type = 'anomaly_finding'`）的每个租户库；之后首装的环境没有存量 |
+| 自愈 | 不在本仓：dbdog-server 启动期 `tenancy.Provisioner.MigrateAll` 推进蓝图 ch/0043——一条 `ALTER … UPDATE … SETTINGS mutations_sync = 2`，只命中 `anomaly_finding` 且 `event_status = 'info'` 或 `priority = ''` 的行（新写路径不产这两种值），重跑收敛。`upgrade.sh` 升级 server 后的重启即触发 |
+| 探测 | 不另加 `pending_stack_config` 项：步骤失败写 `org_blueprint_state.last_error`，已由 L1 的 `blueprint_drift_rows` 报出；步骤成功则 ch 版本 ≥ 43，版本号看得出来 |
+| 上机判据 | ① `psql "$PG_DSN" -Atqc "SELECT org_id, version, last_error FROM public.org_blueprint_state WHERE engine = 'ch' ORDER BY org_id"` 每行 version ≥ 43 且 last_error 为空；② 每个租户库 `SELECT count() FROM obs_t_<org>.events WHERE event_type = 'anomaly_finding' AND (event_status = 'info' OR priority = '')` 为 0 |
+| 删除清单 | ① 蓝图步骤不能删文件（版本号要连续，同 S2）：把 `0043_…sql.tmpl` 的 UPDATE 换成以 `{{ .CHDatabase }}.events` 限定的零命中只读语句；② server `internal/discovery/sink/sink_test.go` 里读该文件核对赋值表的那段。**写路径按 story 状态算 status / priority 不删**——那是长期语义 |
+
 
 ## 长期机制（不是脚手架，永不到期，故不写在册表那行机器可读的登记元数据）
 
