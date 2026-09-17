@@ -19,7 +19,7 @@
 # 与 PG/openGauss 版同名脚本同形;引擎差异只在:gsql、无扩展位(readiness 四位)、
 # canonical explain 入口在 public、用户 schema 黑名单最长(Kernel 507 实测系统 schema
 # 44 个:dbe_* 29 个 + pkg_*/prvt_ilm/resource_manager/sys/cstore/snapshot/sqladvisor/
-# db4ai/blockchain 等)。
+# db4ai/blockchain 等)、库兼容模式 M 另走一套(见 database_mode 上方注释)。
 #
 # 本仓是这个脚本的唯一 owning path：agent-install.sh 把它与同目录的 per-db SQL 一起装到
 # DB 主机的 /opt/dbdog-agent/scripts/，控制台「采集配置」页按该绝对路径直接给出可执行命令
@@ -133,6 +133,40 @@ run_sql() { # <database> <sql>
   "${gsql_base[@]}" -d "$1" -A -t -v ON_ERROR_STOP=1 -c "$2"
 }
 
+# 库兼容模式从库本身量(pg_database.datcompatibility)，不按库名猜；量不到就当普通库走原路径，
+# 让原路径自己的查询报出连接/目录错误。DB_MODE 是「当前正在处理的库」的模式，主流程每库设一次。
+#
+# M 兼容库的内核事实(host109-vm202 GaussDB Kernel 507.0.0，2026-09-18 01:17–01:20 CST，
+# 实例属主 gsql 逐条执行 perdb.sql 与本脚本的每条语句，库 loopfix_compat_m)：
+#   * perdb.sql 第一条 DO 块报 `DO is not supported`，ON_ERROR_STOP 下整个文件停在那里(rc=3)；
+#   * DROP/CREATE FUNCTION 一律报 `CREATE/DROP FUNCTION is not supported outside of upgrade mode
+#     or not initial user`(实例初始用户执行也报)——explain 入口与列统计函数在 M 库里装不上，
+#     随后的 REVOKE/GRANT ON FUNCTION 没有对象可指(语法错)；
+#   * 内核允许的只有:CREATE SCHEMA IF NOT EXISTS(重复执行只 NOTICE，幂等)、两条 GRANT USAGE；
+#   * `||` 是逻辑或(readiness_sql 返回 t/f 而不是位串)，拼位串用 CONCAT；
+#   * 双引号是字符串:`ALTER ROLE ... IN DATABASE "库"` 语法错，库名要反引号(search_path 的值双引号照收)；
+#   * `ALTER ROLE ... IN DATABASE ... RESET search_path` 语法错，`SET search_path TO DEFAULT` 可用，
+#     且连同内核随 SET 一起写入的 current_schema 一并清掉；
+#   * `DROP SCHEMA ... CASCADE` 语法错；不带 CASCADE 的 DROP SCHEMA 本身就连带删表。
+# 所以 M 库只做 schema + 授权 + search_path，函数类跳过并明说「内核不支持」，验收也按这个预期。
+DB_MODE=""
+M_FUNCTIONS_UNSUPPORTED="explain plans and column statistics are unavailable in this database: GaussDB rejects CREATE FUNCTION in DBCOMPATIBILITY 'M' databases (CREATE/DROP FUNCTION is not supported outside of upgrade mode or not initial user)"
+
+database_mode() { # <database>；设 DB_MODE
+  local mode
+  if mode=$(run_sql "$1" "SELECT datcompatibility FROM pg_catalog.pg_database WHERE datname = current_database();"); then
+    DB_MODE=${mode//$'\r'/}
+  else
+    DB_MODE=""
+  fi
+}
+
+# M 库标识符用反引号；名字里带反引号的转义写法没实测过，直接拒绝，不猜。
+m_quote_ident() { # <identifier>
+  [[ "$1" != *'`'* ]] || { echo "M_IDENTIFIER_UNSUPPORTED name=$1 (backtick in an M-compatibility identifier)" >&2; return 1; }
+  printf '`%s`' "$1"
+}
+
 # 清理类动作的确认门：交互问一句；无 tty 且没给 --yes 时拒绝执行(fail closed)。
 confirm() { # <prompt>
   local answer
@@ -208,9 +242,13 @@ set_search_path() { # <database>
   done
   (( ${#final[@]} > 0 )) || { echo "SEARCH_PATH_SKIP database=$database (no schemas)" >&2; return 0; }
   joined="$(IFS=,; echo "${final[*]}")"
+  local db_ident="\"${database}\""
+  if [[ "$DB_MODE" == M ]]; then
+    db_ident=$(m_quote_ident "$database") || { echo "SEARCH_PATH_FAILED database=$database" >&2; return 1; }
+  fi
   # run_sql 失败必须立刻冒出来:本函数常在 &&/|| 链里被调(set -e 失效),若继续走到
   # echo,其退出码会把失败洗白(2026-08-19 实锤,三引擎同修)。
-  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" SET search_path TO ${joined};" || {
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE ${db_ident} SET search_path TO ${joined};" || {
     echo "SEARCH_PATH_FAILED database=$database" >&2
     return 1
   }
@@ -250,13 +288,43 @@ SELECT
 SQL
 )
 
-# 位串拆解：核心三位置 1 = 已配置；第四位是 search_path(缺它只补，不弹清理确认)。
+# M 库位串：schema|usage(监控角色对 dbdog schema 有 USAGE)|search_path。没有函数位——
+# 函数在 M 库里建不出来，不是「缺了待补」。CONCAT 在 A/B/C/PG/M 五种库上实测同为位串。
+readiness_sql_m=$(cat <<'SQL'
+SELECT CONCAT(
+  CASE WHEN EXISTS (
+    SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'dbdog'
+  ) THEN 1 ELSE 0 END, '|',
+  CASE WHEN EXISTS (
+    SELECT 1 FROM pg_catalog.pg_namespace n
+    WHERE n.nspname = 'dbdog' AND pg_catalog.has_schema_privilege('dbdog', n.oid, 'USAGE')
+  ) THEN 1 ELSE 0 END, '|',
+  CASE WHEN EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_db_role_setting s
+    JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase
+    JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
+    WHERE d.datname = current_database() AND r.rolname = 'dbdog'
+      AND array_to_string(s.setconfig, ',', '') LIKE '%search_path=%'
+  ) THEN 1 ELSE 0 END);
+SQL
+)
+
+# 位串拆解：核心位置 1 = 已配置(普通库三位、M 库两位)；最后一位是 search_path(缺它只补，不弹清理确认)。
 readiness_bits() { # <database>
-  run_sql "$1" "$readiness_sql"
+  if [[ "$DB_MODE" == M ]]; then
+    run_sql "$1" "$readiness_sql_m"
+  else
+    run_sql "$1" "$readiness_sql"
+  fi
 }
 
 core_configured() { # <bits>
-  [[ "$1" == 1\|1\|1\|* ]]
+  if [[ "$DB_MODE" == M ]]; then
+    [[ "$1" == 1\|1\|* ]]
+  else
+    [[ "$1" == 1\|1\|1\|* ]]
+  fi
 }
 
 searchpath_set() { # <bits>
@@ -264,23 +332,45 @@ searchpath_set() { # <bits>
 }
 
 verify_database() { # <database>
-  local database=$1 bits
+  local database=$1 bits expected="1|1|1|1" legend="schema|explain|colstats|search_path"
+  if [[ "$DB_MODE" == M ]]; then
+    expected="1|1|1"
+    legend="schema|usage|search_path"
+  fi
   if ! bits=$(readiness_bits "$database"); then
     echo "VERIFY_FAILED database=$database (connection or catalog query failed)" >&2
     return 1
   fi
   bits=${bits//$'\r'/}
-  if [[ "$bits" != "1|1|1|1" ]]; then
-    echo "MISSING database=$database bits=$bits (schema|explain|colstats|search_path)" >&2
+  if [[ "$bits" != "$expected" ]]; then
+    echo "MISSING database=$database bits=$bits ($legend)" >&2
     return 1
   fi
   echo "READY database=$database"
+  if [[ "$DB_MODE" == M ]]; then
+    echo "FUNCTIONS_UNSUPPORTED database=$database datcompatibility=M: $M_FUNCTIONS_UNSUPPORTED"
+  fi
+}
+
+# M 库只执行 perdb.sql 里内核允许的那部分：schema(CREATE SCHEMA 换成 M 上实测幂等的 IF NOT EXISTS，
+# 原文的 DO 护栏 M 不许)与两条 USAGE 授权(与 perdb.sql 同文)；函数类整段跳过并明说。
+configure_m_database() { # <database>
+  local database=$1 statement
+  for statement in \
+    "CREATE SCHEMA IF NOT EXISTS dbdog;" \
+    "GRANT USAGE ON SCHEMA dbdog TO dbdog;" \
+    "GRANT USAGE ON SCHEMA public TO dbdog;"; do
+    run_sql "$database" "$statement" || { echo "APPLY_FAILED database=$database ($statement)" >&2; return 1; }
+  done
+  echo "SKIP_FUNCTIONS database=$database datcompatibility=M: explain entry and column statistics functions not created ($M_FUNCTIONS_UNSUPPORTED)"
 }
 
 configure_database() { # <database>
   local database=$1
   echo "CONFIGURE database=$database"
-  if ! "${gsql_base[@]}" -d "$database" -v ON_ERROR_STOP=1 -f "$PERDB_SQL"; then
+  if [[ "$DB_MODE" == M ]]; then
+    configure_m_database "$database" || return 1
+  elif ! "${gsql_base[@]}" -d "$database" -v ON_ERROR_STOP=1 -f "$PERDB_SQL"; then
     echo "APPLY_FAILED database=$database" >&2
     return 1
   fi
@@ -293,6 +383,10 @@ configure_database() { # <database>
 cleanup_database() { # <database>
   local database=$1
   echo "CLEANUP database=$database"
+  if [[ "$DB_MODE" == M ]]; then
+    cleanup_m_database "$database"
+    return
+  fi
   run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE \"${database}\" RESET search_path;" \
     || { echo "CLEANUP_FAILED database=$database (reset search_path)" >&2; return 1; }
   run_sql "$database" "DROP SCHEMA IF EXISTS dbdog CASCADE;" \
@@ -307,12 +401,30 @@ cleanup_database() { # <database>
   verify_clean_database "$database"
 }
 
+# M 库的对称清理：configure 在 M 库只加了 schema、授权与 search_path，就只收这三样；函数从来没建出来，
+# 没有 DROP FUNCTION 可发(M 上 DROP FUNCTION IF EXISTS 同样被内核拒绝)。
+cleanup_m_database() { # <database>
+  local database=$1 db_ident
+  db_ident=$(m_quote_ident "$database") || { echo "CLEANUP_FAILED database=$database (reset search_path)" >&2; return 1; }
+  run_sql "$database" "ALTER ROLE ${MONITOR_ROLE} IN DATABASE ${db_ident} SET search_path TO DEFAULT;" \
+    || { echo "CLEANUP_FAILED database=$database (reset search_path)" >&2; return 1; }
+  run_sql "$database" "DROP SCHEMA IF EXISTS dbdog;" \
+    || { echo "CLEANUP_FAILED database=$database (drop schema)" >&2; return 1; }
+  run_sql "$database" "REVOKE USAGE ON SCHEMA public FROM ${MONITOR_ROLE};" \
+    || { echo "CLEANUP_FAILED database=$database (revoke public usage)" >&2; return 1; }
+  verify_clean_database "$database"
+}
+
 verify_clean_database() { # <database>
-  local database=$1 bits
+  local database=$1 bits expected="0|0|0|0" legend="schema|explain|colstats|search_path"
+  if [[ "$DB_MODE" == M ]]; then
+    expected="0|0|0"
+    legend="schema|usage|search_path"
+  fi
   bits=$(readiness_bits "$database") || { echo "VERIFY_FAILED database=$database" >&2; return 1; }
   bits=${bits//$'\r'/}
-  if [[ "$bits" != "0|0|0|0" ]]; then
-    echo "CLEAN_VERIFY_UNEXPECTED database=$database bits=$bits (schema|explain|colstats|search_path)" >&2
+  if [[ "$bits" != "$expected" ]]; then
+    echo "CLEAN_VERIFY_UNEXPECTED database=$database bits=$bits ($legend)" >&2
     return 1
   fi
   echo "CLEANED database=$database"
@@ -356,6 +468,7 @@ if [[ "$want_cleanup" == true ]]; then
   echo "(dbdog schema + public explain entry + granted public USAGE + search_path setting; the dbdog login role is kept)"
   confirm "Remove monitoring collection from these databases?" || { echo "aborted; nothing changed" >&2; exit 1; }
   for database in "${databases[@]}"; do
+    database_mode "$database"
     cleanup_database "$database" || failures=$((failures + 1))
   done
   if ((failures > 0)); then
@@ -367,6 +480,7 @@ if [[ "$want_cleanup" == true ]]; then
 fi
 
 for database in "${databases[@]}"; do
+  database_mode "$database"
   bits=$(readiness_bits "$database") || { echo "READINESS_FAILED database=$database" >&2; failures=$((failures + 1)); continue; }
   bits=${bits//$'\r'/}
   if ! core_configured "$bits"; then
