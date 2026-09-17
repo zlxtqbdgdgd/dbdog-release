@@ -59,6 +59,58 @@ agent_known_runtime_error_pattern() {
   printf '%s\n' 'Function age\(xid32\) does not exist|operator does not exist:[[:space:]]*text[[:space:]]*=[[:space:]]*record|GaussDB query scope failed:.*category=(undefined-function|programming-error|database-error)([[:space:]]|$)|error:query-scope-(undefined-function|programming-error|database-error)([[:space:],]|$)|Unable to collect statement metrics due to an error|job:database-metadata[^]]*\][[:space:]]+Job loop (database error|crash)|database-metadata.*Job loop (database error|crash)|panic: runtime error: index out of range \[65536\] with length 28672|preventSegmentMajorPageFault'
 }
 
+# 已知运行错误的「签名」：同一个错误两次出现之间不变的那部分，用来认出验收窗里的命中是不是
+# 升级前旧版本就在报的同一个错误。规则只看日志行自己的结构，不看是哪条错误：
+#   1. 从已知错误模式在行内最左的命中处取到行尾。命中处之前是日志信封——journal 时间/主机/pid、
+#      agent 自己的时间与级别、源码位置 file:line、check 实例 id——换进程、换版本、换配置都会变
+#      （202 上同一条 scope 失败在三个版本里分别出自 gaussdb.py:1083/1098/1101，check id 两种）；
+#   2. 剩下部分里的时刻（日期时间）、内存地址（0x…）抹成占位；
+#   3. key=value 里记「这一次发生」的量——进程/线程/连接/会话号、次数、计数、耗时、长度、字节——
+#      抹成占位；记「是哪个错误」的字段（scope、sqlstate、error_type、category、query_sha256、
+#      版本……）原样留下。
+# 输入每一行都必须命中已知错误模式（调用方先 grep 过），输出与输入逐行对应。
+agent_known_runtime_error_signatures() {
+  local pattern
+  pattern="$(agent_known_runtime_error_pattern)"
+  LC_ALL=C grep -oEi -- "(${pattern}).*" | LC_ALL=C sed -E \
+    -e 's/[[:space:]]+/ /g' \
+    -e 's/ $//' \
+    -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.,][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?/<time>/g' \
+    -e 's/0[xX][0-9a-fA-F]+/0x<addr>/g' \
+    -e 's/goroutine [0-9]+/goroutine <n>/g' \
+    -e 's/(^|[ ,;({])((pid|tid|thread|thread_id|goroutine|conn|connection|conn_id|connection_id|session_id|attempt|attempts|retry|retries|count|elapsed|duration|took|latency)|[A-Za-z0-9_]*_(pid|tid|count|length|len|bytes|ms|us|ns|sec|secs|seconds|elapsed|duration|latency|attempts|retries))(=|: ?)[^ ,;)}]+/\1\2\5<n>/g' \
+    -e 's/ $//'
+}
+
+# 已知错误命中行 → 按签名聚合：签名<TAB>次数<TAB>首次出现<TAB>末次出现（按首次出现排序）。
+# 出现时刻取行内第一个日期时间（journal 或 agent.log 自己的时间戳），没有就记 -。
+agent_known_runtime_error_aggregate() {
+  local hits rc=0
+  hits="$(mktemp "${TMPDIR:-/tmp}/dbdog-agent-known-error.XXXXXX")" || return 1
+  cat >"$hits" || rc=1
+  if [ "$rc" -eq 0 ] && [ -s "$hits" ]; then
+    paste \
+      <(LC_ALL=C awk '{
+          if (match($0, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+            print substr($0, RSTART, RLENGTH)
+          } else {
+            print "-"
+          }
+        }' "$hits") \
+      <(agent_known_runtime_error_signatures <"$hits" | tr '\t' ' ') \
+      | LC_ALL=C awk -F'\t' -v OFS='\t' '
+          NF >= 2 && $2 != "" {
+            if (!($2 in count)) { order[++n] = $2; first[$2] = $1 }
+            count[$2]++
+            last[$2] = $1
+          }
+          END { for (i = 1; i <= n; i++) print order[i], count[order[i]], first[order[i]], last[order[i]] }' \
+      || rc=1
+  fi
+  rm -f -- "$hits"
+  return "$rc"
+}
+
 agent_sha256_file() { # <文件>
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{ print $1 }'

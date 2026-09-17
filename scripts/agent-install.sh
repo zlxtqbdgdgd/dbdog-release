@@ -28,6 +28,8 @@ HAD_CONFIG=0
 PREVIOUS_ACTIVE_UNITS=""
 PREVIOUS_ENABLED_UNITS=""
 INSTALLER_CONTRACT_SHA256=""
+# 停服前取到的「旧版本本次运行期间已在报的已知错误」签名表；空 = 没有基线（全新安装/取不到）。
+AGENT_KNOWN_ERROR_BASELINE=""
 # GaussDB 受管 HBA 规则的事务记录（按 gauss 进程索引）：写入后本次安装任何失败退出都按备份
 # 恢复并 reload——写 gs_hba 是替 DBA 做的事，装不成就得把它还原成 DBA 交给我们时的样子。
 AGENT_HBA_TOUCHED_INDEXES=()
@@ -1809,6 +1811,8 @@ cutover() {
     systemctl is-enabled --quiet "$unit" && PREVIOUS_ENABLED_UNITS="$PREVIOUS_ENABLED_UNITS $unit" || true
   done
 
+  # 必须在停服之前：停服之后「当前在跑的旧版本」就没了，InvocationID 也跟着失效。
+  capture_agent_known_error_baseline "$WORK_DIR/agent-known-error-baseline.tsv"
   MUTATION_STARTED=1
   stop_private_units || die "无法完全停止旧 dbdog-agent 私有服务，拒绝切换文件"
   if [ "$RUNTIME_CHANGED" -eq 1 ]; then
@@ -2303,10 +2307,138 @@ append_agent_validation_logs() { # <start epoch> <agent.log cursor> <output>
   append_agent_log_from_cursor "$log_cursor" "$output"
 }
 
-agent_validation_has_known_runtime_error() { # <file>...
-  local pattern
+# ---- 已知错误基线：升级前旧版本就在报的，不算本次升级引入的回归 -------------------------------
+# 验收判死的本意是抓新版本引入的回归。旧版本运行期间就在报的同一个错误（例：B 兼容库上逐库
+# 采集的 42809，issue #11）回滚也消不掉——回滚到一个同样在报它的旧版本，不会比留在新版本好。
+# 所以停服之前记下「当前在跑的旧版本」这一次运行以来命中已知错误模式的签名；验收窗里的命中
+# 签名全在其中就降为警告，有一个不在就照旧判死。
+# 窗口只认旧版本这一次运行，不看整机历史：更老版本报过、旧版本已修好的错误，新版本又冒出来
+# 就是真回归。「这一次运行」按进程身份划，不拿时钟推：
+#   - journal：各 unit 当前的 InvocationID（systemd 每次启动、包括自动重启都会换新）；
+#   - agent.log：轮转族按修改时间从旧到新排，最后一行 Core 启动日志之后的内容。
+# 两路都取不到（全新安装、旧服务没在跑、日志缺失）就不设基线，判定与以前完全一致。
+readonly AGENT_CORE_START_MARKER='| Starting Datadog Agent v'
+
+agent_unit_current_invocation() { # <unit> → 当前在跑这次运行的 InvocationID；没在跑/取不到返回 1
+  local unit="$1" state invocation
+  systemctl is-active --quiet "$unit" || return 1
+  state="$(systemctl show "$unit" --no-pager -p InvocationID)" || return 1
+  invocation="$(awk -F= '$1 == "InvocationID" { print $2; exit }' <<<"$state")"
+  case "$invocation" in '' | *[!0-9A-Fa-f-]*) return 1 ;; esac
+  printf '%s\n' "$invocation"
+}
+
+agent_log_family_oldest_first() { # <日志目录> → agent.log 及其轮转文件，按修改时间从旧到新
+  local dir="$1" name
+  [ -d "$dir" ] || return 0
+  while IFS= read -r name; do
+    [ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || continue
+    printf '%s\n' "$dir/$name"
+  done < <(cd "$dir" && ls -1tr -- agent.log agent.log.* 2>/dev/null)
+}
+
+agent_log_last_core_start() { # <日志目录> → 文件<TAB>行号：最后一行 Core 启动日志；没有返回 1
+  local dir="$1" file line_no found=""
+  while IFS= read -r file; do
+    line_no="$(LC_ALL=C grep -nF -- "$AGENT_CORE_START_MARKER" "$file" 2>/dev/null | tail -n 1 | cut -d: -f1)" || true
+    [ -z "$line_no" ] || found="${file}"$'\t'"${line_no}"
+  done < <(agent_log_family_oldest_first "$dir")
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
+}
+
+agent_log_since_core_start() { # <日志目录> <文件> <行号> → 该启动行之后的全部 agent.log 内容（从旧到新）
+  local dir="$1" start_file="$2" start_line="$3" file started=0
+  while IFS= read -r file; do
+    if [ "$started" -eq 1 ]; then
+      cat -- "$file"
+    elif [ "$file" = "$start_file" ]; then
+      started=1
+      tail -n "+$((start_line + 1))" -- "$file"
+    fi
+  done < <(agent_log_family_oldest_first "$dir")
+}
+
+capture_agent_known_error_baseline() { # <输出>；停服之前调用，取到时设置 AGENT_KNOWN_ERROR_BASELINE
+  local output="$1" pattern hits unit invocation start start_file start_line sources="" count
+  AGENT_KNOWN_ERROR_BASELINE=""
   pattern="$(agent_known_runtime_error_pattern)"
-  grep -Eqi "$pattern" "$@"
+  hits="$(mktemp "${WORK_DIR:-${TMPDIR:-/tmp}}/agent-known-error-baseline-hits.XXXXXX")" || return 0
+  for unit in "${AGENT_UNITS[@]}"; do
+    invocation="$(agent_unit_current_invocation "$unit")" || continue
+    command -v journalctl >/dev/null 2>&1 || break
+    sources="${sources} journal:${unit}"
+    journalctl -q --no-pager -o short-iso "_SYSTEMD_UNIT=${unit}" "_SYSTEMD_INVOCATION_ID=${invocation}" 2>/dev/null \
+      | LC_ALL=C grep -Ei -- "$pattern" >>"$hits" || true
+  done
+  # agent.log 由 Core 写：Core 没在跑时残留的 agent.log 属于已经不在的进程，不能当基线。
+  if agent_unit_current_invocation dbdog-agent.service >/dev/null \
+    && start="$(agent_log_last_core_start "$AGENT_LOG_DIR")"; then
+    IFS=$'\t' read -r start_file start_line <<<"$start"
+    sources="${sources} agent.log(${start_file##*/}:${start_line} 之后)"
+    agent_log_since_core_start "$AGENT_LOG_DIR" "$start_file" "$start_line" \
+      | LC_ALL=C grep -Ei -- "$pattern" >>"$hits" || true
+  fi
+  if [ -z "$sources" ]; then
+    rm -f -- "$hits"
+    log "没有在跑的旧 Agent 可取已知错误基线（全新安装或旧服务未运行）；验收按原判据执行"
+    return 0
+  fi
+  if ! agent_known_runtime_error_aggregate <"$hits" >"$output"; then
+    rm -f -- "$hits" "$output"
+    warn "旧 Agent 已知错误基线汇总失败；验收按原判据执行"
+    return 0
+  fi
+  rm -f -- "$hits"
+  chmod 0600 "$output" 2>/dev/null || true
+  AGENT_KNOWN_ERROR_BASELINE="$output"
+  count="$(awk 'END { print NR + 0 }' "$output")"
+  log "已记录停服前旧 Agent 本次运行的已知错误基线：${count} 个签名（来源:${sources}）"
+}
+
+agent_validation_has_known_runtime_error() { # <check 输出> <验收日志差量>；返回 0 = 须判死
+  # 有基线时，比对结果追加到最后一个参数（验收日志）里；没有基线时判定与引入基线之前逐字节一致。
+  local pattern validation_out current classified new_count baseline_count
+  local sig count first last base_count base_first base_last kind
+  pattern="$(agent_known_runtime_error_pattern)"
+  grep -Eqi "$pattern" "$@" || return 1
+  if [ -z "${AGENT_KNOWN_ERROR_BASELINE:-}" ] || [ ! -f "$AGENT_KNOWN_ERROR_BASELINE" ]; then
+    return 0
+  fi
+  validation_out="${!#}"
+  current="$(mktemp "${WORK_DIR:-${TMPDIR:-/tmp}}/agent-known-error-current.XXXXXX")" || return 0
+  classified="${current}.classified"
+  if ! LC_ALL=C grep -Ehi -- "$pattern" "$@" | agent_known_runtime_error_aggregate >"$current"; then
+    rm -f -- "$current"
+    return 0
+  fi
+  # 行：new|baseline<TAB>签名<TAB>验收窗次数<TAB>首次<TAB>末次<TAB>旧版本次数<TAB>旧版本首次<TAB>旧版本末次
+  LC_ALL=C awk -F'\t' -v OFS='\t' '
+    NR == FNR { base[$1] = $2 OFS $3 OFS $4; next }
+    { if ($1 in base) print "baseline", $1, $2, $3, $4, base[$1]; else print "new", $1, $2, $3, $4, "-", "-", "-" }
+  ' "$AGENT_KNOWN_ERROR_BASELINE" "$current" >"$classified"
+  new_count="$(awk -F'\t' '$1 == "new" { n++ } END { print n + 0 }' "$classified")"
+  baseline_count="$(awk -F'\t' '$1 == "baseline" { n++ } END { print n + 0 }' "$classified")"
+  {
+    printf '\n===== known runtime errors vs pre-upgrade baseline =====\n'
+    printf 'baseline_signatures=%s new_signatures=%s baseline_hit_signatures=%s\n' \
+      "$(awk 'END { print NR + 0 }' "$AGENT_KNOWN_ERROR_BASELINE")" "$new_count" "$baseline_count"
+    while IFS=$'\t' read -r kind sig count first last base_count base_first base_last; do
+      printf '%s\tvalidation_count=%s first=%s last=%s\tbefore_upgrade_count=%s first=%s last=%s\t%s\n' \
+        "$kind" "$count" "$first" "$last" "$base_count" "$base_first" "$base_last" "$sig"
+    done <"$classified"
+  } >>"$validation_out"
+  if [ "$new_count" -gt 0 ]; then
+    warn "验收窗里有 ${new_count} 个已知错误签名在升级前旧版本本次运行期间没有出现过（新版本引入，判死）："
+    awk -F'\t' '$1 == "new" { print "  [验收窗 " $3 " 次] " substr($2, 1, 300) }' "$classified" \
+      | agent_redact_diagnostic_stream >&2
+  else
+    warn "验收窗命中的 ${baseline_count} 个已知错误签名在升级前旧版本本次运行期间已在报，按基线噪声记录、不回滚（比对明细在 ${validation_out}）："
+    awk -F'\t' '$1 == "baseline" { print "  [验收窗 " $3 " 次；旧版本 " $6 " 次，" $7 " ~ " $8 "] " substr($2, 1, 300) }' "$classified" \
+      | agent_redact_diagnostic_stream >&2
+  fi
+  rm -f -- "$current" "$classified"
+  [ "$new_count" -gt 0 ]
 }
 
 start_and_verify() {
