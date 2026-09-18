@@ -8,8 +8,8 @@
 -- 每个被监控库还要各跑一遍 init-dbdog-user-mysql-perdb.sql(all-databases.sh 代劳)。
 -- 与 PG 版差异(军规 8:引擎各立)：
 --   * MySQL 无角色体系：监控读权限 = GRANT SELECT/PROCESS/REPLICATION CLIENT；
---   * explain 与 consumers 开关是存储过程，集中放 dbdog 库（dbdog 命名，check 出厂默认是
---     datadog.*；出货模板已配三个 query_samples override 对齐）；
+--   * explain 与 consumers 开关是存储过程，集中放 dbdog 库（出货模板已配三个
+--     query_samples override 指向 dbdog.*）；
 --   * 密码无 psql -v 等价物：占位符 + sed（凭证只经 stdin 管道）。
 -- 采集固定走 127.0.0.1 TCP：账号只建 'dbdog'@'127.0.0.1'；不显式指定认证插件
 -- （8.0 默认 caching_sha2_password，pymysql+ cryptography 可连；8.4 起 mysql_native_password

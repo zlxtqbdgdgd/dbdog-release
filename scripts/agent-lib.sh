@@ -4,7 +4,8 @@
 
 AGENT_RUNTIME_DIR="${AGENT_RUNTIME_DIR:-/opt/dbdog-agent}"
 AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
-# 主配置文件名。同机可能另装有 datadog-agent（/etc/datadog-agent）——两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
+# 主配置文件名。同机可能另装有 datadog-agent（/etc/datadog-agent）——两目录隔离；
+# 下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
 AGENT_MAIN_CONFIG_BASENAME="${AGENT_MAIN_CONFIG_BASENAME:-dbdog.yaml}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
@@ -1341,8 +1342,7 @@ EOF
         - template1
         - templatea
         - templatem
-    # 列统计(pg_stats 投影)。检查项的出厂默认指向 datadog.column_statistics()；dbdog 命名下必须显式
-    # 指向，否则报 schema "datadog" does not exist（2026-08-05 x86-gaussdb-73 实证）。
+    # 列统计(pg_stats 投影)。显式钉到 perdb.sql 建的 dbdog.column_statistics()，不依赖 check 默认值。
     collect_column_statistics:
       enabled: true
       function_name: dbdog.column_statistics()
@@ -1512,7 +1512,7 @@ EOF
     port: $port
     username: $(agent_yaml_quote "$username")
     password: $(agent_yaml_quote "${AGENT_PG_RENDER_PASSWORDS[$cred_i]}")
-    # explain 函数走 dbdog 命名(2026-07-24 hard-cut；检查项出厂默认是 datadog.explain_statement)
+    # explain 函数显式钉到 perdb.sql 建的 dbdog.explain_statement，不依赖 check 默认值。
     query_samples:
       explain_function: dbdog.explain_statement
     # 主连接库。其余采集开关一律用 check 默认值，模板不显式配置（避免部署漂移）。

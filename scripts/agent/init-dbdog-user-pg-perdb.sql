@@ -8,8 +8,7 @@
 --   直接 -f 执行不会配置 search_path。
 -- 配套:postgres.d/conf.yaml 须设 username: dbdog、
 --   query_samples.explain_function: dbdog.explain_statement 与
---   collect_column_statistics.function_name: dbdog.column_statistics()
---   (两项的出厂默认值都是 datadog.*)。
+--   collect_column_statistics.function_name: dbdog.column_statistics()。
 
 -- 扩展是库内对象,每库各建一份(与 schema/函数同理)。
 -- pg_buffercache 对应 collect_buffercache_metrics(出货模板默认 true):缺它时
