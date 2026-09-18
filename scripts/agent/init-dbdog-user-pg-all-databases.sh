@@ -144,11 +144,11 @@ confirm() { # <prompt>
 }
 
 # 用户自建 schema 发现：黑名单按引擎各立(实测三引擎系统 schema 清单差异大，军规 8)。
-# PG 侧系统/监控自带：pg_* 前缀、information_schema、public、dbdog、datadog。
+# PG 侧系统/监控自带：pg_* 前缀、information_schema、public、dbdog。
 user_schemas() { # <database>
   run_sql "$1" "SELECT nspname FROM pg_catalog.pg_namespace
 WHERE nspname !~ '^pg_'
-  AND nspname NOT IN ('information_schema','public','dbdog','datadog')
+  AND nspname NOT IN ('information_schema','public','dbdog')
 ORDER BY nspname;"
 }
 

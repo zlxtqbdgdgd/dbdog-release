@@ -189,7 +189,7 @@ user_schemas() { # <database>
 WHERE nspname !~ '^pg_'
   AND nspname !~ '^dbe_'
   AND nspname !~ '^pkg_'
-  AND nspname NOT IN ('information_schema','public','dbdog','datadog','cstore','db4ai',
+  AND nspname NOT IN ('information_schema','public','dbdog','cstore','db4ai',
                       'blockchain','coverage','snapshot','sqladvisor','xmltype',
                       'prvt_ilm','resource_manager','sys')
 ORDER BY nspname;"
