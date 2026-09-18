@@ -4,10 +4,8 @@
 
 AGENT_RUNTIME_DIR="${AGENT_RUNTIME_DIR:-/opt/dbdog-agent}"
 AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
-# 主配置文件名（旧名 datadog.yaml 只在升级自愈窗口里回退读取）。同机可能另装有 datadog-agent
-# （/etc/datadog-agent）——两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
+# 主配置文件名。同机可能另装有 datadog-agent（/etc/datadog-agent）——两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
 AGENT_MAIN_CONFIG_BASENAME="${AGENT_MAIN_CONFIG_BASENAME:-dbdog.yaml}"
-AGENT_MAIN_CONFIG_BASENAME_LEGACY="${AGENT_MAIN_CONFIG_BASENAME_LEGACY:-datadog.yaml}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-$AGENT_RUNTIME_DIR/run}"
 # shellcheck disable=SC2034 # 由 source 本文件的 agent-install.sh/check-upgrade.sh 使用。
@@ -237,7 +235,7 @@ agent_yaml_unquote() { # 读取本安装器生成的单/双引号或裸标量
 }
 
 
-# 在「我们的」配置目录里找主配置：优先新名，回退旧名（升级自愈窗口）。
+# 在「我们的」配置目录里找主配置。
 # 只接受传入目录下的文件；调用方必须传 $AGENT_CONFIG_DIR 或其失败回滚副本，
 # 绝不要传 /etc/datadog-agent（同机另装的 datadog-agent，现场确有主机并排装着）。
 agent_resolve_main_config() { # <config_dir>
@@ -248,10 +246,6 @@ agent_resolve_main_config() { # <config_dir>
   esac
   if [ -f "$dir/$AGENT_MAIN_CONFIG_BASENAME" ]; then
     printf '%s\n' "$dir/$AGENT_MAIN_CONFIG_BASENAME"
-    return 0
-  fi
-  if [ -f "$dir/$AGENT_MAIN_CONFIG_BASENAME_LEGACY" ]; then
-    printf '%s\n' "$dir/$AGENT_MAIN_CONFIG_BASENAME_LEGACY"
     return 0
   fi
   return 1

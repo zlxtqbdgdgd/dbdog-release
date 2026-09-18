@@ -64,19 +64,6 @@
 | 删除清单 | ① agent-install.sh 的 `AGENT_GAUSS_DBM_HEAL_PROBE_SQL`、`agent_heal_gauss_dbm_objects` 和 main 里那行接线；② 两份 perdb.sql 里两条 `DROP FUNCTION IF EXISTS …(l_query text, OUT explain json)`（BEGIN/COMMIT 和新形态保留）；③ 两份 all-databases.sh cleanup 里的旧签名 DROP。**不删的**：就绪判断里的 proargmodes 条件和 diagnose 点名。DBA 随时可能打开这个选项，它们是长期语义 |
 
 
-### S4 · dbdog-agent 主配置文件名 `datadog.yaml` → `dbdog.yaml`
-<!-- scaffold id=S4 module=dbdog-agent introduced=PENDING -->
-
-| 项 | 值 |
-|---|---|
-| 引入 | 2026-09-16；release 本提交自愈 + agent 改 `configName`。`introduced` 在合入后改成本仓该提交 hash；生效版本 = 其后第一次 `publish: dbdog-agent@…` |
-| 病症 | 目录早已是 `/etc/dbdog-agent`，主配置仍叫旧名 `datadog.yaml`；控制台与运维看到半改名。改名后旧二进制找旧名、新二进制找新名 |
-| 谁中招 | 生效版本之前装过的所有 DB 主机；同机另装的 datadog-agent（`/etc/datadog-agent/datadog.yaml`）**不在范围**（目录隔离） |
-| 自愈 | `agent-install.sh`：`resolve_inputs` 经 `agent_resolve_main_config` 在 **`$AGENT_CONFIG_DIR` 内** 优先读 `dbdog.yaml`、回退 `datadog.yaml` 收割凭证；`render_install_state` 写出 `dbdog.yaml`；cutover 整树替换配置目录。探测拒绝传入 `/etc/datadog-agent` |
-| 探测 | 不进栈机 `pending_stack_config`：DB 主机上看 `[ -f /etc/dbdog-agent/datadog.yaml ] && [ ! -f /etc/dbdog-agent/dbdog.yaml ]`。安装器合约指纹会因脚本变更强制重跑升级 |
-| 上机判据 | `[ -f /etc/dbdog-agent/dbdog.yaml ] && [ ! -f /etc/dbdog-agent/datadog.yaml ]`；同机另装的 datadog-agent 若有，`[ -f /etc/datadog-agent/datadog.yaml ]` 原样仍在 |
-| 删除清单 | ① `AGENT_MAIN_CONFIG_BASENAME_LEGACY` 与 `agent_resolve_main_config` 的旧名回退分支；② 本脚手架行。**不删**：`AGENT_MAIN_CONFIG_BASENAME=dbdog.yaml`、渲染/unit 新路径 |
-
 ### S5 · Watchdog 事件存量 `event_status` 落成 `info`、`priority` 为空
 <!-- scaffold id=S5 module=dbdog-server introduced=b706f03 -->
 
