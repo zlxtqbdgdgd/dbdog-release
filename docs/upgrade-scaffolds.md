@@ -45,7 +45,7 @@
 | 引入 | 2026-09-13，loop S305。机制与步骤都在 **dbdog-server**（读路径只认脱敏列、写路径按样本子类分列、蓝图 `migrations/blueprint/ch/0037_dbm_statement_dictionary_obfuscated_column.sql.tmpl`），本仓只登记。`introduced` 取登记时本仓 main 头：生效版本 = 其后第一次 `publish: dbdog-server@…`，**前提是那次发布已含上述 server 改动**——若 server 改动合入之前已有一次 server 发布，把 `introduced` 改成合入之后的本仓 HEAD |
 | 病症 | 升级前的 server 把「计划不可能（no_plans_possible）而被丢弃计划」的 plan 事件正文（agent 已脱敏）写进 `dbm_query_statements.raw_statement`、`statement` 留空；新读路径为了永不回出原文只读 `statement`，这批签名在 `get_dbdog_database_query_statement` 上会变成 found:false，直到同签名的新 plan 事件重写或行按表 TTL 过期 |
 | 谁中招 | 生效版本之前摄入过 DBM 样本的每个租户库；生效版本之后首装的环境没有存量 |
-| 自愈 | 不在本仓：dbdog-server 启动期 `tenancy.Provisioner.MigrateAll` 推进蓝图 ch/0037——两条 `ALTER … UPDATE … SETTINGS mutations_sync = 2`，只搬 **tags 里没有 `raw_query_statement` 键** 的行（该 tag 与 rqt/rqp 原文事件由同一 agent 开关、同一上游提交引入，带它的行分不清来源，一行不动），重跑收敛。`upgrade.sh` 升级 server 后的重启即触发 |
+| 自愈 | 不在本仓：dbdog-server 启动期 `tenancy.Provisioner.MigrateAll` 推进蓝图 ch/0037——两条 `ALTER … UPDATE … SETTINGS mutations_sync = 2`，只搬 **tags 里没有 `raw_query_statement` 键** 的行（该 tag 与 rqt/rqp 原文事件由同一 agent 开关、同一次提交引入，带它的行分不清来源，一行不动），重跑收敛。`upgrade.sh` 升级 server 后的重启即触发 |
 | 探测 | 不另加 `pending_stack_config` 项：步骤失败写 `org_blueprint_state.last_error`，已由 L1 的 `blueprint_drift_rows` 报出；步骤成功则 ch 版本 ≥ 37，版本号看得出来 |
 | 上机判据 | ① `psql "$PG_DSN" -Atqc "SELECT org_id, version, last_error FROM public.org_blueprint_state WHERE engine = 'ch' ORDER BY org_id"` 每行 version ≥ 37 且 last_error 为空；② 每个租户库 `SELECT count() FROM obs_t_<org>.dbm_query_statements WHERE statement = '' AND raw_statement != '' AND NOT mapContains(tags, 'raw_query_statement')` 为 0 |
 | 删除清单 | ① 蓝图步骤**不能删文件**（`tenancy.ParseFS` 要求版本号连续，删了新租户推进会断档）：把 `0037_…sql.tmpl` 的两条 UPDATE 换成一条以 `{{ .CHDatabase }}.dbm_query_statements` 限定的零命中只读语句（`TestRealBlueprintParsesAndRenders` 要求 CH 语句带租户库前缀；该替换写法没在真 CH 上验过）；② server `internal/storage/clickhouse/statement_dictionary_live_test.go` 里「存量自愈」那一段连同 `dictHealStepName`。**读路径只认脱敏列、写路径按子类分列不删**——那是长期语义，不是脚手架 |
@@ -69,12 +69,12 @@
 
 | 项 | 值 |
 |---|---|
-| 引入 | 2026-09-16；release 本提交自愈 + agent fork 改 `configName`。`introduced` 在合入后改成本仓该提交 hash；生效版本 = 其后第一次 `publish: dbdog-agent@…` |
-| 病症 | 目录早已是 `/etc/dbdog-agent`，主配置仍叫上游的 `datadog.yaml`；控制台与运维看到半改名。改名后旧二进制找旧名、新二进制找新名 |
-| 谁中招 | 生效版本之前装过的所有 DB 主机；201/204 上并排的 **官方** `/etc/datadog-agent/datadog.yaml` **不在范围**（目录隔离） |
+| 引入 | 2026-09-16；release 本提交自愈 + agent 改 `configName`。`introduced` 在合入后改成本仓该提交 hash；生效版本 = 其后第一次 `publish: dbdog-agent@…` |
+| 病症 | 目录早已是 `/etc/dbdog-agent`，主配置仍叫旧名 `datadog.yaml`；控制台与运维看到半改名。改名后旧二进制找旧名、新二进制找新名 |
+| 谁中招 | 生效版本之前装过的所有 DB 主机；同机另装的 datadog-agent（`/etc/datadog-agent/datadog.yaml`）**不在范围**（目录隔离） |
 | 自愈 | `agent-install.sh`：`resolve_inputs` 经 `agent_resolve_main_config` 在 **`$AGENT_CONFIG_DIR` 内** 优先读 `dbdog.yaml`、回退 `datadog.yaml` 收割凭证；`render_install_state` 写出 `dbdog.yaml`；cutover 整树替换配置目录。探测拒绝传入 `/etc/datadog-agent` |
 | 探测 | 不进栈机 `pending_stack_config`：DB 主机上看 `[ -f /etc/dbdog-agent/datadog.yaml ] && [ ! -f /etc/dbdog-agent/dbdog.yaml ]`。安装器合约指纹会因脚本变更强制重跑升级 |
-| 上机判据 | `[ -f /etc/dbdog-agent/dbdog.yaml ] && [ ! -f /etc/dbdog-agent/datadog.yaml ]`；官方对照机 `[ -f /etc/datadog-agent/datadog.yaml ]` 仍在（201/204） |
+| 上机判据 | `[ -f /etc/dbdog-agent/dbdog.yaml ] && [ ! -f /etc/dbdog-agent/datadog.yaml ]`；同机另装的 datadog-agent 若有，`[ -f /etc/datadog-agent/datadog.yaml ]` 原样仍在 |
 | 删除清单 | ① `AGENT_MAIN_CONFIG_BASENAME_LEGACY` 与 `agent_resolve_main_config` 的旧名回退分支；② 本脚手架行。**不删**：`AGENT_MAIN_CONFIG_BASENAME=dbdog.yaml`、渲染/unit 新路径 |
 
 ### S5 · Watchdog 事件存量 `event_status` 落成 `info`、`priority` 为空
@@ -129,10 +129,10 @@
 | 病症 | 签名是入库时持久化的派生值（聚合形要按它走索引）。算法一改：在采的实例/库下一轮快照自己重写；**停采的实例/库的老行采集永远不会再碰、快照对账也删不到**，同一张表在裸名 `get_database_schemas` 里分成两条（旧签名一条、新签名一条）。上线前 t_1 量到 16 组（gaussdb bmsql_* 九张、sbtest1..4；og gs_source/gs_errors/snapshot 横跨 49 个 09-15 起不再上报的库） |
 | 为什么落在 server 启动期而不是 `upgrade.sh` | 算法只有 Go 这一份（军规 3）；shell 侧重算等于抄第二份算法，算法再改一次就两边对不上。server 每次升级都会重启，快升级（dev）也一样走到；判据「存量 ≠ 重算」由算法本身定义，不需要版本常量或清单 |
 | 自愈（升级侧） | `lib.sh: heal_schema_signature_drift`——`upgrade.sh` 收尾（含「没有可升级的模块」早退路径）先等后台对账最多 `DBDOG_SERVER_HEAL_WAIT` 秒（默认 30），仍分裂就重启一次 dbdog-server 让对账重跑；同一次升级里蓝图自愈已重启过 server 的，不叠第二轮，只报出来要人看 |
-| 探测 | `lib.sh: schema_signature_drift_rows` → `pending_stack_config` → `check-upgrade.sh` 打进表格并退 10。只探**病症**：每个有 `dbm_schema_objects.signature` 的 schema 里 `GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1`。分组键是 DD 契约层面「同一张表」的定义，不是算法细节：当前算法下同组必同签名，不会误报；以后若把这组之外的字段放回算式，server `schema_signature_test`（索引/外键/分区不许改签名）先红，这里跟着改。探不到（PG 没起、模块没装、DSN 自定义形态）一律当没漂移 |
+| 探测 | `lib.sh: schema_signature_drift_rows` → `pending_stack_config` → `check-upgrade.sh` 打进表格并退 10。只探**病症**：每个有 `dbm_schema_objects.signature` 的 schema 里 `GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1`。分组键是产品契约层面「同一张表」的定义，不是算法细节：当前算法下同组必同签名，不会误报；以后若把这组之外的字段放回算式，server `schema_signature_test`（索引/外键/分区不许改签名）先红，这里跟着改。探不到（PG 没起、模块没装、DSN 自定义形态）一律当没漂移 |
 | 上机判据 | `psql "$PG_DSN" -Atqc "SELECT count(*) FROM (SELECT 1 FROM t_1.dbm_schema_objects GROUP BY dbms, table_name, kind, orientation, part_type, compatibility, columns HAVING count(DISTINCT signature) > 1) g"` 为 0；server 日志有 `schema 结构签名对账完成`（`stale` 首次升级后非零、之后每次启动为 0） |
 | 为什么不删 | 签名只要还是持久化的派生值，下一次改算法（例如 `compatibility` 从表级移到库级，S271 接力点 4）就会再来一遍同样的病症；对账不绑定某一版，删了等于把这个坑留给下次改算法的人 |
-| **它探不到、也不处理什么**（明写） | ① 停采行在库里没有同构「孪生行」时旧签名不形成分裂——探测看不见（用户也看不见分裂），server 对账照样会改；② **停采实例/库的行本身要不要老化**（例如 og 旧实例身份 `-s267`、`opengauss-` 前缀在 09-13 时每张表多列两个实例）——签名对齐后它们并入同一条聚合行、作为多出来的成员挂着，不再分裂，但也不消失。DD 对停报主机的 schema 保留多久，官方文档（Data Collected / Schema Explorer）未写，无证据不删 |
+| **它探不到、也不处理什么**（明写） | ① 停采行在库里没有同构「孪生行」时旧签名不形成分裂——探测看不见（用户也看不见分裂），server 对账照样会改；② **停采实例/库的行本身要不要老化**（例如 og 旧实例身份 `-s267`、`opengauss-` 前缀在 09-13 时每张表多列两个实例）——签名对齐后它们并入同一条聚合行、作为多出来的成员挂着，不再分裂，但也不消失。停报主机的 schema 该保留多久，目前没有定论，无证据不删 |
 
 ### L4 · 指标目录镜像（`metric_catalog` 的 `source=embed` 行）留着内嵌目录已删掉的指标
 

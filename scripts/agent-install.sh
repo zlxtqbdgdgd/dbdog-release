@@ -253,8 +253,8 @@ latest_failed_agent_config() { # 首装验收失败后复用同一次生成的�
 }
 
 resolve_inputs() {
-  # 主配置只在 $AGENT_CONFIG_DIR（/etc/dbdog-agent）里找；201/204 上并排的
-  # /etc/datadog-agent/datadog.yaml 是官方对照机，绝不能当收割源。
+  # 主配置只在 $AGENT_CONFIG_DIR（/etc/dbdog-agent）里找；同机另装的 datadog-agent 的
+  # /etc/datadog-agent/datadog.yaml 不是我们的，绝不能当收割源。
   local old_main=""
   local old_gauss="$AGENT_CONFIG_DIR/conf.d/gaussdb.d/conf.yaml"
   local old recovery=""
@@ -1588,7 +1588,7 @@ validate_runtime_tree() { # <目录> <manifest version>
   done < <(find "$tree" -type l -print0)
 
   # 必须执行即将切换的那一个 binary；空环境只注入候选 tree 的私有库目录，避免误用
-  # 同机官方 Agent、用户 PATH 或旧 runtime 的 LD_LIBRARY_PATH。麒麟构建的稳定格式为
+  # 同机其他 Agent、用户 PATH 或旧 runtime 的 LD_LIBRARY_PATH。麒麟构建的稳定格式为
   # `Agent <release> - Commit: ...`，其中
   # version token 必须完整相等，不能用前缀匹配让 .3 接受 .30/7.79 等版本。
   env_bin="$(command -v env 2>/dev/null || true)"
@@ -1778,9 +1778,9 @@ render_install_state() {
   UNIT_STAGE="$(mktemp -d /etc/systemd/system/.dbdog-agent-units.XXXXXX)"
   install -d -m 0700 "$CONFIG_STAGE/conf.d"
   # dbdog.yaml 里 additional_checksd 指向它；目录不存在时 Agent 每轮都会抱怨路径缺失。
-  # 之所以必须有这个目录（而不是干脆不设 additional_checksd）：不设就会落回上游编译进
-  # 二进制的 /etc/datadog-agent/checks.d，在并排装着官方 Agent 的主机上会读到别人的 check。
-  # （官方对照机配置在 /etc/datadog-agent/，与本目录隔离；渲染只写 $AGENT_CONFIG_DIR。）
+  # 之所以必须有这个目录（而不是干脆不设 additional_checksd）：不设就会落回编译进
+  # 二进制的 /etc/datadog-agent/checks.d，在另装着 datadog-agent 的主机上会读到别人的 check。
+  # （那边的配置在 /etc/datadog-agent/，与本目录隔离；渲染只写 $AGENT_CONFIG_DIR。）
   install -d -m 0700 "$CONFIG_STAGE/checks.d"
   agent_render_dbdog_yaml "$CONFIG_STAGE/$AGENT_MAIN_CONFIG_BASENAME" "$DBDOG_SERVER_URL" \
     "$DBDOG_API_KEY" "$DBDOG_AGENT_HOSTNAME" "$RC_ROOT_JSON"

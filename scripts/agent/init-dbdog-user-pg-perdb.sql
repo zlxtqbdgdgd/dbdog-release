@@ -44,7 +44,7 @@ GRANT EXECUTE ON FUNCTION dbdog.explain_statement(text) TO dbdog;
 
 -- 列统计采集入口(SECURITY DEFINER:pg_stats 按 has_column_privilege 过滤行,
 -- dbdog 无业务表 SELECT 权限会读到空集,故借函数属主身份读取)。
--- search_path 钉死是官方写法:本函数全部对象都写全名,钉死可防 public 同名对象劫持。
+-- search_path 钉死是 PostgreSQL 对 SECURITY DEFINER 的推荐写法:本函数全部对象都写全名,钉死可防 public 同名对象劫持。
 CREATE OR REPLACE FUNCTION dbdog.column_statistics()
 RETURNS TABLE (
   schemaname name,

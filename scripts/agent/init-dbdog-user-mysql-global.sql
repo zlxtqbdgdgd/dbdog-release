@@ -3,13 +3,13 @@
 --   sed "s/__DBDOG_PW__/<监控用户密码>/" /opt/dbdog-agent/scripts/init-dbdog-user-mysql-global.sql \
 --     | mysql -u root -P <port> -h 127.0.0.1
 -- 这是接入的第 1 步(控制台「添加数据库实例」向导按本文件拼命令,安装器只验不建——
--- 与 Datadog 同边界:Agent 从不建库内账号,CREATE USER 由 DBA 跑。
+-- 边界:Agent 从不建库内账号,CREATE USER 由 DBA 跑。
 -- 密码须与向导第 2 步交给安装器的 DBDOG_MYSQL_MONITOR_PASSWORD 一致。
 -- 每个被监控库还要各跑一遍 init-dbdog-user-mysql-perdb.sql(all-databases.sh 代劳)。
 -- 与 PG 版差异(军规 8:引擎各立)：
---   * MySQL 无角色体系：监控读权限 = GRANT SELECT/PROCESS/REPLICATION CLIENT（上游 README 口径）；
---   * explain 与 consumers 开关是存储过程，集中放 dbdog 库（品牌命名，军规 5 有意偏离上游默认
---     datadog.*；check 出货模板已配三个 query_samples override 对齐）；
+--   * MySQL 无角色体系：监控读权限 = GRANT SELECT/PROCESS/REPLICATION CLIENT；
+--   * explain 与 consumers 开关是存储过程，集中放 dbdog 库（dbdog 命名，check 出厂默认是
+--     datadog.*；出货模板已配三个 query_samples override 对齐）；
 --   * 密码无 psql -v 等价物：占位符 + sed（凭证只经 stdin 管道）。
 -- 采集固定走 127.0.0.1 TCP：账号只建 'dbdog'@'127.0.0.1'；不显式指定认证插件
 -- （8.0 默认 caching_sha2_password，pymysql+ cryptography 可连；8.4 起 mysql_native_password
@@ -20,7 +20,7 @@ CREATE USER IF NOT EXISTS 'dbdog'@'127.0.0.1' IDENTIFIED BY '__DBDOG_PW__';
 ALTER USER 'dbdog'@'127.0.0.1' IDENTIFIED BY '__DBDOG_PW__';
 GRANT SELECT, PROCESS, REPLICATION CLIENT ON *.* TO 'dbdog'@'127.0.0.1';
 GRANT SELECT ON mysql.innodb_index_stats TO 'dbdog'@'127.0.0.1';
--- 上游口径：监控连接上限 5，防采集把业务连接槽吃满。
+-- 监控连接上限 5，防采集把业务连接槽吃满。
 ALTER USER 'dbdog'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 5;
 
 CREATE DATABASE IF NOT EXISTS dbdog;

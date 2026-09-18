@@ -4,8 +4,8 @@
 
 AGENT_RUNTIME_DIR="${AGENT_RUNTIME_DIR:-/opt/dbdog-agent}"
 AGENT_CONFIG_DIR="${AGENT_CONFIG_DIR:-/etc/dbdog-agent}"
-# 主配置文件名（dbdog fork）。官方对照机在 /etc/datadog-agent/datadog.yaml——
-# 两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
+# 主配置文件名（旧名 datadog.yaml 只在升级自愈窗口里回退读取）。同机可能另装有 datadog-agent
+# （/etc/datadog-agent）——两目录隔离；下面所有路径都挂在 AGENT_CONFIG_DIR 下，绝不许拼 /etc/datadog-agent。
 AGENT_MAIN_CONFIG_BASENAME="${AGENT_MAIN_CONFIG_BASENAME:-dbdog.yaml}"
 AGENT_MAIN_CONFIG_BASENAME_LEGACY="${AGENT_MAIN_CONFIG_BASENAME_LEGACY:-datadog.yaml}"
 AGENT_LOG_DIR="${AGENT_LOG_DIR:-/var/log/dbdog-agent}"
@@ -239,12 +239,12 @@ agent_yaml_unquote() { # 读取本安装器生成的单/双引号或裸标量
 
 # 在「我们的」配置目录里找主配置：优先新名，回退旧名（升级自愈窗口）。
 # 只接受传入目录下的文件；调用方必须传 $AGENT_CONFIG_DIR 或其失败回滚副本，
-# 绝不要传 /etc/datadog-agent（官方对照机，201/204 上并排存在着）。
+# 绝不要传 /etc/datadog-agent（同机另装的 datadog-agent，现场确有主机并排装着）。
 agent_resolve_main_config() { # <config_dir>
   local dir="$1"
   case "$dir" in
     /etc/datadog-agent|/etc/datadog-agent/*)
-      die "拒绝在官方 datadog-agent 目录里解析主配置: $dir（只许动 $AGENT_CONFIG_DIR）" ;;
+      die "拒绝在非 dbdog 的 /etc/datadog-agent 目录里解析主配置: $dir（只许动 $AGENT_CONFIG_DIR）" ;;
   esac
   if [ -f "$dir/$AGENT_MAIN_CONFIG_BASENAME" ]; then
     printf '%s\n' "$dir/$AGENT_MAIN_CONFIG_BASENAME"
@@ -1035,9 +1035,9 @@ database_monitoring:
     dd_url: $(agent_yaml_quote "$server")
 
 confd_path: $(agent_yaml_quote "$AGENT_CONFIG_DIR/conf.d")
-# 必须显式钉住：不设的话 Agent 会落回**上游编译进二进制的默认值**
-# /etc/datadog-agent/checks.d。在同机并排装着官方 datadog-agent 的主机上（如
-# host109-vm201），那个目录是真实存在的，我们的 Agent 会去加载别人的自定义 check。
+# 必须显式钉住：不设的话 Agent 会落回**编译进二进制的默认值**
+# /etc/datadog-agent/checks.d。在同机另装着 datadog-agent 的主机上（现场确有），
+# 那个目录是真实存在的，我们的 Agent 会去加载别人的自定义 check。
 # 二进制里那批 /etc/datadog-agent 常量改不掉（是 Go 源码里的字面量，不是构建参数），
 # 所以只能在配置里逐个覆盖——confd_path / run_path / log_file 已经这么做了，
 # additional_checksd 之前漏了。
@@ -1354,7 +1354,7 @@ EOF
       function_name: dbdog.column_statistics()
     # activity 直发指标(active_queries/transactions.open 等；出厂默认 false)，显式开启。
     collect_activity_metrics: true
-    # 膨胀组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，登记在 dbdog-web docs/adr/0002）。
+    # 膨胀组：check 默认 false，出货显式开启，有意偏离 check 默认（军规 5，登记在 dbdog-web docs/adr/0002）。
     # collect_function_metrics 不开：靶机实测 track_functions = none、pg_stat_user_functions 为空，开了也没数；
     # 安装器不改库参数，DBA 设成 pl/all 后可自行显式开。
     collect_bloat_metrics: true
@@ -1380,7 +1380,7 @@ EOF
     source: gaussdb
     service: gaussdb
     # logs stanza 的 tags 与 instances 的 tags 是**两个作用域**，日志不继承 instance tag。
-    # 不写这块的后果：日志事件 env 为空——env 是 dd.logs 官方 7 列之一，env:<环境> 筛选会整个
+    # 不写这块的后果：日志事件 env 为空——env 是 dd.logs 的 7 个固定列之一，env:<环境> 筛选会整个
     # 漏掉本引擎（2026-08-04 box34 openGauss 实证）。
     tags:
       - $(agent_yaml_quote "env:$env_name")
@@ -1546,7 +1546,7 @@ EOF
       enabled: true
       function_name: dbdog.column_statistics()
     collect_activity_metrics: true
-    # 函数 / 膨胀两组：check 默认 false（同上游），出货显式开启，有意偏离 DD 默认（军规 5，
+    # 函数 / 膨胀两组：check 默认 false，出货显式开启，有意偏离 check 默认（军规 5，
     # 登记在 dbdog-web docs/adr/0002）。function 要库侧 track_functions = pl/all（PG 默认 none）——
     # 安装器不改库参数，由 DBA 设，不设则这组无数。
     collect_function_metrics: true

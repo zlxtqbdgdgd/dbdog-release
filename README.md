@@ -175,8 +175,8 @@ modules/dbdog-benchweb/current/bin/dbdog-benchweb --import-cases modules/dbdog-b
 dbdog-web 的 Agent 接入页签发 ingest API key。dbdog 的私有运行时、配置和服务分别固定在
 `/opt/dbdog-agent`、`/etc/dbdog-agent` 与 `dbdog-agent*`，不会触碰同机其他采集 agent。
 
-安装器管「基础」，不管「建号」——分工与 Datadog 一致（DD 的 Agent 从不建库内账号，
-`CREATE USER datadog` 与 explain 函数都由 DBA 按文档自己跑）：
+安装器管「基础」，不管「建号」——Agent 从不建库内账号，`CREATE USER dbdog` 与 explain
+函数都由 DBA 按向导自己跑：
 
 | | 安装器做 | DBA 在控制台 Databases →「添加数据库实例」向导里做 |
 |---|---|---|
