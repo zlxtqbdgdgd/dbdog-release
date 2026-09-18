@@ -7,7 +7,7 @@ GitHub Release [`artifacts`](../../releases/tag/artifacts) 里，文件名自带
 ## 最新版本
 
 <!-- VERSION-TABLE:BEGIN -->
-更新于 2026-09-18 11:00（此表由 publish.sh 生成，权威数据在 manifest.tsv）
+更新于 2026-09-18 12:33（此表由 publish.sh 生成，权威数据在 manifest.tsv）
 
 | 模块 | 类别 | 装在 | 版本 | 产物 | 架构 |
 | --- | --- | --- | --- | --- | --- |
@@ -21,7 +21,7 @@ GitHub Release [`artifacts`](../../releases/tag/artifacts) 里，文件名自带
 | node | third-party | 全家桶机 | 20.18.1 | node-20.18.1-aarch64.tar.gz | aarch64 |
 | goose | third-party | 全家桶机 | 3.27.3 | goose-3.27.3-aarch64.tar.gz | aarch64 |
 | dbdog-agent | first-party | DB 主机 | 7.83.0-dbdog.8 | dbdog-agent-7.83.0-dbdog.8-x86_64.tar.gz | x86_64 |
-| dbdog-benchweb | first-party | 全家桶机 | 0.1.6 | dbdog-benchweb-0.1.6-aarch64.tar.gz | aarch64 |
+| dbdog-benchweb | first-party | 全家桶机 | 0.1.7 | dbdog-benchweb-0.1.7-aarch64.tar.gz | aarch64 |
 <!-- VERSION-TABLE:END -->
 
 「全家桶机」指跑 PostgreSQL、ClickHouse 和四个应用服务的那台机器；「DB 主机」指被监控的
